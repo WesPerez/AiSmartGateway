@@ -237,6 +237,15 @@ ADMIN_HTML = """
       width: auto;
       padding: 6px 8px;
     }
+    .inline-toggle {
+      display: inline-flex;
+      align-items: center;
+      margin: 0;
+    }
+    .inline-toggle input {
+      width: auto;
+      margin: 0;
+    }
     .compact-input {
       min-width: 76px;
       padding: 6px 8px;
@@ -392,8 +401,9 @@ ADMIN_HTML = """
     .policy-table th:nth-child(2), .policy-table td:nth-child(2) { min-width: 190px; }
     .policy-table th:nth-child(3), .policy-table td:nth-child(3) { min-width: 120px; }
     .policy-table th:nth-child(4), .policy-table td:nth-child(4) { min-width: 340px; }
-    .policy-table th:nth-child(5), .policy-table td:nth-child(5) { min-width: 420px; }
-    .policy-table th:nth-child(6), .policy-table td:nth-child(6) { min-width: 140px; }
+    .policy-table th:nth-child(5), .policy-table td:nth-child(5) { min-width: 320px; }
+    .policy-table th:nth-child(6), .policy-table td:nth-child(6) { min-width: 360px; }
+    .policy-table th:nth-child(7), .policy-table td:nth-child(7) { min-width: 140px; }
     .pill {
       display: inline-flex;
       align-items: center;
@@ -653,7 +663,7 @@ ADMIN_HTML = """
                 <th>策略</th>
                 <th>模型</th>
                 <th>接口</th>
-                <th>状态 <label class="inline-toggle"><input id="showUnhealthyUpstreams" type="checkbox">显示异常</label></th>
+                <th>状态 <label class="inline-toggle" title="默认只显示至少一个接口健康的上游模型；勾选后显示异常和无健康接口的上游模型。"><input id="showUnhealthyUpstreams" type="checkbox" aria-label="显示异常上游模型"></label></th>
                 <th>延迟</th>
                 <th>最近检测</th>
                 <th>下次探测</th>
@@ -669,16 +679,16 @@ ADMIN_HTML = """
       <section id="tab-providers" class="tabpane hidden">
         <div class="row between" style="margin-bottom: 12px;">
           <div class="sub">源池策略会回写 New API 渠道。新增/删除上游、修改 key、模型权限、用户分组和订阅仍在 New API 管理。</div>
-          <div class="row">
-            <button id="savePolicyBtn" class="primary" title="保存当前页的启停、路由桶、优先级、权重、Base URL 和声明模型">保存源池策略</button>
-            <button id="syncBtnProviders" class="primary" title="从 New API 重新拉取源池渠道；没有标签的新启用 default 渠道会自动纳入机会源池">同步 New API 源池</button>
-            <button id="probeBtnProviders" class="primary" title="重新加载本地配置，并按冷却策略启动后台增量探测">重载配置并增量探测</button>
-          </div>
         </div>
         <div class="help">
           <strong>保存源池策略</strong>：把本页策略写回 New API 渠道标签并同步到 Gateway。
           <strong>同步 New API 源池</strong>：以 New API 渠道为准重新生成源池；新启用且未打标签的 default 渠道会自动纳入机会源池。
           <strong>重载配置并增量探测</strong>：不保存页面改动，只让 Gateway 重新读取配置并后台检测到期通道。
+        </div>
+        <div class="row" style="margin-bottom: 14px;">
+          <button id="savePolicyBtn" class="primary" title="保存当前页的启停、路由桶、优先级、权重、Base URL 和声明模型">保存源池策略</button>
+          <button id="syncBtnProviders" class="primary" title="从 New API 重新拉取源池渠道；没有标签的新启用 default 渠道会自动纳入机会源池">同步 New API 源池</button>
+          <button id="probeBtnProviders" class="primary" title="重新加载本地配置，并按冷却策略启动后台增量探测">重载配置并增量探测</button>
         </div>
         <div class="policy-hero">
           <div class="panel policy-filter">
@@ -700,7 +710,8 @@ ADMIN_HTML = """
                 <th>策略层级</th>
                 <th>优先/权重</th>
                 <th>Base URL</th>
-                <th>模型</th>
+                <th>声明模型</th>
+                <th>实际健康模型</th>
                 <th>健康</th>
               </tr>
             </thead>
@@ -719,7 +730,7 @@ ADMIN_HTML = """
     let logsData = { logs: [] };
     let providerDrafts = {};
     const pageSizeOptions = [10, 25, 50, 100, 200];
-    const pageSizes = { models: 25, matrix: 25, upstreams: 25, logs: 25, providers: 25 };
+    const pageSizes = { models: 10, matrix: 10, upstreams: 10, logs: 10, providers: 10 };
     const pages = { models: 1, matrix: 1, upstreams: 1, logs: 1, providers: 1 };
 
     const $ = (id) => document.getElementById(id);
@@ -1352,12 +1363,10 @@ ADMIN_HTML = """
           </td>
           <td>
             <div class="stack">
-              <label>声明模型</label>
               <textarea class="provider-models" data-field="models">${escapeHtml(models)}</textarea>
-              <label>实际健康模型</label>
-              <div class="chiprow">${healthyModels.length ? healthyModels.slice(0, 18).map((m) => `<span class="chip ok mono">${escapeHtml(m.model)}<span class="model-kind">${escapeHtml(m.kinds.join("+"))}</span></span>`).join("") + (healthyModels.length > 18 ? `<span class="chip dark">+${healthyModels.length - 18}</span>` : "") : '<span class="muted">暂无健康模型</span>'}</div>
             </div>
           </td>
+          <td><div class="chiprow">${healthyModels.length ? healthyModels.slice(0, 18).map((m) => `<span class="chip ok mono">${escapeHtml(m.model)}<span class="model-kind">${escapeHtml(m.kinds.join("+"))}</span></span>`).join("") + (healthyModels.length > 18 ? `<span class="chip dark">+${healthyModels.length - 18}</span>` : "") : '<span class="muted">暂无健康模型</span>'}</div></td>
           <td>
             <div class="stack">
               <span>健康 ${runtime.healthy ?? 0}</span>
