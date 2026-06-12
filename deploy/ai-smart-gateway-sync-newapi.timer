@@ -1,0 +1,10 @@
+[Unit]
+Description=Periodic New API to AI Smart Gateway source-pool sync
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

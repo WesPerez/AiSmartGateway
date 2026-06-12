@@ -1,0 +1,11 @@
+.env
+config/providers.yaml
+data/
+backups/
+.venv/
+__pycache__/
+.pytest_cache/
+.test_deps/
+.ruff_cache/
+.mypy_cache/
+*.pyc

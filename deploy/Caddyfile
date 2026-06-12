@@ -1,0 +1,21 @@
+{
+    email {$ACME_EMAIL}
+}
+
+{$DOMAIN} {
+    encode gzip zstd
+
+    @api path /v1/*
+    reverse_proxy @api smart-gateway:8000
+
+    @health path /health
+    reverse_proxy @health smart-gateway:8000
+
+    @admin path /admin/*
+    reverse_proxy @admin smart-gateway:8000
+
+    respond / 200 {
+        body "AI Smart Gateway OK"
+    }
+}
+

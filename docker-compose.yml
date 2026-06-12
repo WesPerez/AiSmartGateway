@@ -1,0 +1,55 @@
+name: ai-smart-gateway
+
+services:
+  smart-gateway:
+    build:
+      context: ./smart-gateway
+    container_name: ai-smart-gateway
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      CONFIG_DIR: /app/config
+      DATA_DIR: /data
+      SYNC_NEWAPI_SCRIPT: /workspace/scripts/sync-newapi-router.py
+      SMART_GATEWAY_INTERNAL_URL: http://127.0.0.1:8000
+    volumes:
+      - ./config:/app/config
+      - ./data:/data
+      - ./:/workspace
+      - ${NEWAPI_DATA_DIR:-./newapi-data}:/newapi-data
+    expose:
+      - "8000"
+    ports:
+      - "127.0.0.1:18000:8000"
+    networks:
+      - ai-gateway
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/health >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  caddy:
+    image: caddy:2.8
+    container_name: ai-gateway-caddy
+    profiles:
+      - caddy
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./data/caddy_data:/data
+      - ./data/caddy_config:/config
+    depends_on:
+      - smart-gateway
+    networks:
+      - ai-gateway
+
+networks:
+  ai-gateway:
+    driver: bridge

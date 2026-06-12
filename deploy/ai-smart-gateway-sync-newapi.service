@@ -1,0 +1,9 @@
+[Unit]
+Description=Sync New API gateway-source channels into AI Smart Gateway
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/AiSmartGateway
+ExecStart=/opt/AiSmartGateway/scripts/sync-newapi-router.py --router-groups default,vip --no-backup
