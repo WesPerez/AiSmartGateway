@@ -369,6 +369,12 @@ def preserve_probe_state(new_item: dict[str, Any], previous: dict[str, Any] | No
     return preserved
 
 
+def runtime_failure_cooling_down(item: dict[str, Any] | None) -> bool:
+    if not item:
+        return False
+    return str(item.get("reason") or "").startswith("runtime_failure:") and float(item.get("next_probe_at") or 0) > now()
+
+
 async def save_state() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     data = {"updated_at": now(), "health": HEALTH, "model_cache": MODEL_CACHE, "last_probe_at": LAST_PROBE_AT}
@@ -947,6 +953,8 @@ async def probe_all(force: bool = False) -> None:
                     "skip_reason": "",
                 }
             )
+            if result.get("healthy") and runtime_failure_cooling_down(previous):
+                item = preserve_probe_state(item, previous)
         else:
             if previous is None:
                 item.update(
@@ -1368,8 +1376,6 @@ def shadow_candidate_allowed(item: dict[str, Any], controls: dict[str, Any]) -> 
     if controls.get("provider_id") and controls.get("provider_id") == item.get("provider_id"):
         return True
     reason = str(item.get("reason") or "")
-    if reason == "runtime_failure:invalid_request":
-        return True
     if reason.startswith("runtime_failure:") and float(item.get("next_probe_at") or 0) > now():
         return False
     return True
@@ -1394,11 +1400,17 @@ def should_mark_runtime_failure(reason: str) -> bool:
 
 
 def should_mark_provider_all_endpoints_failed(kind: str, endpoint_reasons: list[str]) -> bool:
+    return runtime_failure_reason_for_endpoint_failures(kind, endpoint_reasons) is not None
+
+
+def runtime_failure_reason_for_endpoint_failures(kind: str, endpoint_reasons: list[str]) -> str | None:
     if not endpoint_reasons:
-        return True
+        return "all_endpoints_failed"
     if kind == "responses" and all(reason == "invalid_request" for reason in endpoint_reasons):
-        return False
-    return any(should_mark_runtime_failure(reason) for reason in endpoint_reasons)
+        return "invalid_request"
+    if any(should_mark_runtime_failure(reason) for reason in endpoint_reasons):
+        return "all_endpoints_failed"
+    return None
 
 
 def exploration_enabled(controls: dict[str, Any]) -> bool:
@@ -1425,7 +1437,7 @@ def retryable_probe_candidate_allowed(item: dict[str, Any], kind: str, controls:
         return False
     if item.get("fallback_only") or item.get("route_group") == "paid_fallback":
         return False
-    return provider_matches_controls(item, controls)
+    return provider_matches_controls(item, controls) and shadow_candidate_allowed(item, controls)
 
 
 def healthy_candidate_buckets(model: str, kind: str, controls: dict[str, Any] | None = None) -> list[dict[str, Any]]:
@@ -1890,8 +1902,9 @@ async def relay_stream(
                             yield b"data: [DONE]\n\n"
                         return
 
-                if should_mark_provider_all_endpoints_failed(kind, endpoint_reasons):
-                    await mark_runtime_failure(kind, model, chosen["provider_id"], "all_endpoints_failed")
+                runtime_failure_reason = runtime_failure_reason_for_endpoint_failures(kind, endpoint_reasons)
+                if runtime_failure_reason:
+                    await mark_runtime_failure(kind, model, chosen["provider_id"], runtime_failure_reason)
         except Exception as exc:
             if stream_started:
                 if kind == "responses" and not response_completed:
