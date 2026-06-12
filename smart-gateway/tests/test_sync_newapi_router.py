@@ -164,7 +164,7 @@ def test_auto_adopt_default_channels_tags_only_enabled_plain_channels(tmp_path):
     assert rows["tagged-upstream"] == "custom"
 
 
-def test_sync_source_channel_models_prunes_only_channels_seen_in_health(tmp_path):
+def test_sync_source_channel_models_keeps_declared_source_models(tmp_path):
     sync = load_sync_module()
     con = make_db(tmp_path / "one-api.db")
     con.execute(
@@ -209,7 +209,7 @@ def test_sync_source_channel_models_prunes_only_channels_seen_in_health(tmp_path
     changed = sync.sync_source_channel_models(con, rows, healthy_by_channel, seen_channel_ids)
     updated = dict(con.execute("select id, models from channels order by id").fetchall())
 
-    assert changed == 2
-    assert updated[1] == "healthy-model"
+    assert changed == 0
+    assert updated[1] == "old-model,healthy-model"
     assert updated[2] == "declared-model"
-    assert updated[3] == ""
+    assert updated[3] == "stale-model"

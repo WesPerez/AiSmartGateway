@@ -37,7 +37,7 @@ ROUTER_SETTING = {
 }
 ROUTER_SETTINGS = {
     "allow_service_tier": True,
-    "disable_store": True,
+    "disable_store": False,
     "allow_safety_identifier": True,
     "allow_include_obfuscation": True,
     "upstream_model_update_check_enabled": False,
@@ -45,6 +45,28 @@ ROUTER_SETTINGS = {
     "upstream_model_update_ignored_models": [],
     "upstream_model_update_last_detected_models": [],
     "upstream_model_update_last_check_time": 0,
+}
+ROUTER_PARAM_OVERRIDE = {
+    "operations": [
+        {
+            "mode": "pass_headers",
+            "value": [
+                "OpenAI-Beta",
+                "Originator",
+                "Session_id",
+                "X-Codex-Beta-Features",
+                "X-Stainless-Arch",
+                "X-Stainless-Lang",
+                "X-Stainless-OS",
+                "X-Stainless-Package-Version",
+                "X-Stainless-Retry-Count",
+                "X-Stainless-Runtime",
+                "X-Stainless-Runtime-Version",
+                "X-Request-Id",
+                "User-Agent",
+            ],
+        }
+    ]
 }
 DEFAULT_MODEL_RATIO = 0.5
 MODEL_RATIO_KEY = "ModelRatio"
@@ -377,20 +399,7 @@ def sync_source_channel_models(
     healthy_by_channel: dict[int, set[str]],
     seen_channel_ids: set[int],
 ) -> int:
-    changed = 0
-    for row in source_rows:
-        channel_id = int(row["id"])
-        if int(row["status"] or 0) != 1:
-            next_models = ""
-        elif channel_id in seen_channel_ids:
-            next_models = ",".join(sorted(healthy_by_channel.get(channel_id, set())))
-        else:
-            continue
-        if (row["models"] or "") == next_models:
-            continue
-        con.execute("update channels set models = ? where id = ?", (next_models, channel_id))
-        changed += 1
-    return changed
+    return 0
 
 
 def sync_router_abilities(
@@ -612,10 +621,11 @@ def sync(args: argparse.Namespace) -> None:
         models = filter_models_csv(discovered_models, disabled_models(con))
         now_ts = int(time.time())
         channel_columns = table_columns(con, "channels")
-        router_extra_columns = [column for column in ("setting", "settings") if column in channel_columns]
+        router_extra_columns = [column for column in ("setting", "settings", "param_override") if column in channel_columns]
         router_extra_values = {
             "setting": json.dumps(ROUTER_SETTING, ensure_ascii=False, separators=(",", ":")),
             "settings": json.dumps(ROUTER_SETTINGS, ensure_ascii=False, separators=(",", ":")),
+            "param_override": json.dumps(ROUTER_PARAM_OVERRIDE, ensure_ascii=False, separators=(",", ":")),
         }
         existing = con.execute("select id from channels where name = ? or base_url = ?", (ROUTER_NAME, ROUTER_BASE_URL)).fetchone()
         if existing:
