@@ -624,8 +624,11 @@ ADMIN_HTML = """
       <section id="tab-upstreams" class="tabpane hidden">
         <div class="row between" style="margin-bottom: 12px;">
           <div class="sub">按上游查看每个模型的当前健康、接口支持、延迟、最近检测和下次探测。这里只显示启用源池上游。</div>
-          <div class="row" style="min-width: 320px;">
-            <input id="upstreamFilter" placeholder="搜索上游或模型">
+          <div class="row" style="min-width: 520px;">
+            <input id="upstreamFilter" list="upstreamOptions" placeholder="输入或选择上游">
+            <datalist id="upstreamOptions"></datalist>
+            <input id="upstreamModelFilter" list="upstreamModelOptions" placeholder="输入或选择模型">
+            <datalist id="upstreamModelOptions"></datalist>
           </div>
         </div>
         <div class="tablewrap wide-table">
@@ -674,7 +677,7 @@ ADMIN_HTML = """
           </div>
           <div id="routeBoard" class="route-board"></div>
         </div>
-        <div class="notice">维护流程：New API 录入真实上游和 key；这里调整启停、策略层级、费用类型、优先级、权重和声明模型。选择“付费兜底”或费用类型为“付费”都会进入最后兜底层。</div>
+        <div class="notice">维护流程：New API 录入真实上游和 key；这里调整启停、策略层级、费用标记、优先级、权重和声明模型。付费兜底只由策略层级“5 付费兜底”决定；费用类型仅用于免费/计量/未知标记和展示。</div>
         <div class="tablewrap">
           <table class="policy-table">
             <thead>
@@ -984,6 +987,24 @@ ADMIN_HTML = """
       $("modelOptions").innerHTML = Array.from(models).sort().map((model) => `<option value="${escapeHtml(model)}"></option>`).join("");
     }
 
+    function updateUpstreamOptions() {
+      const upstreams = new Set();
+      const models = new Set((state?.models || []).map((m) => m.id).filter(Boolean));
+      for (const row of enabledProviderRows()) {
+        if (row.provider?.name) upstreams.add(row.provider.name);
+        if (row.provider?.id) upstreams.add(String(row.provider.id));
+        for (const model of row.provider?.declared_models || []) models.add(model);
+      }
+      for (const row of buildUpstreamRows()) {
+        if (row.provider_name) upstreams.add(row.provider_name);
+        if (row.provider_id) upstreams.add(row.provider_id);
+        if (row.model) models.add(row.model);
+        for (const actual of row.actual_models || []) models.add(actual);
+      }
+      $("upstreamOptions").innerHTML = Array.from(upstreams).sort().map((item) => `<option value="${escapeHtml(item)}"></option>`).join("");
+      $("upstreamModelOptions").innerHTML = Array.from(models).sort().map((item) => `<option value="${escapeHtml(item)}"></option>`).join("");
+    }
+
     function smallModelChips(items, limit = 8) {
       const merged = mergeModelKinds(items);
       const shown = merged.slice(0, limit);
@@ -1207,15 +1228,19 @@ ADMIN_HTML = """
           }
         }
       }
-      const keyword = ($("upstreamFilter")?.value || "").trim().toLowerCase();
+      const upstreamKeyword = ($("upstreamFilter")?.value || "").trim().toLowerCase();
+      const modelKeyword = ($("upstreamModelFilter")?.value || "").trim().toLowerCase();
       return Array.from(byKey.values()).filter((row) => {
-        if (!keyword) return true;
-        return `${row.provider_name} ${row.provider_id} ${row.model} ${Array.from(row.actual_models).join(" ")}`.toLowerCase().includes(keyword);
+        const upstreamText = `${row.provider_name} ${row.provider_id}`.toLowerCase();
+        const modelText = `${row.model} ${Array.from(row.actual_models).join(" ")}`.toLowerCase();
+        return (!upstreamKeyword || upstreamText.includes(upstreamKeyword)) && (!modelKeyword || modelText.includes(modelKeyword));
       }).sort((a, b) =>
-        Number(b.healthy_count > 0) - Number(a.healthy_count > 0) ||
-        compareText(a.provider_name, b.provider_name) ||
         (routeOrder[a.route_group] ?? 99) - (routeOrder[b.route_group] ?? 99) ||
         Number(b.priority) - Number(a.priority) ||
+        Number(b.weight) - Number(a.weight) ||
+        Number(b.healthy_count > 0) - Number(a.healthy_count > 0) ||
+        Number(a.best_latency ?? 999999) - Number(b.best_latency ?? 999999) ||
+        compareText(a.provider_name, b.provider_name) ||
         compareText(a.model, b.model)
       );
     }
@@ -1290,6 +1315,7 @@ ADMIN_HTML = """
       const enabledValue = String(providerValue(p, "enabled", String((policy.enabled ?? p.enabled) !== false)));
       const routeValue = providerValue(p, "route_group", policy.route_group || p.route_group);
       const costValue = providerValue(p, "cost_tier", policy.cost_tier || p.cost_tier);
+      const editableCostValue = costValue === "paid" ? "metered" : costValue;
       const fallbackValue = String(providerValue(p, "fallback_only", String((policy.fallback_only ?? p.fallback_only) === true)));
       const priorityValue = providerValue(p, "priority", policy.priority ?? p.priority ?? 0);
       const weightValue = providerValue(p, "weight", policy.weight ?? p.weight ?? 100);
@@ -1311,9 +1337,9 @@ ADMIN_HTML = """
             <div class="stack provider-selects">
               <select data-field="enabled">${option("true", "启用", enabledValue)}${option("false", "停用", enabledValue)}</select>
               <select data-field="route_group">${routeOptions}</select>
-              <select data-field="cost_tier">${option("free", "免费", costValue)}${option("metered", "计量", costValue)}${option("paid", "付费", costValue)}${option("unknown", "未知", costValue)}</select>
+              <select data-field="cost_tier">${option("free", "免费", editableCostValue)}${option("metered", "计量", editableCostValue)}${option("unknown", "未知", editableCostValue)}</select>
               <input type="hidden" data-field="fallback_only" value="${escapeHtml(fallbackValue)}">
-              <div class="cell-sub">付费兜底由策略层级或费用类型自动决定</div>
+              <div class="cell-sub">付费兜底只由策略层级决定</div>
             </div>
           </td>
           <td>
@@ -1393,13 +1419,14 @@ ADMIN_HTML = """
         const draft = providerDrafts[key] || {};
         const get = (field, fallback) => draft[field] ?? fallback ?? "";
         const routeGroup = get("route_group", policy.route_group || provider.route_group);
-        const costTier = get("cost_tier", policy.cost_tier || provider.cost_tier);
+        const rawCostTier = get("cost_tier", policy.cost_tier || provider.cost_tier);
+        const costTier = rawCostTier === "paid" ? "metered" : rawCostTier;
         return {
           id: Number(key),
           enabled: String(get("enabled", String((policy.enabled ?? provider.enabled) !== false))) === "true",
           route_group: routeGroup,
           cost_tier: costTier,
-          fallback_only: routeGroup === "paid_fallback" || costTier === "paid",
+          fallback_only: routeGroup === "paid_fallback",
           priority: Number(get("priority", policy.priority ?? provider.priority ?? 0) || 0),
           weight: Number(get("weight", policy.weight ?? provider.weight ?? 100) || 100),
           base_url: get("base_url", policy.base_url || provider.base_url || ""),
@@ -1426,6 +1453,7 @@ ADMIN_HTML = """
       renderLogs(logs);
       renderProviders();
       updateModelOptions();
+      updateUpstreamOptions();
       renderRouteBoard();
     }
 
@@ -1537,10 +1565,12 @@ ADMIN_HTML = """
     });
 
     $("modelFilter").addEventListener("input", renderRouteBoard);
-    $("upstreamFilter").addEventListener("input", () => {
+    function handleUpstreamFilterInput() {
       pages.upstreams = 1;
       renderUpstreams();
-    });
+    }
+    $("upstreamFilter").addEventListener("input", handleUpstreamFilterInput);
+    $("upstreamModelFilter").addEventListener("input", handleUpstreamFilterInput);
 
     document.addEventListener("input", (event) => {
       if (!event.target.closest("#tab-providers")) return;

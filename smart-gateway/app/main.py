@@ -529,7 +529,7 @@ def update_newapi_source_policy(updates: list[dict[str, Any]]) -> int:
     if not NEWAPI_DB.exists():
         raise ValueError(f"New API database not found: {NEWAPI_DB}")
     allowed_routes = {"primary", "opportunistic", "backup", "paid_fallback", "other"}
-    allowed_costs = {"free", "metered", "paid", "unknown"}
+    allowed_costs = {"free", "metered", "unknown"}
     con = sqlite3.connect(NEWAPI_DB)
     try:
         changed = 0
@@ -549,7 +549,7 @@ def update_newapi_source_policy(updates: list[dict[str, Any]]) -> int:
                 raise ValueError(f"unsupported route_group: {route_group}")
             if cost_tier not in allowed_costs:
                 raise ValueError(f"unsupported cost_tier: {cost_tier}")
-            fallback_only = route_group == "paid_fallback" or cost_tier == "paid" or parse_bool(update.get("fallback_only"), False)
+            fallback_only = route_group == "paid_fallback" or parse_bool(update.get("fallback_only"), False)
             status = 1 if parse_bool(update.get("enabled"), True) else 0
             weight = max(1, min(10000, int(update.get("weight") or 100)))
             priority = int(update.get("priority") if update.get("priority") is not None else 0)
