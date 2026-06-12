@@ -1000,7 +1000,8 @@ async def admin_overview(
         )
         return {
             "app": APP_NAME,
-            "base_url": f"{base}/v1",
+            "base_url": base,
+            "legacy_base_url": f"{base}/v1",
             "new_api_admin_url": f"{base}/",
             "admin_url": f"{base}/gateway-admin/",
             "router_channel_name": "Smart Gateway Router",

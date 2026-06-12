@@ -7,10 +7,11 @@
 公开入口应只暴露 New API：
 
 ```text
-https://api.example.com/v1
+https://api.example.com
 ```
 
 客户端 API Key 应在 New API 的令牌页面生成。Smart Gateway 的内部访问 Key 只用于 New API 的路由渠道，不应作为公开客户端 Key 分发。
+兼容入口 `https://api.example.com/v1` 可保留给已经配置过 `/v1` 的客户端。
 
 ## New API 负责
 

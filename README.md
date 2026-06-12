@@ -9,7 +9,7 @@ internal downstream router that New API calls through a single channel named
 Public client configuration:
 
 ```text
-Base URL: https://api.example.com/v1
+Base URL: https://api.example.com
 API Key: token generated in New API
 ```
 
@@ -27,8 +27,10 @@ URL: https://api.example.com/gateway-admin/
 Login token: ADMIN_TOKEN from .env
 ```
 
-In the recommended deployment, `/v1/*` routes to New API. New API calls Smart
-Gateway through an internal router channel.
+In the recommended deployment, root-level OpenAI-compatible API paths such as
+`/models`, `/chat/completions`, and `/responses` route to New API's `/v1/*`
+API. The legacy `/v1/*` entry is kept for clients that already include `/v1`.
+New API calls Smart Gateway through an internal router channel.
 
 Upstream source management:
 

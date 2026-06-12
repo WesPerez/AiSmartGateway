@@ -1104,7 +1104,8 @@ async def test_admin_overview_requires_token_and_exposes_gateway_config(gateway)
         "responses": {},
     }
     overview = await gateway.admin_overview(make_request("api.example.com"), "Bearer admin", None)
-    assert overview["base_url"] == "https://api.example.com/v1"
+    assert overview["base_url"] == "https://api.example.com"
+    assert overview["legacy_base_url"] == "https://api.example.com/v1"
     assert overview["new_api_admin_url"] == "https://api.example.com/"
     assert overview["admin_url"] == "https://api.example.com/gateway-admin/"
     assert overview["router_channel_name"] == "Smart Gateway Router"
