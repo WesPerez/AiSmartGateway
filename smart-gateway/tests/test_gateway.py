@@ -485,6 +485,11 @@ async def test_non_stream_uses_paid_fallback_after_responses_invalid_request(gat
     assert response.status_code == 200
     payload = json.loads(response.body.decode())
     assert payload["id"] == "paid-ok"
+    item = gateway.HEALTH["responses"]["good-model"]["primary"]
+    assert item["healthy"] is False
+    assert item["reason"] == "runtime_failure:responses_request_shape_unverified"
+    assert item["shape_invalid_count"] == 1
+    assert item["shape_invalid_required"] == 3
     logs = gateway.read_recent_request_logs()
     assert logs[0]["provider_id"] == "paid"
     assert logs[0]["route_bucket"] == "paid_fallback"
@@ -757,6 +762,44 @@ def test_responses_probe_retry_runs_before_paid_fallback(gateway):
     assert [bucket["name"] for bucket in buckets] == ["probe_retry", "paid_fallback"]
 
 
+def test_real_shape_invalid_does_not_run_before_paid_fallback(gateway):
+    gateway.HEALTH = {
+        "responses": {
+            "good-model": {
+                "primary::good-model": {
+                    "provider_id": "primary",
+                    "actual_model": "good-model",
+                    "healthy": False,
+                    "kind": "responses",
+                    "priority": 100,
+                    "weight": 100,
+                    "route_group": "primary",
+                    "source": "upstream_models+declared",
+                    "reason": "runtime_failure:real_shape_invalid",
+                    "shape_status": "real_shape_invalid",
+                    "shape_invalid_count": 3,
+                    "shape_invalid_required": 3,
+                    "next_probe_at": int(gateway.now()) + 1800,
+                },
+                "paid": {
+                    "provider_id": "paid",
+                    "actual_model": "good-model",
+                    "healthy": True,
+                    "priority": 10,
+                    "weight": 1000,
+                    "route_group": "paid_fallback",
+                    "fallback_only": True,
+                },
+            }
+        },
+        "chat": {},
+    }
+
+    buckets = gateway.healthy_candidate_buckets("good-model", "responses")
+
+    assert [bucket["name"] for bucket in buckets] == ["paid_fallback"]
+
+
 def test_exploration_does_not_include_paid_shadow(gateway, monkeypatch):
     monkeypatch.setattr(gateway.random, "random", lambda: 0.0)
     monkeypatch.setattr(gateway, "ROUTE_EXPLORATION_RATE", 1.0)
@@ -1001,6 +1044,78 @@ def test_runtime_failure_reason_for_endpoint_failures(gateway):
     assert gateway.runtime_failure_reason_for_endpoint_failures("responses", ["invalid_request", "invalid_request"]) is None
     assert gateway.runtime_failure_reason_for_endpoint_failures("chat", ["invalid_request"]) is None
     assert gateway.runtime_failure_reason_for_endpoint_failures("responses", ["invalid_request", "server_unavailable"]) == "all_endpoints_failed"
+
+
+@pytest.mark.asyncio()
+async def test_responses_shape_invalid_confirms_after_three_real_requests(gateway):
+    gateway.HEALTH = {
+        "responses": {
+            "good-model": {
+                "p1::good-model": {
+                    "provider_id": "p1",
+                    "actual_model": "good-model",
+                    "healthy": True,
+                    "kind": "responses",
+                    "priority": 100,
+                    "weight": 1,
+                    "reason": "ok",
+                },
+            }
+        },
+        "chat": {},
+    }
+    body = {"model": "good-model", "input": "ping", "stream": False}
+
+    await gateway.mark_responses_shape_invalid_attempt("responses", "good-model", "p1", body, {})
+    item = gateway.HEALTH["responses"]["good-model"]["p1::good-model"]
+    assert item["reason"] == "runtime_failure:responses_request_shape_unverified"
+    assert item["shape_invalid_count"] == 1
+    assert item["healthy"] is False
+
+    await gateway.mark_responses_shape_invalid_attempt("responses", "good-model", "p1", body, {})
+    await gateway.mark_responses_shape_invalid_attempt("responses", "good-model", "p1", body, {})
+    item = gateway.HEALTH["responses"]["good-model"]["p1::good-model"]
+    assert item["reason"] == "runtime_failure:real_shape_invalid"
+    assert item["shape_status"] == "real_shape_invalid"
+    assert item["shape_invalid_count"] == 3
+
+
+@pytest.mark.asyncio()
+async def test_responses_success_clears_shape_verification(gateway):
+    gateway.HEALTH = {
+        "responses": {
+            "good-model": {
+                "p1::good-model": {
+                    "provider_id": "p1",
+                    "actual_model": "good-model",
+                    "healthy": False,
+                    "kind": "responses",
+                    "priority": 100,
+                    "weight": 1,
+                    "reason": "runtime_failure:responses_request_shape_unverified",
+                    "shape_status": "confirming",
+                    "shape_invalid_count": 2,
+                    "shape_invalid_required": 3,
+                    "shape_fingerprint": "abc",
+                    "status_code": 400,
+                    "sample": "invalid codex request",
+                    "skipped": True,
+                    "skip_reason": "cooldown",
+                },
+            }
+        },
+        "chat": {},
+    }
+
+    await gateway.mark_runtime_success("responses", "good-model", "p1", 123)
+
+    item = gateway.HEALTH["responses"]["good-model"]["p1::good-model"]
+    assert item["reason"] == "ok"
+    assert item["healthy"] is True
+    assert "shape_invalid_count" not in item
+    assert item["status_code"] == 200
+    assert item["sample"] == ""
+    assert item["skipped"] is False
 
 
 @pytest.mark.asyncio()
@@ -1315,8 +1430,9 @@ async def test_responses_stream_invalid_request_does_not_cool_down_provider_afte
     joined = b"".join(chunks)
     item = gateway.HEALTH["responses"]["good-model"]["p1::good-model"]
     assert b"all_upstreams_failed" in joined
-    assert item["healthy"] is True
-    assert item["reason"] == "ok"
+    assert item["healthy"] is False
+    assert item["reason"] == "runtime_failure:responses_request_shape_unverified"
+    assert item["shape_invalid_count"] == 1
 
 
 @pytest.mark.asyncio()

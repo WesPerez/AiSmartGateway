@@ -667,6 +667,7 @@ ADMIN_HTML = """
                 <th>延迟</th>
                 <th>最近检测</th>
                 <th>下次探测</th>
+                <th>检测/冷却策略</th>
                 <th>详情</th>
               </tr>
             </thead>
@@ -1256,7 +1257,12 @@ ADMIN_HTML = """
               checked_at: item.checked_at,
               next_probe_at: item.next_probe_at,
               reason: item.reason || item.skip_reason || "",
-              actual_model: item.actual_model || ""
+              actual_model: item.actual_model || "",
+              shape_status: item.shape_status || "",
+              shape_invalid_count: Number(item.shape_invalid_count || 0),
+              shape_invalid_required: Number(item.shape_invalid_required || 3),
+              shape_invalid_last_at: item.shape_invalid_last_at,
+              shape_verification_source: item.shape_verification_source || ""
             };
             row.total_count += 1;
             if (item.healthy) row.healthy_count += 1;
@@ -1292,15 +1298,57 @@ ADMIN_HTML = """
     function kindStatusChip(kind, data) {
       if (!data) return `<span class="chip dark">${kind} 无记录</span>`;
       const requestShapeUnverified = kind === "responses" && ["invalid_request", "responses_request_shape_unverified", "runtime_failure:invalid_request", "runtime_failure:responses_request_shape_unverified"].includes(data.reason || "");
+      const realShapeInvalid = kind === "responses" && ["real_shape_invalid", "runtime_failure:real_shape_invalid"].includes(data.reason || "");
       const cls = data.healthy ? "ok" : (requestShapeUnverified ? "dark" : "warn");
-      const text = data.healthy ? "健康" : (requestShapeUnverified ? "待真实请求验证" : "异常");
+      const text = data.healthy ? "健康" : (realShapeInvalid ? "形态不兼容" : (requestShapeUnverified ? "待真实请求验证" : "异常"));
       return `<span class="chip ${cls}">${kind} ${text}${data.latency_ms == null ? "" : " " + data.latency_ms + "ms"}</span>`;
+    }
+
+    function cooldownSeconds(data) {
+      if (!data || !data.checked_at || !data.next_probe_at) return null;
+      return Math.max(0, Number(data.next_probe_at) - Number(data.checked_at));
+    }
+
+    function formatDuration(seconds) {
+      if (seconds == null) return "";
+      if (seconds >= 3600) return `${Math.round(seconds / 3600)} 小时`;
+      if (seconds >= 60) return `${Math.round(seconds / 60)} 分钟`;
+      return `${seconds} 秒`;
+    }
+
+    function upstreamPolicyDetail(row) {
+      const responses = row.kinds.responses;
+      if (responses) {
+        const reason = responses.reason || "";
+        const count = Number(responses.shape_invalid_count || 0);
+        const required = Number(responses.shape_invalid_required || 3);
+        if (["real_shape_invalid", "runtime_failure:real_shape_invalid"].includes(reason)) {
+          return `真实请求确认 ${required}/${required} 失败；自动冷却至 ${formatTs(responses.next_probe_at)}`;
+        }
+        if (["invalid_request", "responses_request_shape_unverified", "runtime_failure:invalid_request", "runtime_failure:responses_request_shape_unverified"].includes(reason)) {
+          const current = count > 0 ? count : 0;
+          const source = responses.shape_status === "probe_unverified" || current === 0 ? "探活形态不可信" : "真实请求确认中";
+          return `${source}；真实请求失败 ${current}/${required}，未满 ${required} 次仍会在付费兜底前验证`;
+        }
+      }
+      const data = responses || row.kinds.chat;
+      const ttl = formatDuration(cooldownSeconds(data));
+      if (row.healthy_count > 0) return `健康缓存${ttl ? " " + ttl : ""}；到期后增量探测`;
+      if (!data) return "暂无检测记录；等待增量探测";
+      const reason = data.reason || "";
+      if (["not_found", "model_unsupported"].includes(reason)) return `模型不支持长冷却${ttl ? " " + ttl : ""}`;
+      if (["auth_or_forbidden", "quota", "rate_limited", "server_unavailable", "empty_stream"].includes(reason)) return `异常冷却${ttl ? " " + ttl : ""}；到期后重试`;
+      if (reason.startsWith("runtime_failure:")) return `运行时失败冷却${ttl ? " " + ttl : ""}`;
+      return `按原因冷却${ttl ? " " + ttl : ""}`;
     }
 
     function upstreamDetail(row) {
       const reasons = Array.from(row.reasons).filter((reason) => reason && reason !== "ok").slice(0, 3);
+      if (reasons.some((reason) => ["real_shape_invalid", "runtime_failure:real_shape_invalid"].includes(reason))) {
+        return "真实 Codex Responses 请求连续确认失败，冷却期内不自动选用";
+      }
       if (reasons.some((reason) => ["invalid_request", "responses_request_shape_unverified", "runtime_failure:invalid_request", "runtime_failure:responses_request_shape_unverified"].includes(reason))) {
-        return "Responses 探活/当前请求形态被上游拒绝，保留为真实请求重试候选";
+        return "Responses 探活或真实请求形态被拒，按三次真实请求确认后再判不可用";
       }
       if (row.healthy_count <= 0 && reasons.length) return reasons.join(", ");
       const mapped = Array.from(row.actual_models).filter((actual) => actual && actual !== row.model).sort();
@@ -1331,6 +1379,7 @@ ADMIN_HTML = """
             <td>${latency == null ? "" : latency + " ms"}</td>
             <td>${formatTs(row.checked_at, "未检测")}</td>
             <td>${formatTs(row.next_probe_at)}</td>
+            <td>${escapeHtml(upstreamPolicyDetail(row))}</td>
             <td class="mono">${escapeHtml(detail)}</td>
           </tr>
         `;

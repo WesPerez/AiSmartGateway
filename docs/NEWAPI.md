@@ -194,25 +194,24 @@ Responses model/provider unavailable.
 Current behavior:
 
 - Probe `invalid_request` for Responses becomes request-shape-unverified.
-- Runtime `invalid_request` for Responses does not long-cooldown the provider.
-- Such providers remain retry candidates before paid fallback.
+- Runtime `invalid_request` for Responses is verified with the real client
+  request shape before the provider is judged unavailable.
+- Verification is keyed by the request-shape fingerprint. The default threshold
+  is 3 real request failures for the same provider/model/API kind/request shape.
+- Before 3 confirmations, such providers remain retry candidates before paid
+  fallback.
+- After 3 confirmations, the provider/model/kind is marked
+  `runtime_failure:real_shape_invalid` and receives a short cooldown.
+- A successful real request immediately marks the provider healthy and clears
+  the request-shape verification counter.
 - Paid fallback is not blocked merely because a non-paid provider returned
   `invalid_request`.
 
-Recommended next optimization:
+The default verification/cooldown knobs are:
 
-1. When a real client request gets `invalid_request` before any stream chunk,
-   retry the same logical provider with the real request shape up to a bounded
-   confirmation count.
-2. Prefer spreading the three confirmations across real request attempts or a
-   short verification window, rather than blindly spending three identical
-   retries every user request.
-3. Key the result by provider, model, API kind, endpoint URL, and request-shape
-   class.
-4. If all confirmations fail with the same semantic error, mark it
-   `real_shape_invalid` for a short cooldown.
-5. If any confirmation succeeds, immediately mark the provider/model/kind
-   healthy and route normally.
+- `RESPONSES_INVALID_REQUEST_CONFIRMATIONS=3`
+- `RESPONSES_INVALID_REQUEST_RETRY_SECONDS=60`
+- `RESPONSES_INVALID_REQUEST_COOLDOWN_SECONDS=1800`
 
 This gives a better balance than either extreme:
 

@@ -525,6 +525,9 @@ Smart Gateway 后台逐步增加和调整了：
 - 保留 New API 源渠道模型声明。
 - 删除错误的 paid fallback 阻断。
 - Responses `invalid_request` 请求形态待验证。
+- Responses `invalid_request` 真实请求三次确认机制：探活形态失败不直接误杀；真实客户端请求同一请求形态连续 3 次失败后才标记 `runtime_failure:real_shape_invalid` 并短冷却。
+- 成功真实请求会立即反写健康状态，并清空 request-shape failure counter。
+- 上游模型状态页显示探活/真实请求验证和冷却策略。
 - UI 显示优化。
 - 测试覆盖。
 
@@ -532,19 +535,17 @@ Smart Gateway 后台逐步增加和调整了：
 
 优先级最高：
 
-1. 实现 Responses `invalid_request` 的真实请求三次确认机制。
-2. 将 `probe_retry` 改造成 provider 主状态的 verification budget，而不是单独 route bucket。
-3. 在日志中增加“真实请求确认计数、shape fingerprint、确认状态”。
-4. 在上游模型状态页面显示“最小探活失败但真实请求待确认/成功/失败”。
-5. 对真实请求确认使用短 TTL，避免临时上游恢复后长期被跳过。
+1. 将 `probe_retry` 改造成 provider 主状态的 verification budget，而不是单独 route bucket。
+2. 在路由日志列表中增加“真实请求确认计数、shape fingerprint、确认状态”。
+3. 增加管理员手动清除某个 provider/model/kind 冷却和验证计数的按钮。
+4. 用真实 Codex 请求日志继续验证 anyrouter 通过 New API + Gateway 的完整链路。
 
 中优先级：
 
 1. 更精细地区分 `invalid_request`：缺字段、模型不支持、Codex shape 不合法、上游自定义校验。
 2. 对 stream 请求只在首块前允许重试。
-3. 对成功真实请求反写健康状态，并清空 request-shape failure counter。
-4. 增加按模型的“实际路由预览”接口，直接输出候选排序。
-5. New API 模型价格同步继续保留历史人工价格归档。
+3. 增加按模型的“实际路由预览”接口，直接输出候选排序。
+4. New API 模型价格同步继续保留历史人工价格归档。
 
 低优先级：
 
@@ -561,9 +562,9 @@ Smart Gateway 后台逐步增加和调整了：
 - 它避免了错误阻断付费兜底导致客户端失败。
 - 它保留了 New API 源渠道模型声明。
 - 它让真实请求日志成为判断依据。
+- 它已经把 Responses `invalid_request` 从“文档建议”落到服务器实际路由逻辑里。
 
 但它还不是最终最优：
 
-- 仍需要真实请求三次确认机制来准确处理 `invalid_request`。
 - 仍需要把 request-shape verification 从 route bucket 抽象成健康子状态。
 - 仍需要用真实 Codex 请求日志验证 anyrouter 通过 New API + Gateway 的完整链路。

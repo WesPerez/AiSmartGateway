@@ -51,6 +51,9 @@ PROBE_RATE_LIMIT_TTL_SECONDS = int(os.getenv("PROBE_RATE_LIMIT_TTL_SECONDS", "18
 PROBE_SERVER_ERROR_TTL_SECONDS = int(os.getenv("PROBE_SERVER_ERROR_TTL_SECONDS", "900"))
 PROBE_EXCEPTION_TTL_SECONDS = int(os.getenv("PROBE_EXCEPTION_TTL_SECONDS", "900"))
 PROBE_UNKNOWN_ERROR_TTL_SECONDS = int(os.getenv("PROBE_UNKNOWN_ERROR_TTL_SECONDS", "1800"))
+RESPONSES_INVALID_REQUEST_CONFIRMATIONS = max(1, int(os.getenv("RESPONSES_INVALID_REQUEST_CONFIRMATIONS", "3")))
+RESPONSES_INVALID_REQUEST_RETRY_SECONDS = int(os.getenv("RESPONSES_INVALID_REQUEST_RETRY_SECONDS", "60"))
+RESPONSES_INVALID_REQUEST_COOLDOWN_SECONDS = int(os.getenv("RESPONSES_INVALID_REQUEST_COOLDOWN_SECONDS", "1800"))
 ROUTE_EXPLORATION_RATE = max(0.0, min(1.0, float(os.getenv("ROUTE_EXPLORATION_RATE", "0.15"))))
 ROUTE_EXPLORATION_MAX_CANDIDATES = max(0, int(os.getenv("ROUTE_EXPLORATION_MAX_CANDIDATES", "1")))
 ALLOW_GATEWAY_PROVIDER_WRITE = os.getenv("ALLOW_GATEWAY_PROVIDER_WRITE", "false").lower() == "true"
@@ -345,6 +348,16 @@ def responses_request_shape_reason(reason: str | None) -> bool:
         "runtime_failure:invalid_request",
         "runtime_failure:responses_request_shape_unverified",
     }
+
+
+def responses_real_shape_invalid_reason(reason: str | None) -> bool:
+    return reason in {"real_shape_invalid", "runtime_failure:real_shape_invalid"}
+
+
+def request_shape_fingerprint(body: dict[str, Any], headers: dict[str, str] | None = None) -> str:
+    shape = request_shape(body, headers)
+    text = json.dumps(shape, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
 def preserve_probe_state(new_item: dict[str, Any], previous: dict[str, Any] | None) -> dict[str, Any]:
@@ -907,6 +920,8 @@ async def probe_one(provider: dict[str, Any], local_model: str, actual_model: st
                     last_result = {
                         "healthy": False,
                         "reason": reason,
+                        "shape_status": "probe_unverified" if kind == "responses" and reason == "responses_request_shape_unverified" else "",
+                        "shape_invalid_required": RESPONSES_INVALID_REQUEST_CONFIRMATIONS if kind == "responses" and reason == "responses_request_shape_unverified" else None,
                         "status_code": response.status_code,
                         "latency_ms": latency_ms,
                         "sample": text[:300],
@@ -922,6 +937,8 @@ async def probe_one(provider: dict[str, Any], local_model: str, actual_model: st
                     last_result = {
                         "healthy": False,
                         "reason": reason,
+                        "shape_status": "probe_unverified" if kind == "responses" and reason == "responses_request_shape_unverified" else "",
+                        "shape_invalid_required": RESPONSES_INVALID_REQUEST_CONFIRMATIONS if kind == "responses" and reason == "responses_request_shape_unverified" else None,
                         "status_code": response.status_code,
                         "latency_ms": latency_ms,
                         "sample": sample[:300],
@@ -1038,6 +1055,8 @@ async def probe_all(force: bool = False) -> None:
                     "checked_at": int(now()),
                     "next_probe_at": int(now()) + probe_cooldown_seconds(result.get("reason"), bool(result.get("healthy"))),
                     "sample": result.get("sample", ""),
+                    "shape_status": result.get("shape_status") or "",
+                    "shape_invalid_required": result.get("shape_invalid_required"),
                     "skipped": False,
                     "skip_reason": "",
                 }
@@ -1465,6 +1484,8 @@ def shadow_candidate_allowed(item: dict[str, Any], controls: dict[str, Any]) -> 
     if controls.get("provider_id") and controls.get("provider_id") == item.get("provider_id"):
         return True
     reason = str(item.get("reason") or "")
+    if responses_real_shape_invalid_reason(reason) and float(item.get("next_probe_at") or 0) > now():
+        return False
     if responses_request_shape_reason(reason) and item.get("kind") == "responses":
         return True
     if reason.startswith("runtime_failure:") and float(item.get("next_probe_at") or 0) > now():
@@ -1492,6 +1513,10 @@ def should_mark_runtime_failure(reason: str, kind: str | None = None) -> bool:
     return reason != "invalid_request"
 
 
+def should_verify_responses_request_shape(kind: str, endpoint_reasons: list[str]) -> bool:
+    return bool(endpoint_reasons) and kind == "responses" and all(reason == "invalid_request" for reason in endpoint_reasons)
+
+
 def should_mark_provider_all_endpoints_failed(kind: str, endpoint_reasons: list[str]) -> bool:
     return runtime_failure_reason_for_endpoint_failures(kind, endpoint_reasons) is not None
 
@@ -1499,7 +1524,7 @@ def should_mark_provider_all_endpoints_failed(kind: str, endpoint_reasons: list[
 def runtime_failure_reason_for_endpoint_failures(kind: str, endpoint_reasons: list[str]) -> str | None:
     if not endpoint_reasons:
         return "all_endpoints_failed"
-    if kind == "responses" and all(reason == "invalid_request" for reason in endpoint_reasons):
+    if should_verify_responses_request_shape(kind, endpoint_reasons):
         return None
     if any(should_mark_runtime_failure(reason, kind) for reason in endpoint_reasons):
         return "all_endpoints_failed"
@@ -1657,6 +1682,47 @@ async def mark_runtime_failure(kind: str, model: str, provider_id: str, reason: 
             await save_state()
 
 
+async def mark_responses_shape_invalid_attempt(
+    kind: str,
+    model: str,
+    provider_id: str,
+    body: dict[str, Any],
+    incoming_headers: dict[str, str] | None,
+    latency_ms: int | None = None,
+) -> None:
+    if kind != "responses":
+        return
+    fingerprint = request_shape_fingerprint(body, incoming_headers)
+    async with STATE_LOCK:
+        matched = [
+            item
+            for item in (HEALTH.get(kind, {}).get(model) or {}).values()
+            if item.get("provider_id") == provider_id
+        ]
+        now_int = int(now())
+        for item in matched:
+            previous_fingerprint = item.get("shape_fingerprint")
+            previous_count = int(item.get("shape_invalid_count") or 0) if previous_fingerprint == fingerprint else 0
+            count = previous_count + 1
+            confirmed = count >= RESPONSES_INVALID_REQUEST_CONFIRMATIONS
+            item["healthy"] = False
+            item["reason"] = "runtime_failure:real_shape_invalid" if confirmed else "runtime_failure:responses_request_shape_unverified"
+            item["checked_at"] = now_int
+            item["shape_status"] = "real_shape_invalid" if confirmed else "confirming"
+            item["shape_invalid_count"] = count
+            item["shape_invalid_required"] = RESPONSES_INVALID_REQUEST_CONFIRMATIONS
+            item["shape_fingerprint"] = fingerprint
+            item["shape_invalid_last_at"] = now_int
+            item["shape_verification_source"] = "runtime_real_request"
+            if latency_ms is not None:
+                item["latency_ms"] = latency_ms
+            item["next_probe_at"] = now_int + (
+                RESPONSES_INVALID_REQUEST_COOLDOWN_SECONDS if confirmed else RESPONSES_INVALID_REQUEST_RETRY_SECONDS
+            )
+        if matched:
+            await save_state()
+
+
 async def mark_runtime_success(kind: str, model: str, provider_id: str, latency_ms: int) -> None:
     async with STATE_LOCK:
         matched = [
@@ -1667,9 +1733,20 @@ async def mark_runtime_success(kind: str, model: str, provider_id: str, latency_
         for item in matched:
             item["healthy"] = True
             item["reason"] = "ok"
+            item["status_code"] = 200
             item["latency_ms"] = latency_ms
             item["checked_at"] = int(now())
             item["next_probe_at"] = int(now()) + PROBE_SUCCESS_TTL_SECONDS
+            item["sample"] = ""
+            item["skip_reason"] = ""
+            item["skipped"] = False
+            if kind == "responses":
+                item.pop("shape_status", None)
+                item.pop("shape_invalid_count", None)
+                item.pop("shape_invalid_required", None)
+                item.pop("shape_fingerprint", None)
+                item.pop("shape_invalid_last_at", None)
+                item.pop("shape_verification_source", None)
         if matched:
             await save_state()
 
@@ -1741,6 +1818,7 @@ async def relay_non_stream(
         route_fields = log_route_fields(chosen, route_bucket)
         tried.append({"provider_id": chosen["provider_id"], "actual_model": chosen["actual_model"], **route_fields})
         start = now()
+        endpoint_reasons: list[str] = []
         try:
             async with httpx.AsyncClient(
                 timeout=httpx.Timeout(provider.get("timeout_seconds") or REQUEST_TIMEOUT_SECONDS),
@@ -1753,6 +1831,7 @@ async def relay_non_stream(
                     response = await client.post(candidate_url, headers=provider_headers(provider, incoming_headers, kind), json=req_body)
                     if 200 <= response.status_code < 300:
                         break
+                    endpoint_reasons.append(classify_error(response.status_code, response.text[:1000]))
                 if response is None:
                     raise RuntimeError("no endpoint url")
             latency_ms = int((now() - start) * 1000)
@@ -1785,8 +1864,16 @@ async def relay_non_stream(
                     return JSONResponse(data, status_code=response.status_code)
                 return JSONResponse({"raw": text}, status_code=response.status_code)
             reason = classify_error(response.status_code, text[:1000])
-            if should_mark_runtime_failure(reason, kind):
-                await mark_runtime_failure(kind, model, chosen["provider_id"], reason)
+            if not endpoint_reasons or endpoint_reasons[-1] != reason:
+                endpoint_reasons.append(reason)
+            if should_verify_responses_request_shape(kind, endpoint_reasons):
+                await mark_responses_shape_invalid_attempt(kind, model, chosen["provider_id"], body, incoming_headers, latency_ms)
+            else:
+                runtime_failure_reason = runtime_failure_reason_for_endpoint_failures(kind, endpoint_reasons)
+                if runtime_failure_reason:
+                    await mark_runtime_failure(kind, model, chosen["provider_id"], runtime_failure_reason)
+                elif should_mark_runtime_failure(reason, kind):
+                    await mark_runtime_failure(kind, model, chosen["provider_id"], reason)
             await append_request_log(
                 {
                     "request_id": request_id,
@@ -2009,7 +2096,16 @@ async def relay_stream(
                         return
 
                 runtime_failure_reason = runtime_failure_reason_for_endpoint_failures(kind, endpoint_reasons)
-                if runtime_failure_reason:
+                if should_verify_responses_request_shape(kind, endpoint_reasons):
+                    await mark_responses_shape_invalid_attempt(
+                        kind,
+                        model,
+                        chosen["provider_id"],
+                        body,
+                        incoming_headers,
+                        int((now() - start) * 1000),
+                    )
+                elif runtime_failure_reason:
                     await mark_runtime_failure(kind, model, chosen["provider_id"], runtime_failure_reason)
         except Exception as exc:
             if stream_started:
