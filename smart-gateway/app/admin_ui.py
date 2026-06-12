@@ -246,6 +246,16 @@ ADMIN_HTML = """
       color: var(--danger);
       font-weight: 650;
     }
+    .help {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.6;
+      margin-top: 8px;
+    }
+    .help strong {
+      color: var(--text);
+      font-weight: 700;
+    }
     @media (max-width: 920px) {
       .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .provider-grid, .provider-wide { grid-template-columns: 1fr; }
@@ -265,8 +275,8 @@ ADMIN_HTML = """
         <div class="sub">New API 后置智能路由层：运行观测、健康矩阵、最终流向和兜底策略</div>
       </div>
       <div class="row">
-        <button id="refreshBtn">刷新</button>
-        <button id="logoutBtn">退出</button>
+        <button id="refreshBtn" title="只刷新当前管理页展示数据，不触发同步或探测">刷新</button>
+        <button id="logoutBtn" title="清除当前浏览器保存的 Admin Token">退出</button>
       </div>
     </div>
   </header>
@@ -353,8 +363,12 @@ ADMIN_HTML = """
             <button data-copy="adminUrl">复制</button>
           </div>
           <div class="row" style="margin-top: 12px;">
-            <button id="syncBtn" class="primary">同步 New API 源池</button>
-            <button id="probeBtn" class="primary">重载配置并增量探测</button>
+            <button id="syncBtn" class="primary" title="从 New API 读取带源池标签的渠道，生成 Smart Gateway 上游配置，并重载服务">同步 New API 源池</button>
+            <button id="probeBtn" class="primary" title="重新加载本地配置，并按冷却策略只探测到期或变化的模型通道">重载配置并增量探测</button>
+          </div>
+          <div class="help">
+            <strong>同步 New API 源池</strong>：把 New API 中带源池标签的渠道同步成 Gateway 上游；适合新增、删除、改 key、改 Base URL 后使用。
+            <strong>重载配置并增量探测</strong>：只重载并启动后台健康探测，不改 New API 渠道；探测遵守冷却策略，结果稍后点刷新查看。
           </div>
         </div>
       </section>
@@ -427,10 +441,15 @@ ADMIN_HTML = """
         <div class="row between" style="margin-bottom: 12px;">
           <div class="sub">源池策略会回写 New API 渠道。新增/删除上游、修改 key、模型权限、用户分组和订阅仍在 New API 管理。</div>
           <div class="row">
-            <button id="savePolicyBtn" class="primary">保存源池策略</button>
-            <button id="syncBtnProviders" class="primary">同步 New API 源池</button>
-            <button id="probeBtnProviders" class="primary">重载配置并增量探测</button>
+            <button id="savePolicyBtn" class="primary" title="保存当前页的启停、路由桶、成本层级、优先级、权重、Base URL 和声明模型">保存源池策略</button>
+            <button id="syncBtnProviders" class="primary" title="从 New API 重新拉取源池渠道，适合渠道或 key 在 New API 改过以后使用">同步 New API 源池</button>
+            <button id="probeBtnProviders" class="primary" title="重新加载本地配置，并按冷却策略启动后台增量探测">重载配置并增量探测</button>
           </div>
+        </div>
+        <div class="help">
+          <strong>保存源池策略</strong>：把本页策略写回 New API 渠道标签并同步到 Gateway。
+          <strong>同步 New API 源池</strong>：以 New API 渠道为准重新生成源池。
+          <strong>重载配置并增量探测</strong>：不保存页面改动，只让 Gateway 重新读取配置并后台检测到期通道。
         </div>
         <div class="notice">维护流程：New API 录入真实上游和 key；这里调整启停、权重、路由桶、成本层级和声明模型。保存后会自动写回 New API 渠道标签并同步 Smart Gateway。</div>
         <div id="providersEditor"></div>
@@ -505,6 +524,28 @@ ADMIN_HTML = """
       return fallbackOnly ? `${label} 仅兜底` : label;
     }
 
+    const routeOrder = {
+      primary: 0,
+      opportunistic: 1,
+      backup: 2,
+      paid_fallback: 3,
+      other: 4,
+      explore: 5,
+      probe_retry: 6,
+      shadow: 7
+    };
+
+    const costOrder = {
+      free: 0,
+      metered: 1,
+      paid: 2,
+      unknown: 3
+    };
+
+    function compareText(a, b) {
+      return String(a || "").localeCompare(String(b || ""));
+    }
+
     function renderOverview(data) {
       $("providerCount").textContent = data.provider_count;
       $("modelCount").textContent = data.models.length;
@@ -533,11 +574,27 @@ ADMIN_HTML = """
 
     function renderMatrix(data) {
       const rows = [];
+      const items = [];
       for (const kind of ["chat", "responses"]) {
         const group = data.health[kind] || {};
         for (const model of Object.keys(group).sort()) {
           for (const item of Object.values(group[model])) {
-            rows.push(`
+            items.push({ kind, model, item });
+          }
+        }
+      }
+      items.sort((a, b) =>
+        Number(b.item.checked_at || 0) - Number(a.item.checked_at || 0) ||
+        Number(a.item.next_probe_at || 0) - Number(b.item.next_probe_at || 0) ||
+        compareText(a.kind, b.kind) ||
+        compareText(a.model, b.model) ||
+        compareText(a.item.provider_name || a.item.provider_id, b.item.provider_name || b.item.provider_id)
+      );
+      for (const row of items) {
+        const kind = row.kind;
+        const model = row.model;
+        const item = row.item;
+        rows.push(`
               <tr>
                 <td>${kind}</td>
                 <td class="mono">${model}</td>
@@ -553,8 +610,6 @@ ADMIN_HTML = """
                 <td class="mono">${item.reason || item.skip_reason || ""}</td>
               </tr>
             `);
-          }
-        }
       }
       $("matrixBody").innerHTML = rows.join("");
     }
@@ -646,7 +701,26 @@ ADMIN_HTML = """
     }
 
     function renderProviders() {
-      $("providersEditor").innerHTML = providers.map(providerTemplate).join("");
+      const ordered = [...providers].sort((a, b) => {
+        const ap = a.editable_policy || {};
+        const bp = b.editable_policy || {};
+        const aEnabled = (ap.enabled ?? a.enabled) !== false;
+        const bEnabled = (bp.enabled ?? b.enabled) !== false;
+        const aFallback = (ap.fallback_only ?? a.fallback_only) === true;
+        const bFallback = (bp.fallback_only ?? b.fallback_only) === true;
+        const ar = a.runtime || {};
+        const br = b.runtime || {};
+        return Number(bEnabled) - Number(aEnabled) ||
+          (routeOrder[ap.route_group || a.route_group] ?? 99) - (routeOrder[bp.route_group || b.route_group] ?? 99) ||
+          Number(aFallback) - Number(bFallback) ||
+          (costOrder[ap.cost_tier || a.cost_tier] ?? 99) - (costOrder[bp.cost_tier || b.cost_tier] ?? 99) ||
+          Number(bp.priority ?? b.priority ?? 0) - Number(ap.priority ?? a.priority ?? 0) ||
+          Number(bp.weight ?? b.weight ?? 0) - Number(ap.weight ?? a.weight ?? 0) ||
+          Number(br.healthy ?? 0) - Number(ar.healthy ?? 0) ||
+          Number(ar.unhealthy ?? 0) - Number(br.unhealthy ?? 0) ||
+          compareText(a.name || a.id, b.name || b.id);
+      });
+      $("providersEditor").innerHTML = ordered.map(providerTemplate).join("");
     }
 
     function collectPolicyUpdates() {
@@ -705,7 +779,7 @@ ADMIN_HTML = """
       $("probeBtn").disabled = true;
       try {
         await api("/gateway-admin/reload", { method: "POST" });
-        setNotice("已重载配置，并按冷却策略增量探测。");
+        setNotice("已重载配置，并启动后台增量探测。探测遵守冷却策略，稍后点刷新查看最新结果。");
       } finally {
         $("probeBtn").disabled = false;
       }
@@ -745,7 +819,7 @@ ADMIN_HTML = """
       $("probeBtnProviders").disabled = true;
       try {
         await api("/gateway-admin/reload", { method: "POST" });
-        setNotice("已重载配置，并按冷却策略增量探测。");
+        setNotice("已重载配置，并启动后台增量探测。探测遵守冷却策略，稍后点刷新查看最新结果。");
       } finally {
         $("probeBtnProviders").disabled = false;
       }
