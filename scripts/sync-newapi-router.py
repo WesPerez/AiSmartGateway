@@ -27,6 +27,10 @@ DEFAULT_ROUTER_GROUPS = ["default", "vip"]
 ROUTER_NAME = "Smart Gateway Router"
 ROUTER_BASE_URL = "http://smart-gateway:8000"
 DEFAULT_MODEL_RATIO = 0.5
+MODEL_RATIO_KEY = "ModelRatio"
+MODEL_RATIO_ARCHIVE_KEY = "SmartGatewayModelRatioArchive"
+MODEL_SYNC_TAG = "smart-gateway"
+MODEL_AUTO_DISABLED_TAG = "smart-gateway-auto-disabled"
 VOLCES_CODING_DECLARED_MODELS = [
     "deepseek-v4-flash",
     "deepseek-v4-pro",
@@ -203,33 +207,64 @@ def load_router_models(master_key: str, gateway_url: str) -> str:
     return ",".join(models) if models else "gpt-5.5"
 
 
-def merge_model_ratio(con: sqlite3.Connection, models_csv: str) -> int:
-    models = [item.strip() for item in models_csv.split(",") if item.strip()]
-    if not models:
-        return 0
-    row = con.execute("select value from options where key = 'ModelRatio'").fetchone()
+def load_json_option(con: sqlite3.Connection, key: str) -> dict[str, Any]:
+    row = con.execute("select value from options where key = ?", (key,)).fetchone()
     try:
-        ratios = json.loads(row[0]) if row and row[0] else {}
+        data = json.loads(row[0]) if row and row[0] else {}
     except Exception:
-        ratios = {}
-    if not isinstance(ratios, dict):
-        ratios = {}
-    default_ratio = ratios.get("gpt-5.5", DEFAULT_MODEL_RATIO)
+        data = {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_json_option(con: sqlite3.Connection, key: str, value: dict[str, Any]) -> None:
+    text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    con.execute(
+        """
+        insert into options (key, value) values (?, ?)
+        on conflict(key) do update set value = excluded.value
+        """,
+        (key, text),
+    )
+
+
+def model_ratio_default(model: str, ratios: dict[str, Any], archive: dict[str, Any]) -> Any:
+    if model in archive:
+        return archive[model]
+    if model in ratios:
+        return ratios[model]
+    lowered = model.lower()
+    for prefix, value in [
+        ("gpt-5.5", ratios.get("gpt-5.5", DEFAULT_MODEL_RATIO)),
+        ("gpt-5", ratios.get("gpt-5.5", DEFAULT_MODEL_RATIO)),
+        ("claude-opus", ratios.get("claude-opus-4-7", 7.5)),
+        ("claude-sonnet", ratios.get("claude-sonnet-4-6", 1.5)),
+        ("claude-haiku", ratios.get("claude-haiku-4-5-20251001", 0.5)),
+        ("deepseek", ratios.get("deepseek-chat", 0.135)),
+        ("glm", ratios.get("glm-5.1", DEFAULT_MODEL_RATIO)),
+        ("gemini", ratios.get("gemini-2.5-pro", 0.625)),
+    ]:
+        if lowered.startswith(prefix):
+            return value
+    return ratios.get("gpt-5.5", DEFAULT_MODEL_RATIO)
+
+
+def sync_model_ratio(con: sqlite3.Connection, models_csv: str) -> tuple[int, int]:
+    models = [item.strip() for item in models_csv.split(",") if item.strip()]
+    current = set(models)
+    ratios = load_json_option(con, MODEL_RATIO_KEY)
+    archive = load_json_option(con, MODEL_RATIO_ARCHIVE_KEY)
+    archive.update(ratios)
+    next_ratios: dict[str, Any] = {}
     added = 0
     for model in models:
-        if model not in ratios:
-            ratios[model] = default_ratio
+        if model not in archive and model not in ratios:
             added += 1
-    if added:
-        value = json.dumps(ratios, ensure_ascii=False, separators=(",", ":"))
-        con.execute(
-            """
-            insert into options (key, value) values ('ModelRatio', ?)
-            on conflict(key) do update set value = excluded.value
-            """,
-            (value,),
-        )
-    return added
+        next_ratios[model] = model_ratio_default(model, ratios, archive)
+        archive[model] = next_ratios[model]
+    removed = len([model for model in ratios if model not in current])
+    write_json_option(con, MODEL_RATIO_KEY, next_ratios)
+    write_json_option(con, MODEL_RATIO_ARCHIVE_KEY, archive)
+    return added, removed
 
 
 def parse_groups(value: str | None) -> list[str]:
@@ -239,9 +274,14 @@ def parse_groups(value: str | None) -> list[str]:
 
 def disabled_models(con: sqlite3.Connection) -> set[str]:
     rows = con.execute(
-        "select model_name from models where status = 0 and deleted_at is null"
+        "select model_name, tags from models where status = 0 and deleted_at is null"
     ).fetchall()
-    return {str(row[0]) for row in rows if row[0]}
+    disabled: set[str] = set()
+    for row in rows:
+        tags = split_tags(row["tags"])
+        if row["model_name"] and MODEL_AUTO_DISABLED_TAG not in tags:
+            disabled.add(str(row["model_name"]))
+    return disabled
 
 
 def filter_models_csv(models_csv: str, disabled: set[str]) -> str:
@@ -283,10 +323,21 @@ def sync_router_abilities(
 
 def sync_models_table(con: sqlite3.Connection, models_csv: str) -> int:
     models = [item.strip() for item in models_csv.split(",") if item.strip()]
-    if not models:
-        return 0
+    current = set(models)
     now_ts = int(time.time())
     added = 0
+    rows = con.execute(
+        "select id, model_name, tags, status from models where deleted_at is null"
+    ).fetchall()
+    for row in rows:
+        tags = split_tags(row["tags"])
+        if MODEL_SYNC_TAG in tags and row["model_name"] not in current and row["status"] != 0:
+            if MODEL_AUTO_DISABLED_TAG not in tags:
+                tags.append(MODEL_AUTO_DISABLED_TAG)
+            con.execute(
+                "update models set tags = ?, status = 0, updated_time = ? where id = ?",
+                (",".join(tags), now_ts, row["id"]),
+            )
     for model in models:
         exists = con.execute(
             "select id, tags from models where model_name = ? and deleted_at is null",
@@ -294,12 +345,13 @@ def sync_models_table(con: sqlite3.Connection, models_csv: str) -> int:
         ).fetchone()
         if exists:
             tags = split_tags(exists["tags"])
-            if "smart-gateway" not in tags:
-                tags.append("smart-gateway")
-                con.execute(
-                    "update models set tags = ?, updated_time = ? where id = ?",
-                    (",".join(tags), now_ts, exists["id"]),
-                )
+            if MODEL_SYNC_TAG not in tags:
+                tags.append(MODEL_SYNC_TAG)
+            tags = [tag for tag in tags if tag != MODEL_AUTO_DISABLED_TAG]
+            con.execute(
+                "update models set tags = ?, status = 1, updated_time = ? where id = ?",
+                (",".join(tags), now_ts, exists["id"]),
+            )
         else:
             con.execute(
                 """
@@ -457,7 +509,7 @@ def sync(args: argparse.Namespace) -> None:
                 (master_key, ROUTER_NAME, now_ts, ROUTER_BASE_URL, models, DEFAULT_GROUP),
             )
             router_id = int(con.execute("select last_insert_rowid()").fetchone()[0])
-        model_ratio_added = merge_model_ratio(con, models)
+        model_ratio_added, model_ratio_removed = sync_model_ratio(con, models)
         abilities_synced = sync_router_abilities(con, int(router_id), source_channel_ids, models, router_groups)
         model_rows_added = sync_models_table(con, models)
         con.commit()
@@ -470,6 +522,7 @@ def sync(args: argparse.Namespace) -> None:
     print(f"router channel id: {router_id}")
     print(f"provider config changed: {providers_changed}")
     print(f"model ratios added: {model_ratio_added}")
+    print(f"model ratios removed from active set: {model_ratio_removed}")
     print(f"router abilities synced: {abilities_synced}")
     print(f"model rows added: {model_rows_added}")
     print(f"router groups: {','.join(router_groups)}")

@@ -8,11 +8,11 @@ ADMIN_HTML = """
   <style>
     :root {
       color-scheme: light;
-      --bg: #f6f7f9;
+      --bg: #f4f6f8;
       --panel: #ffffff;
-      --text: #17202a;
-      --muted: #667085;
-      --line: #d9dee7;
+      --text: #111827;
+      --muted: #5f6b7a;
+      --line: #d6dce5;
       --accent: #0f766e;
       --accent-dark: #115e59;
       --danger: #b42318;
@@ -123,7 +123,7 @@ ADMIN_HTML = """
       width: 100%;
       border: 1px solid var(--line);
       border-radius: 6px;
-      padding: 9px 10px;
+      padding: 8px 10px;
       font: inherit;
       background: #fff;
       color: var(--text);
@@ -184,19 +184,22 @@ ADMIN_HTML = """
     th, td {
       border-bottom: 1px solid var(--line);
       text-align: left;
-      padding: 10px 8px;
+      padding: 9px 8px;
       vertical-align: top;
     }
     th {
       color: var(--muted);
       font-weight: 700;
-      background: #fafbfc;
+      background: #f8fafc;
       position: sticky;
       top: 0;
       z-index: 1;
     }
+    tbody tr:hover {
+      background: #fbfcfe;
+    }
     .tablewrap {
-      max-height: 620px;
+      max-height: 680px;
       overflow: auto;
       border: 1px solid var(--line);
       border-radius: 8px;
@@ -215,11 +218,15 @@ ADMIN_HTML = """
       padding: 6px 10px;
     }
     .compact-input {
-      min-width: 82px;
+      min-width: 76px;
+      padding: 6px 8px;
     }
     .provider-models {
-      min-width: 260px;
-      min-height: 72px;
+      min-width: 240px;
+      min-height: 86px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.45;
     }
     .stack {
       display: flex;
@@ -228,6 +235,44 @@ ADMIN_HTML = """
     }
     .muted {
       color: var(--muted);
+    }
+    .cell-main {
+      font-weight: 700;
+      margin-bottom: 3px;
+    }
+    .cell-sub {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    .chiprow {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+      max-width: 360px;
+    }
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 2px 6px;
+      background: #fff;
+      white-space: nowrap;
+      font-size: 12px;
+    }
+    .chip.ok {
+      color: var(--ok);
+      border-color: #abefc6;
+      background: #ecfdf3;
+    }
+    .provider-selects select {
+      padding: 6px 8px;
+    }
+    .provider-base textarea {
+      min-height: 54px;
+      font-size: 12px;
+      line-height: 1.35;
     }
     .pill {
       display: inline-flex;
@@ -647,20 +692,21 @@ ADMIN_HTML = """
     function modelProviderSummary(model) {
       const upstreams = healthyModelProviders(model);
       if (!upstreams.length) return '<span class="muted">无健康上游</span>';
-      const providers = new Set(upstreams.map((item) => item.provider));
-      const routeCounts = {};
+      const byProvider = new Map();
       for (const item of upstreams) {
-        const label = routeLabel(item.route_group) || item.route_group || "未分组";
-        routeCounts[label] = (routeCounts[label] || 0) + 1;
+        const current = byProvider.get(item.provider);
+        if (!current || Number(item.priority) > Number(current.priority) || Number(item.weight) > Number(current.weight)) {
+          byProvider.set(item.provider, item);
+        }
       }
-      const fastest = upstreams
-        .filter((item) => item.latency_ms != null)
-        .sort((a, b) => Number(a.latency_ms) - Number(b.latency_ms))[0];
-      const parts = Object.entries(routeCounts).map(([name, count]) => `${name} ${count}`);
+      const items = Array.from(byProvider.values()).sort((a, b) =>
+        Number(b.priority) - Number(a.priority) ||
+        Number(b.weight) - Number(a.weight) ||
+        compareText(a.provider, b.provider)
+      );
       return `
-        <div class="stack">
-          <span>${providers.size} 个上游 / ${upstreams.length} 条健康通道</span>
-          <span class="muted">${parts.join("，")}${fastest ? ` / 最快 ${escapeHtml(fastest.provider)} ${fastest.latency_ms} ms` : ""}</span>
+        <div class="chiprow">
+          ${items.map((item) => `<span class="chip ok">${escapeHtml(item.provider)} W${item.weight}</span>`).join("")}
         </div>
       `;
     }
@@ -830,15 +876,15 @@ ADMIN_HTML = """
         <tr class="provider" data-index="${escapeHtml(p.id || "")}">
           <td>
             <div class="stack">
-              <strong>${escapeHtml(p.name || p.id || "provider")}</strong>
-              <span class="mono">${escapeHtml(p.id || "")}</span>
-              <span class="muted">${escapeHtml(p.api_key_preview || "")}</span>
+              <div class="cell-main">${escapeHtml(p.name || p.id || "provider")}</div>
+              <div class="cell-sub mono">${escapeHtml(p.id || "")}</div>
+              <div class="cell-sub">${escapeHtml(p.api_key_preview || "")}</div>
               <input type="hidden" data-field="id" value="${escapeHtml(key)}">
             </div>
           </td>
           <td><select data-field="enabled">${option("true", "启用", enabledValue)}${option("false", "停用", enabledValue)}</select></td>
           <td>
-            <div class="stack">
+            <div class="stack provider-selects">
               <select data-field="route_group">${option("primary", "主力", routeValue)}${option("opportunistic", "机会", routeValue)}${option("backup", "备份", routeValue)}${option("paid_fallback", "付费兜底", routeValue)}${option("other", "其它", routeValue)}</select>
               <select data-field="cost_tier">${option("free", "免费", costValue)}${option("metered", "计量", costValue)}${option("paid", "付费", costValue)}${option("unknown", "未知", costValue)}</select>
               <select data-field="fallback_only">${option("false", "非仅兜底", fallbackValue)}${option("true", "仅兜底", fallbackValue)}</select>
@@ -851,13 +897,13 @@ ADMIN_HTML = """
             </div>
           </td>
           <td>
-            <div class="stack">
+            <div class="stack provider-base">
               <input data-field="base_url" value="${escapeHtml(baseUrlValue)}">
               <textarea readonly>${escapeHtml(baseUrls)}</textarea>
             </div>
           </td>
           <td><textarea class="provider-models" data-field="models">${escapeHtml(models)}</textarea></td>
-          <td><div class="stack">${healthyModels.length ? healthyModels.map((m) => `<span class="mono">${escapeHtml(m)}</span>`).join("") : '<span class="muted">暂无健康模型</span>'}</div></td>
+          <td><div class="chiprow">${healthyModels.length ? healthyModels.map((m) => `<span class="chip ok mono">${escapeHtml(m)}</span>`).join("") : '<span class="muted">暂无健康模型</span>'}</div></td>
           <td>
             <div class="stack">
               <span class="pill ${p.enabled !== false ? "ok" : "bad"}">${p.enabled !== false ? "启用" : "停用"}</span>
