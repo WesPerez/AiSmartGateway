@@ -440,6 +440,32 @@ def test_healthy_candidates_keeps_lower_priority_failover(gateway):
     assert [item["provider_id"] for item in candidates] == ["p1", "p2"]
 
 
+def test_select_route_candidate_uses_priority_before_weight(gateway, monkeypatch):
+    selected_weights = []
+
+    def fake_pick_weighted(candidates):
+        selected_weights.append([item["provider_id"] for item in candidates])
+        return candidates[0]
+
+    monkeypatch.setattr(gateway, "pick_weighted", fake_pick_weighted)
+    buckets = [
+        {
+            "name": "primary",
+            "items": [
+                {"provider_id": "low-heavy", "priority": 10, "weight": 10000},
+                {"provider_id": "high-light", "priority": 100, "weight": 1},
+                {"provider_id": "high-heavy", "priority": 100, "weight": 100},
+            ],
+        }
+    ]
+
+    chosen, bucket_name = gateway.select_route_candidate(buckets)
+
+    assert bucket_name == "primary"
+    assert chosen["provider_id"] == "high-light"
+    assert selected_weights == [["high-light", "high-heavy"]]
+
+
 def test_healthy_candidate_buckets_order_paid_last(gateway, monkeypatch):
     monkeypatch.setattr(gateway, "ROUTE_EXPLORATION_RATE", 0.0)
     gateway.HEALTH = {

@@ -222,8 +222,8 @@ ADMIN_HTML = """
       padding: 6px 8px;
     }
     .provider-models {
-      min-width: 240px;
-      min-height: 86px;
+      min-width: 220px;
+      min-height: 70px;
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       font-size: 12px;
       line-height: 1.45;
@@ -249,7 +249,7 @@ ADMIN_HTML = """
       display: flex;
       flex-wrap: wrap;
       gap: 5px;
-      max-width: 360px;
+      max-width: 520px;
     }
     .chip {
       display: inline-flex;
@@ -266,6 +266,16 @@ ADMIN_HTML = """
       border-color: #abefc6;
       background: #ecfdf3;
     }
+    .chip.warn {
+      color: var(--warn);
+      border-color: #fedf89;
+      background: #fffaeb;
+    }
+    .chip.dark {
+      color: #344054;
+      border-color: #cbd5e1;
+      background: #f8fafc;
+    }
     .provider-selects select {
       padding: 6px 8px;
     }
@@ -274,6 +284,96 @@ ADMIN_HTML = """
       font-size: 12px;
       line-height: 1.35;
     }
+    .policy-hero {
+      display: grid;
+      grid-template-columns: minmax(260px, 360px) minmax(0, 1fr);
+      gap: 14px;
+      margin-bottom: 14px;
+    }
+    .policy-filter {
+      display: grid;
+      gap: 10px;
+      align-content: start;
+    }
+    .route-board {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(190px, 1fr));
+      gap: 10px;
+    }
+    .route-lane {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fbfcfe;
+      min-height: 120px;
+      overflow: hidden;
+    }
+    .lane-head {
+      padding: 10px;
+      border-bottom: 1px solid var(--line);
+      background: #fff;
+    }
+    .lane-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      font-weight: 800;
+      font-size: 13px;
+    }
+    .lane-sub {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+      margin-top: 4px;
+    }
+    .lane-body {
+      padding: 8px;
+      display: grid;
+      gap: 8px;
+    }
+    .route-card {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      padding: 9px;
+    }
+    .route-card.top {
+      border-color: #99f6e4;
+      box-shadow: inset 3px 0 0 var(--accent);
+    }
+    .route-card-title {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      font-weight: 750;
+      font-size: 13px;
+      line-height: 1.35;
+    }
+    .route-meta {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.6;
+      margin-top: 5px;
+    }
+    .models-mini {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+      margin-top: 7px;
+    }
+    .models-mini .chip {
+      font-size: 11px;
+      padding: 1px 5px;
+      max-width: 180px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .policy-table th:nth-child(1), .policy-table td:nth-child(1) { min-width: 220px; }
+    .policy-table th:nth-child(2), .policy-table td:nth-child(2) { min-width: 170px; }
+    .policy-table th:nth-child(3), .policy-table td:nth-child(3) { min-width: 120px; }
+    .policy-table th:nth-child(4), .policy-table td:nth-child(4) { min-width: 280px; }
+    .policy-table th:nth-child(5), .policy-table td:nth-child(5) { min-width: 260px; }
+    .policy-table th:nth-child(6), .policy-table td:nth-child(6) { min-width: 140px; }
     .pill {
       display: inline-flex;
       align-items: center;
@@ -331,6 +431,8 @@ ADMIN_HTML = """
     @media (max-width: 920px) {
       .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .provider-grid, .provider-wide { grid-template-columns: 1fr; }
+      .policy-hero { grid-template-columns: 1fr; }
+      .route-board { grid-template-columns: 1fr; }
     }
     @media (max-width: 560px) {
       .grid { grid-template-columns: 1fr; }
@@ -527,20 +629,28 @@ ADMIN_HTML = """
           <strong>同步 New API 源池</strong>：以 New API 渠道为准重新生成源池；新启用且未打标签的 default 渠道会自动纳入机会源池。
           <strong>重载配置并增量探测</strong>：不保存页面改动，只让 Gateway 重新读取配置并后台检测到期通道。
         </div>
-        <div class="notice">维护流程：New API 录入真实上游和 key；这里调整启停、权重、路由桶、成本层级和声明模型。保存后会自动写回 New API 渠道标签并同步 Smart Gateway。</div>
+        <div class="policy-hero">
+          <div class="panel policy-filter">
+            <h2>路由视图</h2>
+            <div class="notice">同模型同策略层级内，先用最高优先级；最高优先级内再按权重分流。付费兜底永远最后。</div>
+            <label for="modelFilter">按模型查看实际可走上游</label>
+            <input id="modelFilter" list="modelOptions" placeholder="输入或选择模型；留空显示全部启用上游">
+            <datalist id="modelOptions"></datalist>
+            <div id="routeHint" class="help"></div>
+          </div>
+          <div id="routeBoard" class="route-board"></div>
+        </div>
+        <div class="notice">维护流程：New API 录入真实上游和 key；这里调整启停、策略层级、成本类型、优先级、权重和声明模型。保存后会自动写回 New API 渠道标签并同步 Smart Gateway。</div>
         <div class="tablewrap">
-          <table>
+          <table class="policy-table">
             <thead>
               <tr>
                 <th>上游</th>
-                <th>启用</th>
-                <th>路由/成本</th>
-                <th>优先级/权重</th>
+                <th>策略层级</th>
+                <th>优先/权重</th>
                 <th>Base URL</th>
-                <th>声明模型</th>
-                <th>实际健康模型</th>
+                <th>模型</th>
                 <th>健康</th>
-                <th>标签</th>
               </tr>
             </thead>
             <tbody id="providersBody"></tbody>
@@ -600,17 +710,24 @@ ADMIN_HTML = """
       return ts ? new Date(ts * 1000).toLocaleString() : empty;
     }
 
+    const editableRoutes = [
+      { value: "primary", label: "1 主力优先", short: "主力", desc: "正常首选，适合稳定且希望优先消耗的上游" },
+      { value: "backup", label: "2 备份补位", short: "备份", desc: "主力没有健康通道时使用" },
+      { value: "opportunistic", label: "3 机会利用", short: "机会", desc: "不稳定或临时上游，默认排在备份之后" },
+      { value: "other", label: "4 低优先其他", short: "其他", desc: "特殊来源或暂不明确策略的上游" },
+      { value: "paid_fallback", label: "5 付费兜底", short: "付费兜底", desc: "所有非付费路径不可用后才使用" }
+    ];
+
+    const runtimeRoutes = [
+      { value: "explore", label: "自动探索", short: "探索", desc: "系统小概率试用待验证来源" },
+      { value: "probe_retry", label: "探测重试", short: "重试", desc: "Responses 特定错误的自动重试桶" },
+      { value: "shadow", label: "影子验证", short: "影子", desc: "非健康或待验证来源，不作为常规首选" }
+    ];
+
+    const routeMeta = Object.fromEntries([...editableRoutes, ...runtimeRoutes].map((item, index) => [item.value, { ...item, index }]));
+
     function routeLabel(value) {
-      return ({
-        primary: "主力",
-        opportunistic: "机会",
-        backup: "备份",
-        other: "其它",
-        explore: "探索",
-        probe_retry: "探测体重试",
-        shadow: "模型列表补偿",
-        paid_fallback: "付费兜底"
-      })[value] || value || "";
+      return routeMeta[value]?.short || value || "";
     }
 
     function costLabel(value, fallbackOnly = false) {
@@ -623,14 +740,14 @@ ADMIN_HTML = """
     }
 
     const routeOrder = {
+      explore: -1,
       primary: 0,
-      opportunistic: 1,
-      backup: 2,
-      paid_fallback: 3,
-      other: 4,
-      explore: 5,
-      probe_retry: 6,
-      shadow: 7
+      backup: 1,
+      opportunistic: 2,
+      other: 3,
+      probe_retry: 4,
+      shadow: 5,
+      paid_fallback: 6
     };
 
     const costOrder = {
@@ -671,6 +788,7 @@ ADMIN_HTML = """
           if (!item.healthy) continue;
           items.push({
             kind,
+            provider_id: item.provider_id || "",
             provider: item.provider_name || item.provider_id || "",
             actual_model: item.actual_model || "",
             route_group: item.route_group || "",
@@ -685,7 +803,85 @@ ADMIN_HTML = """
         (routeOrder[a.route_group] ?? 99) - (routeOrder[b.route_group] ?? 99) ||
         Number(b.priority) - Number(a.priority) ||
         Number(b.weight) - Number(a.weight) ||
+        Number(a.latency_ms ?? 999999) - Number(b.latency_ms ?? 999999) ||
         compareText(a.provider, b.provider)
+      );
+    }
+
+    function providerHealthyModelDetails(providerId, selectedModel = "") {
+      const items = [];
+      for (const kind of ["chat", "responses"]) {
+        const health = state?.health?.[kind] || {};
+        for (const model of Object.keys(health)) {
+          if (selectedModel && model !== selectedModel) continue;
+          for (const item of Object.values(health[model] || {})) {
+            if (item.healthy && item.provider_id === providerId) {
+              items.push({ model, kind, item });
+            }
+          }
+        }
+      }
+      return items.sort((a, b) =>
+        compareText(a.model, b.model) ||
+        compareText(a.kind, b.kind)
+      );
+    }
+
+    function enabledProviderRows() {
+      syncVisibleProviderDrafts();
+      return providers
+        .filter((p) => {
+          const policy = p.editable_policy || {};
+          return String(providerValue(p, "enabled", String((policy.enabled ?? p.enabled) !== false))) === "true";
+        })
+        .map((p) => {
+          const policy = p.editable_policy || {};
+          const route = providerValue(p, "route_group", policy.route_group || p.route_group || "primary");
+          const cost = providerValue(p, "cost_tier", policy.cost_tier || p.cost_tier || "free");
+          const fallback = String(providerValue(p, "fallback_only", String((policy.fallback_only ?? p.fallback_only) === true))) === "true" || route === "paid_fallback" || cost === "paid";
+          const runtime = p.runtime || {};
+          return {
+            provider: p,
+            route_group: fallback ? "paid_fallback" : route,
+            display_route: route,
+            cost_tier: cost,
+            fallback_only: fallback,
+            priority: Number(providerValue(p, "priority", policy.priority ?? p.priority ?? 0) || 0),
+            weight: Number(providerValue(p, "weight", policy.weight ?? p.weight ?? 0) || 0),
+            healthy: Number(runtime.healthy ?? 0),
+            unhealthy: Number(runtime.unhealthy ?? 0),
+            avg_latency_ms: runtime.avg_latency_ms
+          };
+        });
+    }
+
+    function candidateRowsForModel(model) {
+      if (!model) return [];
+      const rows = [];
+      for (const item of healthyModelProviders(model)) {
+        const provider = providers.find((p) => p.id === item.provider_id) || providers.find((p) => p.name === item.provider);
+        rows.push({
+          provider,
+          provider_name: item.provider,
+          route_group: item.route_group || "primary",
+          cost_tier: item.cost_tier || "",
+          priority: Number(item.priority || 0),
+          weight: Number(item.weight || 0),
+          latency_ms: item.latency_ms,
+          kind: item.kind,
+          actual_model: item.actual_model
+        });
+      }
+      return rows;
+    }
+
+    function sortedRouteRows(rows) {
+      return [...rows].sort((a, b) =>
+        (routeOrder[a.route_group] ?? 99) - (routeOrder[b.route_group] ?? 99) ||
+        Number(b.priority) - Number(a.priority) ||
+        Number(b.weight) - Number(a.weight) ||
+        Number(a.latency_ms ?? a.avg_latency_ms ?? 999999) - Number(b.latency_ms ?? b.avg_latency_ms ?? 999999) ||
+        compareText(a.provider?.name || a.provider_name || a.provider?.id, b.provider?.name || b.provider_name || b.provider?.id)
       );
     }
 
@@ -724,6 +920,73 @@ ADMIN_HTML = """
         }
       }
       return Array.from(models).sort();
+    }
+
+    function updateModelOptions() {
+      const models = new Set((state?.models || []).map((m) => m.id).filter(Boolean));
+      $("modelOptions").innerHTML = Array.from(models).sort().map((model) => `<option value="${escapeHtml(model)}"></option>`).join("");
+    }
+
+    function smallModelChips(items, limit = 8) {
+      const shown = items.slice(0, limit);
+      const rest = items.length - shown.length;
+      return `
+        <div class="models-mini">
+          ${shown.map((entry) => `<span class="chip ok mono" title="${escapeHtml(entry.model + " / " + entry.kind)}">${escapeHtml(entry.model)} ${entry.kind}</span>`).join("")}
+          ${rest > 0 ? `<span class="chip dark">+${rest}</span>` : ""}
+        </div>
+      `;
+    }
+
+    function routeCard(row, selectedModel, isTop) {
+      const provider = row.provider || {};
+      const name = row.provider_name || provider.name || provider.id || "unknown";
+      const latency = row.latency_ms ?? row.avg_latency_ms;
+      const models = selectedModel
+        ? [{ model: selectedModel, kind: row.kind || "" }]
+        : providerHealthyModelDetails(provider.id || "", "");
+      return `
+        <div class="route-card ${isTop ? "top" : ""}">
+          <div class="route-card-title">
+            <span>${escapeHtml(name)}</span>
+            <span class="pill ${row.fallback_only || row.cost_tier === "paid" ? "warn" : "ok"}">${escapeHtml(costLabel(row.cost_tier, row.fallback_only))}</span>
+          </div>
+          <div class="route-meta">
+            优先级 ${row.priority} / 权重 ${row.weight}${latency == null ? "" : ` / ${latency} ms`}<br>
+            ${selectedModel && row.actual_model ? `实际模型 <span class="mono">${escapeHtml(row.actual_model)}</span>` : `健康 ${row.healthy ?? models.length} / 异常 ${row.unhealthy ?? 0}`}
+          </div>
+          ${smallModelChips(models)}
+        </div>
+      `;
+    }
+
+    function renderRouteBoard() {
+      const selectedModel = $("modelFilter")?.value.trim() || "";
+      const sourceRows = selectedModel ? candidateRowsForModel(selectedModel) : enabledProviderRows();
+      const rows = sortedRouteRows(sourceRows);
+      const groups = editableRoutes.map((route) => {
+        const items = rows.filter((row) => row.route_group === route.value);
+        return { ...route, items };
+      });
+      const firstNonEmpty = groups.find((group) => group.items.length > 0);
+      $("routeHint").innerHTML = selectedModel
+        ? `当前模型：<span class="mono">${escapeHtml(selectedModel)}</span>，共 ${rows.length} 条健康可用上游。`
+        : `显示所有启用上游；选择模型后会按该模型真实健康通道排序。`;
+      $("routeBoard").innerHTML = groups.map((group) => {
+        const topPriority = Math.max(-1, ...group.items.map((item) => Number(item.priority || 0)));
+        const cardHtml = group.items.length
+          ? group.items.map((row) => routeCard(row, selectedModel, group === firstNonEmpty && Number(row.priority || 0) === topPriority)).join("")
+          : '<div class="muted">暂无启用健康上游</div>';
+        return `
+          <section class="route-lane">
+            <div class="lane-head">
+              <div class="lane-title"><span>${escapeHtml(group.label)}</span><span class="pill ${group.items.length ? "ok" : "bad"}">${group.items.length}</span></div>
+              <div class="lane-sub">${escapeHtml(group.desc)}</div>
+            </div>
+            <div class="lane-body">${cardHtml}</div>
+          </section>
+        `;
+      }).join("");
     }
 
     function providerKey(p) {
@@ -872,6 +1135,7 @@ ADMIN_HTML = """
       const weightValue = providerValue(p, "weight", policy.weight ?? p.weight ?? 100);
       const baseUrlValue = providerValue(p, "base_url", policy.base_url || p.base_url || "");
       const healthyModels = providerHealthyModels(p.id);
+      const routeOptions = editableRoutes.map((route) => option(route.value, route.label, routeValue)).join("");
       return `
         <tr class="provider" data-index="${escapeHtml(p.id || "")}">
           <td>
@@ -879,13 +1143,14 @@ ADMIN_HTML = """
               <div class="cell-main">${escapeHtml(p.name || p.id || "provider")}</div>
               <div class="cell-sub mono">${escapeHtml(p.id || "")}</div>
               <div class="cell-sub">${escapeHtml(p.api_key_preview || "")}</div>
+              <div>${p.enabled !== false ? '<span class="pill ok">启用</span>' : '<span class="pill bad">停用</span>'}</div>
               <input type="hidden" data-field="id" value="${escapeHtml(key)}">
             </div>
           </td>
-          <td><select data-field="enabled">${option("true", "启用", enabledValue)}${option("false", "停用", enabledValue)}</select></td>
           <td>
             <div class="stack provider-selects">
-              <select data-field="route_group">${option("primary", "主力", routeValue)}${option("opportunistic", "机会", routeValue)}${option("backup", "备份", routeValue)}${option("paid_fallback", "付费兜底", routeValue)}${option("other", "其它", routeValue)}</select>
+              <select data-field="enabled">${option("true", "启用", enabledValue)}${option("false", "停用", enabledValue)}</select>
+              <select data-field="route_group">${routeOptions}</select>
               <select data-field="cost_tier">${option("free", "免费", costValue)}${option("metered", "计量", costValue)}${option("paid", "付费", costValue)}${option("unknown", "未知", costValue)}</select>
               <select data-field="fallback_only">${option("false", "非仅兜底", fallbackValue)}${option("true", "仅兜底", fallbackValue)}</select>
             </div>
@@ -902,17 +1167,22 @@ ADMIN_HTML = """
               <textarea readonly>${escapeHtml(baseUrls)}</textarea>
             </div>
           </td>
-          <td><textarea class="provider-models" data-field="models">${escapeHtml(models)}</textarea></td>
-          <td><div class="chiprow">${healthyModels.length ? healthyModels.map((m) => `<span class="chip ok mono">${escapeHtml(m)}</span>`).join("") : '<span class="muted">暂无健康模型</span>'}</div></td>
           <td>
             <div class="stack">
-              <span class="pill ${p.enabled !== false ? "ok" : "bad"}">${p.enabled !== false ? "启用" : "停用"}</span>
+              <label>声明模型</label>
+              <textarea class="provider-models" data-field="models">${escapeHtml(models)}</textarea>
+              <label>实际健康模型</label>
+              <div class="chiprow">${healthyModels.length ? healthyModels.slice(0, 18).map((m) => `<span class="chip ok mono">${escapeHtml(m)}</span>`).join("") + (healthyModels.length > 18 ? `<span class="chip dark">+${healthyModels.length - 18}</span>` : "") : '<span class="muted">暂无健康模型</span>'}</div>
+            </div>
+          </td>
+          <td>
+            <div class="stack">
               <span>健康 ${runtime.healthy ?? 0}</span>
               <span>异常 ${runtime.unhealthy ?? 0}</span>
               <span>${runtime.avg_latency_ms == null ? "" : runtime.avg_latency_ms + " ms"}</span>
+              <span class="mono">${escapeHtml(policy.tag || p.tag || "")}</span>
             </div>
           </td>
-          <td class="mono">${escapeHtml(policy.tag || p.tag || "")}</td>
         </tr>
       `;
     }
@@ -991,6 +1261,8 @@ ADMIN_HTML = """
       renderMatrix(overview);
       renderLogs(logs);
       renderProviders();
+      updateModelOptions();
+      renderRouteBoard();
     }
 
     $("loginBtn").addEventListener("click", async () => {
@@ -1071,7 +1343,10 @@ ADMIN_HTML = """
       if (name === "models") renderModels(state);
       if (name === "matrix") renderMatrix(state);
       if (name === "logs") renderLogs(logsData);
-      if (name === "providers") renderProviders();
+      if (name === "providers") {
+        renderProviders();
+        renderRouteBoard();
+      }
     });
 
     document.querySelectorAll(".tab").forEach((tab) => {
@@ -1080,7 +1355,24 @@ ADMIN_HTML = """
         document.querySelectorAll(".tabpane").forEach((x) => x.classList.add("hidden"));
         tab.classList.add("active");
         $("tab-" + tab.dataset.tab).classList.remove("hidden");
+        if (tab.dataset.tab === "providers") renderRouteBoard();
       });
+    });
+
+    $("modelFilter").addEventListener("input", renderRouteBoard);
+
+    document.addEventListener("input", (event) => {
+      if (!event.target.closest("#tab-providers")) return;
+      if (!event.target.matches("input, textarea, select")) return;
+      syncVisibleProviderDrafts();
+      renderRouteBoard();
+    });
+
+    document.addEventListener("change", (event) => {
+      if (!event.target.closest("#tab-providers")) return;
+      if (!event.target.matches("input, textarea, select")) return;
+      syncVisibleProviderDrafts();
+      renderRouteBoard();
     });
 
     document.querySelectorAll("[data-copy]").forEach((btn) => {

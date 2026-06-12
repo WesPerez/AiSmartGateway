@@ -1500,8 +1500,16 @@ def select_route_candidate(buckets: list[dict[str, Any]]) -> tuple[dict[str, Any
     for bucket in buckets:
         items = bucket["items"]
         if items:
-            return pick_weighted(items), bucket["name"]
+            return pick_priority_weighted(items), bucket["name"]
     return None
+
+
+def pick_priority_weighted(candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    if not candidates:
+        raise ValueError("candidates must not be empty")
+    highest_priority = max(int(item.get("priority") or 0) for item in candidates)
+    highest = [item for item in candidates if int(item.get("priority") or 0) == highest_priority]
+    return pick_weighted(highest)
 
 
 def pick_weighted(candidates: list[dict[str, Any]]) -> dict[str, Any]:
