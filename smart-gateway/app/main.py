@@ -503,6 +503,9 @@ def load_newapi_channel_rows() -> list[dict[str, Any]]:
     con = sqlite3.connect(NEWAPI_DB)
     con.row_factory = sqlite3.Row
     try:
+        table = con.execute("select name from sqlite_master where type = 'table' and name = 'channels'").fetchone()
+        if not table:
+            return []
         rows = con.execute(
             """
             select id, name, status, priority, weight, base_url, models, tag, "group", remark, key
@@ -1027,7 +1030,12 @@ async def admin_providers(
         return unauthorized
     raw = (load_yaml(PROVIDERS_FILE).get("providers") or [])
     expanded = expand_env({"providers": raw}).get("providers") or []
-    channel_rows = {int(row["id"]): row for row in load_newapi_channel_rows()}
+    source_warning = None
+    try:
+        channel_rows = {int(row["id"]): row for row in load_newapi_channel_rows()}
+    except sqlite3.Error as exc:
+        channel_rows = {}
+        source_warning = f"New API database unavailable: {exc}"
     runtime = provider_runtime_summary()
     providers = []
     for index, item in enumerate(raw):
@@ -1064,7 +1072,10 @@ async def admin_providers(
                 "tag": provider["tag"],
             }
         providers.append(provider)
-    return {"providers": providers}
+    response = {"providers": providers}
+    if source_warning:
+        response["source_warning"] = source_warning
+    return response
 
 
 @app.post("/admin/api/source-policy")

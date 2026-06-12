@@ -1212,6 +1212,14 @@ def test_update_newapi_source_policy_parses_string_booleans(gateway, tmp_path, m
     assert row == (1, "gateway-source,gw:primary,gw:free")
 
 
+def test_load_newapi_channel_rows_ignores_empty_database(gateway, tmp_path, monkeypatch):
+    db = tmp_path / "one-api.db"
+    sqlite3.connect(db).close()
+    monkeypatch.setattr(gateway, "NEWAPI_DB", db)
+
+    assert gateway.load_newapi_channel_rows() == []
+
+
 @pytest.mark.asyncio()
 async def test_admin_reload_uses_incremental_probe_by_default(gateway, monkeypatch):
     scheduled = []

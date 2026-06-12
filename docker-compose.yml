@@ -17,7 +17,7 @@ services:
       - ./config:/app/config
       - ./data:/data
       - ./:/workspace
-      - ${NEWAPI_DATA_DIR:-./newapi-data}:/newapi-data
+      - ${NEWAPI_DATA_DIR:?set NEWAPI_DATA_DIR to the New API data directory}:/newapi-data
     expose:
       - "8000"
     ports:
