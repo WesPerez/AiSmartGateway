@@ -233,6 +233,10 @@ ADMIN_HTML = """
     .pager button {
       padding: 6px 10px;
     }
+    .pager select {
+      width: auto;
+      padding: 6px 8px;
+    }
     .compact-input {
       min-width: 76px;
       padding: 6px 8px;
@@ -294,11 +298,6 @@ ADMIN_HTML = """
     }
     .provider-selects select {
       padding: 6px 8px;
-    }
-    .provider-base textarea {
-      min-height: 54px;
-      font-size: 12px;
-      line-height: 1.35;
     }
     .policy-hero {
       display: grid;
@@ -654,7 +653,7 @@ ADMIN_HTML = """
                 <th>策略</th>
                 <th>模型</th>
                 <th>接口</th>
-                <th>状态</th>
+                <th>状态 <label class="inline-toggle"><input id="showUnhealthyUpstreams" type="checkbox">显示异常</label></th>
                 <th>延迟</th>
                 <th>最近检测</th>
                 <th>下次探测</th>
@@ -719,7 +718,8 @@ ADMIN_HTML = """
     let providers = [];
     let logsData = { logs: [] };
     let providerDrafts = {};
-    const pageSize = 25;
+    const pageSizeOptions = [10, 25, 50, 100, 200];
+    const pageSizes = { models: 25, matrix: 25, upstreams: 25, logs: 25, providers: 25 };
     const pages = { models: 1, matrix: 1, upstreams: 1, logs: 1, providers: 1 };
 
     const $ = (id) => document.getElementById(id);
@@ -799,10 +799,11 @@ ADMIN_HTML = """
 
     function paginate(name, items) {
       const total = items.length;
-      const totalPages = Math.max(1, Math.ceil(total / pageSize));
+      const size = pageSizes[name] || 25;
+      const totalPages = Math.max(1, Math.ceil(total / size));
       pages[name] = Math.min(Math.max(1, pages[name] || 1), totalPages);
-      const start = (pages[name] - 1) * pageSize;
-      return { items: items.slice(start, start + pageSize), total, totalPages };
+      const start = (pages[name] - 1) * size;
+      return { items: items.slice(start, start + size), total, totalPages };
     }
 
     function renderPager(name, total, totalPages) {
@@ -811,6 +812,9 @@ ADMIN_HTML = """
       const page = pages[name] || 1;
       el.innerHTML = `
         <span>第 ${page} / ${totalPages} 页，共 ${total} 条</span>
+        <select data-page-size="${name}" title="每页条数">
+          ${pageSizeOptions.map((size) => `<option value="${size}" ${Number(pageSizes[name] || 25) === size ? "selected" : ""}>${size} / 页</option>`).join("")}
+        </select>
         <button data-page="${name}" data-dir="-1" ${page <= 1 ? "disabled" : ""}>上一页</button>
         <button data-page="${name}" data-dir="1" ${page >= totalPages ? "disabled" : ""}>下一页</button>
       `;
@@ -828,7 +832,6 @@ ADMIN_HTML = """
             provider: item.provider_name || item.provider_id || "",
             actual_model: item.actual_model || "",
             route_group: item.route_group || "",
-            cost_tier: item.cost_tier || "",
             priority: item.priority ?? 0,
             weight: item.weight ?? 0,
             latency_ms: item.latency_ms
@@ -885,14 +888,12 @@ ADMIN_HTML = """
         .map((p) => {
           const policy = p.editable_policy || {};
           const route = providerValue(p, "route_group", policy.route_group || p.route_group || "primary");
-          const cost = providerValue(p, "cost_tier", policy.cost_tier || p.cost_tier || "free");
-          const fallback = route === "paid_fallback" || cost === "paid";
+          const fallback = route === "paid_fallback" || (policy.fallback_only ?? p.fallback_only) === true;
           const runtime = p.runtime || {};
           return {
             provider: p,
             route_group: fallback ? "paid_fallback" : route,
             display_route: route,
-            cost_tier: cost,
             fallback_only: fallback,
             priority: Number(providerValue(p, "priority", policy.priority ?? p.priority ?? 0) || 0),
             weight: Number(providerValue(p, "weight", policy.weight ?? p.weight ?? 0) || 0),
@@ -914,7 +915,6 @@ ADMIN_HTML = """
           provider,
           provider_name: item.provider,
           route_group: item.route_group || "primary",
-          cost_tier: item.cost_tier || "",
           priority: Number(item.priority || 0),
           weight: Number(item.weight || 0),
           latency_ms: item.latency_ms,
@@ -1089,7 +1089,6 @@ ADMIN_HTML = """
           id,
           enabled: get("enabled"),
           route_group: get("route_group"),
-          cost_tier: get("cost_tier"),
           fallback_only: get("fallback_only"),
           priority: get("priority"),
           weight: get("weight"),
@@ -1196,13 +1195,13 @@ ADMIN_HTML = """
               provider_name: item.provider_name || provider.name || providerId,
               model,
               route_group: item.route_group || policy.route_group || provider.route_group || "",
-              cost_tier: item.cost_tier || policy.cost_tier || provider.cost_tier || "",
               priority: Number(item.priority ?? policy.priority ?? provider.priority ?? 0),
               weight: Number(item.weight ?? policy.weight ?? provider.weight ?? 0),
               kinds: {},
               checked_at: 0,
               next_probe_at: null,
-              best_latency: null,
+              best_healthy_latency: null,
+              best_failed_latency: null,
               healthy_count: 0,
               total_count: 0,
               reasons: new Set(),
@@ -1222,14 +1221,17 @@ ADMIN_HTML = """
             if (item.actual_model) row.actual_models.add(item.actual_model);
             if (item.checked_at && item.checked_at > row.checked_at) row.checked_at = item.checked_at;
             if (item.next_probe_at && (row.next_probe_at == null || item.next_probe_at < row.next_probe_at)) row.next_probe_at = item.next_probe_at;
-            if (item.latency_ms != null && (row.best_latency == null || item.latency_ms < row.best_latency)) row.best_latency = item.latency_ms;
+            if (item.latency_ms != null && item.healthy && (row.best_healthy_latency == null || item.latency_ms < row.best_healthy_latency)) row.best_healthy_latency = item.latency_ms;
+            if (item.latency_ms != null && !item.healthy && (row.best_failed_latency == null || item.latency_ms < row.best_failed_latency)) row.best_failed_latency = item.latency_ms;
             byKey.set(key, row);
           }
         }
       }
       const upstreamKeyword = ($("upstreamFilter")?.value || "").trim().toLowerCase();
       const modelKeyword = ($("upstreamModelFilter")?.value || "").trim().toLowerCase();
+      const showUnhealthy = $("showUnhealthyUpstreams")?.checked === true;
       return Array.from(byKey.values()).filter((row) => {
+        if (!showUnhealthy && row.healthy_count <= 0) return false;
         const upstreamText = `${row.provider_name} ${row.provider_id}`.toLowerCase();
         const modelText = `${row.model} ${Array.from(row.actual_models).join(" ")}`.toLowerCase();
         return (!upstreamKeyword || upstreamText.includes(upstreamKeyword)) && (!modelKeyword || modelText.includes(modelKeyword));
@@ -1238,7 +1240,7 @@ ADMIN_HTML = """
         Number(b.priority) - Number(a.priority) ||
         Number(b.weight) - Number(a.weight) ||
         Number(b.healthy_count > 0) - Number(a.healthy_count > 0) ||
-        Number(a.best_latency ?? 999999) - Number(b.best_latency ?? 999999) ||
+        Number((a.best_healthy_latency ?? a.best_failed_latency) ?? 999999) - Number((b.best_healthy_latency ?? b.best_failed_latency) ?? 999999) ||
         compareText(a.provider_name, b.provider_name) ||
         compareText(a.model, b.model)
       );
@@ -1257,6 +1259,7 @@ ADMIN_HTML = """
       $("upstreamsBody").innerHTML = page.items.map((row) => {
         const actual = Array.from(row.actual_models).sort().join(", ");
         const reasons = Array.from(row.reasons).slice(0, 3).join(", ");
+        const latency = row.best_healthy_latency ?? row.best_failed_latency;
         return `
           <tr>
             <td>
@@ -1270,7 +1273,7 @@ ADMIN_HTML = """
             <td class="mono">${escapeHtml(row.model)}</td>
             <td><div class="chiprow">${kindStatusChip("chat", row.kinds.chat)}${kindStatusChip("responses", row.kinds.responses)}</div></td>
             <td>${statusPill(row.healthy_count > 0, row.healthy_count > 0 && row.healthy_count < row.total_count)}</td>
-            <td>${row.best_latency == null ? "" : row.best_latency + " ms"}</td>
+            <td>${latency == null ? "" : latency + " ms"}</td>
             <td>${formatTs(row.checked_at, "未检测")}</td>
             <td>${formatTs(row.next_probe_at)}</td>
             <td class="mono">${escapeHtml(actual || reasons)}</td>
@@ -1309,7 +1312,6 @@ ADMIN_HTML = """
       const key = providerKey(p);
       const models = providerValue(p, "models", policy.models || (p.declared_models || []).join(","));
       const runtime = p.runtime || {};
-      const baseUrls = (policy.base_urls || p.base_urls || [policy.base_url || p.base_url || ""]).join("\\n");
       const enabledValue = String(providerValue(p, "enabled", String((policy.enabled ?? p.enabled) !== false)));
       const routeValue = providerValue(p, "route_group", policy.route_group || p.route_group);
       const fallbackValue = String(providerValue(p, "fallback_only", String((policy.fallback_only ?? p.fallback_only) === true)));
@@ -1333,7 +1335,6 @@ ADMIN_HTML = """
             <div class="stack provider-selects">
               <select data-field="enabled">${option("true", "启用", enabledValue)}${option("false", "停用", enabledValue)}</select>
               <select data-field="route_group">${routeOptions}</select>
-              <input type="hidden" data-field="cost_tier" value="unknown">
               <input type="hidden" data-field="fallback_only" value="${escapeHtml(fallbackValue)}">
               <div class="cell-sub">付费兜底只由策略层级决定</div>
             </div>
@@ -1347,7 +1348,6 @@ ADMIN_HTML = """
           <td>
             <div class="stack provider-base">
               <input data-field="base_url" value="${escapeHtml(baseUrlValue)}">
-              <textarea readonly>${escapeHtml(baseUrls)}</textarea>
             </div>
           </td>
           <td>
@@ -1418,7 +1418,6 @@ ADMIN_HTML = """
           id: Number(key),
           enabled: String(get("enabled", String((policy.enabled ?? provider.enabled) !== false))) === "true",
           route_group: routeGroup,
-          cost_tier: "unknown",
           fallback_only: routeGroup === "paid_fallback",
           priority: Number(get("priority", policy.priority ?? provider.priority ?? 0) || 0),
           weight: Number(get("weight", policy.weight ?? provider.weight ?? 100) || 100),
@@ -1547,6 +1546,23 @@ ADMIN_HTML = """
       }
     });
 
+    document.addEventListener("change", (event) => {
+      const select = event.target.closest("[data-page-size]");
+      if (!select) return;
+      const name = select.dataset.pageSize;
+      if (name === "providers") syncVisibleProviderDrafts();
+      pageSizes[name] = Number(select.value || 25);
+      pages[name] = 1;
+      if (name === "models") renderModels(state);
+      if (name === "matrix") renderMatrix(state);
+      if (name === "upstreams") renderUpstreams();
+      if (name === "logs") renderLogs(logsData);
+      if (name === "providers") {
+        renderProviders();
+        renderRouteBoard();
+      }
+    });
+
     document.querySelectorAll(".tab").forEach((tab) => {
       tab.addEventListener("click", () => {
         document.querySelectorAll(".tab").forEach((x) => x.classList.remove("active"));
@@ -1564,6 +1580,7 @@ ADMIN_HTML = """
     }
     $("upstreamFilter").addEventListener("input", handleUpstreamFilterInput);
     $("upstreamModelFilter").addEventListener("input", handleUpstreamFilterInput);
+    $("showUnhealthyUpstreams").addEventListener("change", handleUpstreamFilterInput);
 
     document.addEventListener("input", (event) => {
       if (!event.target.closest("#tab-providers")) return;

@@ -434,12 +434,10 @@ def split_tags(value: str | None) -> list[str]:
     return [item.strip() for item in re.split(r"[,;\s]+", value or "") if item.strip()]
 
 
-def normalize_route_tag_value(route_group: str, cost_tier: str, fallback_only: bool) -> str:
+def normalize_route_tag_value(route_group: str, fallback_only: bool) -> str:
     tags: list[str] = ["gateway-source"]
     if route_group:
         tags.append(f"gw:{route_group}")
-    if cost_tier:
-        tags.append(f"gw:{cost_tier}")
     if fallback_only:
         tags.append("gw:fallback-only")
     return ",".join(dict.fromkeys(tags))
@@ -460,6 +458,9 @@ def parse_route_tags(tag_value: str | None) -> dict[str, Any]:
                 cost_tier = "paid"
         elif value in {"free", "metered", "paid", "unknown"}:
             cost_tier = value
+            if value == "paid":
+                route_group = "paid_fallback"
+                fallback_only = True
         elif value == "fallback-only":
             fallback_only = True
         elif value == "not-fallback-only":
@@ -529,7 +530,6 @@ def update_newapi_source_policy(updates: list[dict[str, Any]]) -> int:
     if not NEWAPI_DB.exists():
         raise ValueError(f"New API database not found: {NEWAPI_DB}")
     allowed_routes = {"primary", "opportunistic", "backup", "paid_fallback", "other"}
-    allowed_costs = {"free", "metered", "unknown"}
     con = sqlite3.connect(NEWAPI_DB)
     try:
         changed = 0
@@ -544,11 +544,8 @@ def update_newapi_source_policy(updates: list[dict[str, Any]]) -> int:
             if not existing:
                 raise ValueError(f"channel not found: {channel_id}")
             route_group = str(update.get("route_group") or "primary").strip()
-            cost_tier = str(update.get("cost_tier") or "free").strip()
             if route_group not in allowed_routes:
                 raise ValueError(f"unsupported route_group: {route_group}")
-            if cost_tier not in allowed_costs:
-                raise ValueError(f"unsupported cost_tier: {cost_tier}")
             fallback_only = route_group == "paid_fallback" or parse_bool(update.get("fallback_only"), False)
             status = 1 if parse_bool(update.get("enabled"), True) else 0
             weight = max(1, min(10000, int(update.get("weight") or 100)))
@@ -563,7 +560,7 @@ def update_newapi_source_policy(updates: list[dict[str, Any]]) -> int:
                 models = ",".join(
                     dict.fromkeys(item.strip() for item in str(models_value or "").replace("\n", ",").split(",") if item.strip())
                 )
-            tag = normalize_route_tag_value(route_group, cost_tier, fallback_only)
+            tag = normalize_route_tag_value(route_group, fallback_only)
             con.execute(
                 """
                 update channels
@@ -1097,7 +1094,6 @@ async def admin_providers(
                 "id": channel_data["id"],
                 "enabled": provider["enabled"],
                 "route_group": provider["route_group"],
-                "cost_tier": provider["cost_tier"],
                 "fallback_only": provider["fallback_only"],
                 "priority": provider["priority"],
                 "weight": provider["weight"],
@@ -1264,7 +1260,6 @@ async def admin_matrix(
                     "priority": provider["priority"],
                     "weight": provider["weight"],
                     "route_group": provider.get("route_group", "primary"),
-                    "cost_tier": provider.get("cost_tier", "free"),
                     "fallback_only": bool(provider.get("fallback_only", False)),
                 }
                 for provider in PROVIDERS
@@ -1318,7 +1313,7 @@ def provider_matches_controls(item: dict[str, Any], controls: dict[str, Any]) ->
         return False
     if route_group and item.get("route_group") != route_group:
         return False
-    if not allow_paid and (item.get("cost_tier") == "paid" or item.get("route_group") == "paid_fallback"):
+    if not allow_paid and (item.get("route_group") == "paid_fallback" or item.get("fallback_only")):
         return False
     return True
 
@@ -1345,7 +1340,7 @@ def sorted_route_bucket(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def route_bucket_name(item: dict[str, Any]) -> str:
-    if item.get("route_group") == "paid_fallback" or item.get("fallback_only") or item.get("cost_tier") == "paid":
+    if item.get("route_group") == "paid_fallback" or item.get("fallback_only"):
         return "paid_fallback"
     if item.get("_explore"):
         return "explore"
@@ -1400,7 +1395,7 @@ def exploration_enabled(controls: dict[str, Any]) -> bool:
 
 
 def exploration_candidate_allowed(item: dict[str, Any]) -> bool:
-    if item.get("fallback_only") or item.get("cost_tier") == "paid" or item.get("route_group") == "paid_fallback":
+    if item.get("fallback_only") or item.get("route_group") == "paid_fallback":
         return False
     return item.get("route_group", "primary") in {"opportunistic", "primary", "backup"}
 
@@ -1413,7 +1408,7 @@ def retryable_probe_candidate_allowed(item: dict[str, Any], kind: str, controls:
     reason = str(item.get("reason") or "")
     if reason not in {"invalid_request", "runtime_failure:invalid_request"}:
         return False
-    if item.get("fallback_only") or item.get("cost_tier") == "paid" or item.get("route_group") == "paid_fallback":
+    if item.get("fallback_only") or item.get("route_group") == "paid_fallback":
         return False
     return provider_matches_controls(item, controls)
 
@@ -1427,17 +1422,17 @@ def healthy_candidate_buckets(model: str, kind: str, controls: dict[str, Any] | 
         [
             item
             for item in healthy
-            if item.get("route_group", "primary") == "primary" and not item.get("fallback_only") and item.get("cost_tier") != "paid"
+            if item.get("route_group", "primary") == "primary" and not item.get("fallback_only")
         ]
     )
     backup = sorted_route_bucket(
-        [item for item in healthy if item.get("route_group") == "backup" and not item.get("fallback_only") and item.get("cost_tier") != "paid"]
+        [item for item in healthy if item.get("route_group") == "backup" and not item.get("fallback_only")]
     )
     paid = sorted_route_bucket(
         [
             item
             for item in healthy
-            if item.get("route_group") == "paid_fallback" or item.get("fallback_only") or item.get("cost_tier") == "paid"
+            if item.get("route_group") == "paid_fallback" or item.get("fallback_only")
         ]
     )
     other = sorted_route_bucket(
@@ -1446,7 +1441,6 @@ def healthy_candidate_buckets(model: str, kind: str, controls: dict[str, Any] | 
             for item in healthy
             if item.get("route_group", "primary") not in {"primary", "backup", "paid_fallback"}
             and not item.get("fallback_only")
-            and item.get("cost_tier") != "paid"
         ]
     )
     retryable_probe = sorted_route_bucket(

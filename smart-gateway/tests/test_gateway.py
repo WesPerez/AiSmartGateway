@@ -466,27 +466,12 @@ def test_select_route_candidate_uses_priority_before_weight(gateway, monkeypatch
     assert selected_weights == [["high-light", "high-heavy"]]
 
 
-def test_paid_cost_tier_is_routed_as_paid_fallback(gateway):
-    gateway.HEALTH = {
-        "chat": {
-            "good-model": {
-                "paid-cost": {
-                    "provider_id": "paid-cost",
-                    "actual_model": "good-model",
-                    "healthy": True,
-                    "priority": 100,
-                    "weight": 100,
-                    "route_group": "primary",
-                    "cost_tier": "paid",
-                },
-            }
-        },
-        "responses": {},
-    }
+def test_legacy_paid_cost_tag_is_migrated_to_paid_fallback(gateway):
+    provider = {"id": "p1", "base_url": "https://p1.example", "enabled": True}
+    item = gateway.with_channel_fields(provider, {"status": 1, "base_url": "https://p1.example", "tag": "gateway-source,gw:paid"})
 
-    buckets = gateway.healthy_candidate_buckets("good-model", "chat")
-
-    assert [bucket["name"] for bucket in buckets] == ["paid_fallback"]
+    assert item["route_group"] == "paid_fallback"
+    assert item["fallback_only"] is True
 
 
 def test_healthy_candidate_buckets_order_paid_last(gateway, monkeypatch):
@@ -1258,7 +1243,7 @@ def test_update_newapi_source_policy_parses_string_booleans(gateway, tmp_path, m
 
     row = sqlite3.connect(db).execute('select status, tag from channels where id = 2').fetchone()
     assert changed == 1
-    assert row == (1, "gateway-source,gw:primary,gw:free")
+    assert row == (1, "gateway-source,gw:primary")
 
 
 def test_load_newapi_channel_rows_ignores_empty_database(gateway, tmp_path, monkeypatch):
