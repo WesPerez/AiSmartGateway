@@ -338,6 +338,15 @@ def probe_cooldown_seconds(reason: str | None, healthy: bool) -> int:
     return PROBE_UNKNOWN_ERROR_TTL_SECONDS
 
 
+def responses_request_shape_reason(reason: str | None) -> bool:
+    return reason in {
+        "invalid_request",
+        "responses_request_shape_unverified",
+        "runtime_failure:invalid_request",
+        "runtime_failure:responses_request_shape_unverified",
+    }
+
+
 def preserve_probe_state(new_item: dict[str, Any], previous: dict[str, Any] | None) -> dict[str, Any]:
     if not previous:
         return new_item
@@ -372,7 +381,10 @@ def preserve_probe_state(new_item: dict[str, Any], previous: dict[str, Any] | No
 def runtime_failure_cooling_down(item: dict[str, Any] | None) -> bool:
     if not item:
         return False
-    return str(item.get("reason") or "").startswith("runtime_failure:") and float(item.get("next_probe_at") or 0) > now()
+    reason = str(item.get("reason") or "")
+    if responses_request_shape_reason(reason):
+        return False
+    return reason.startswith("runtime_failure:") and float(item.get("next_probe_at") or 0) > now()
 
 
 async def save_state() -> None:
@@ -598,11 +610,13 @@ def provider_runtime_summary() -> dict[str, dict[str, Any]]:
                 provider_id = item.get("provider_id")
                 if not provider_id:
                     continue
-                row = summary.setdefault(provider_id, {"healthy": 0, "unhealthy": 0, "latencies": []})
+                row = summary.setdefault(provider_id, {"healthy": 0, "unhealthy": 0, "unverified": 0, "latencies": []})
                 if item.get("healthy"):
                     row["healthy"] += 1
                     if item.get("latency_ms") is not None:
                         row["latencies"].append(item.get("latency_ms"))
+                elif kind == "responses" and responses_request_shape_reason(str(item.get("reason") or "")):
+                    row["unverified"] += 1
                 else:
                     row["unhealthy"] += 1
     for row in summary.values():
@@ -698,6 +712,7 @@ PASSTHROUGH_REQUEST_HEADERS = {
     "originator",
     "session_id",
     "x-codex-beta-features",
+    "x-codex-turn-metadata",
     "x-stainless-arch",
     "x-stainless-lang",
     "x-stainless-os",
@@ -886,9 +901,12 @@ async def probe_one(provider: dict[str, Any], local_model: str, actual_model: st
                 latency_ms = int((now() - start) * 1000)
                 text = response.text[:2000]
                 if response.status_code < 200 or response.status_code >= 300:
+                    reason = classify_error(response.status_code, text)
+                    if kind == "responses" and reason == "invalid_request":
+                        reason = "responses_request_shape_unverified"
                     last_result = {
                         "healthy": False,
-                        "reason": classify_error(response.status_code, text),
+                        "reason": reason,
                         "status_code": response.status_code,
                         "latency_ms": latency_ms,
                         "sample": text[:300],
@@ -898,9 +916,12 @@ async def probe_one(provider: dict[str, Any], local_model: str, actual_model: st
                 data = response.json()
                 if response_has_error_json(data):
                     sample = json.dumps(data, ensure_ascii=False)[:1000]
+                    reason = classify_error(response.status_code, sample)
+                    if kind == "responses" and reason == "invalid_request":
+                        reason = "responses_request_shape_unverified"
                     last_result = {
                         "healthy": False,
-                        "reason": classify_error(response.status_code, sample),
+                        "reason": reason,
                         "status_code": response.status_code,
                         "latency_ms": latency_ms,
                         "sample": sample[:300],
@@ -1444,6 +1465,8 @@ def shadow_candidate_allowed(item: dict[str, Any], controls: dict[str, Any]) -> 
     if controls.get("provider_id") and controls.get("provider_id") == item.get("provider_id"):
         return True
     reason = str(item.get("reason") or "")
+    if responses_request_shape_reason(reason) and item.get("kind") == "responses":
+        return True
     if reason.startswith("runtime_failure:") and float(item.get("next_probe_at") or 0) > now():
         return False
     return True
@@ -1458,12 +1481,14 @@ def shadow_route_source_allowed(item: dict[str, Any]) -> bool:
     reason = str(item.get("reason") or "")
     if reason in {"pending_probe", "probe_budget_exhausted"}:
         return True
-    if reason in {"invalid_request", "runtime_failure:invalid_request"} and item.get("kind") == "responses":
+    if responses_request_shape_reason(reason) and item.get("kind") == "responses":
         return True
     return not item.get("checked_at")
 
 
-def should_mark_runtime_failure(reason: str) -> bool:
+def should_mark_runtime_failure(reason: str, kind: str | None = None) -> bool:
+    if kind == "responses" and responses_request_shape_reason(reason):
+        return False
     return reason != "invalid_request"
 
 
@@ -1475,20 +1500,10 @@ def runtime_failure_reason_for_endpoint_failures(kind: str, endpoint_reasons: li
     if not endpoint_reasons:
         return "all_endpoints_failed"
     if kind == "responses" and all(reason == "invalid_request" for reason in endpoint_reasons):
-        return "invalid_request"
-    if any(should_mark_runtime_failure(reason) for reason in endpoint_reasons):
+        return None
+    if any(should_mark_runtime_failure(reason, kind) for reason in endpoint_reasons):
         return "all_endpoints_failed"
     return None
-
-
-def paid_fallback_blocked_by_request_shape(kind: str, route_bucket: str, controls: dict[str, Any], seen_reasons: list[str]) -> bool:
-    if kind != "responses":
-        return False
-    if route_bucket != "paid_fallback":
-        return False
-    if controls.get("provider_id") or controls.get("route_group"):
-        return False
-    return "invalid_request" in seen_reasons
 
 
 def exploration_enabled(controls: dict[str, Any]) -> bool:
@@ -1511,7 +1526,7 @@ def retryable_probe_candidate_allowed(item: dict[str, Any], kind: str, controls:
     if kind != "responses":
         return False
     reason = str(item.get("reason") or "")
-    if reason not in {"invalid_request", "runtime_failure:invalid_request"}:
+    if not responses_request_shape_reason(reason):
         return False
     if item.get("fallback_only") or item.get("route_group") == "paid_fallback":
         return False
@@ -1582,8 +1597,8 @@ def healthy_candidate_buckets(model: str, kind: str, controls: dict[str, Any] | 
         {"name": "primary", "items": primary},
         {"name": "backup", "items": backup},
         {"name": "other", "items": other},
-        {"name": "explore", "items": explore},
         {"name": "probe_retry", "items": retryable_probe},
+        {"name": "explore", "items": explore},
         {"name": "shadow", "items": shadow},
         {"name": "paid_fallback", "items": paid},
     ]
@@ -1669,6 +1684,15 @@ def log_route_fields(chosen: dict[str, Any], route_bucket: str | None = None) ->
     }
 
 
+def normalize_responses_upstream_body(body: dict[str, Any], chosen: dict[str, Any]) -> dict[str, Any]:
+    req_body = deepcopy(body)
+    req_body["model"] = chosen["actual_model"]
+    if "instructions" not in req_body:
+        req_body["instructions"] = ""
+    req_body.setdefault("store", False)
+    return req_body
+
+
 async def relay_non_stream(
     path: str,
     body: dict[str, Any],
@@ -1701,39 +1725,18 @@ async def relay_non_stream(
         )
     tried = []
     last_error: dict[str, Any] | None = None
-    seen_non_paid_reasons: list[str] = []
     attempts = min(MAX_RETRIES_PER_REQUEST, total_candidates)
     for _ in range(attempts):
         selected = select_route_candidate(buckets)
         if not selected:
             break
         chosen, route_bucket = selected
-        if paid_fallback_blocked_by_request_shape(kind, route_bucket, controls, seen_non_paid_reasons):
-            last_error = {
-                "status_code": 400,
-                "reason": "paid_fallback_blocked_after_invalid_request",
-                "body": "Non-paid Responses upstreams returned invalid_request; paid fallback skipped to avoid masking request compatibility errors.",
-                "tried": tried,
-            }
-            await append_request_log(
-                {
-                    "request_id": request_id,
-                    "kind": kind,
-                    "stream": bool(body.get("stream", False)),
-                    "requested_model": model,
-                    "success": False,
-                    "error_type": "paid_fallback_blocked_after_invalid_request",
-                    "route_controls": controls,
-                    "request_shape": request_shape(body, incoming_headers),
-                }
-            )
-            break
         for bucket in buckets:
             bucket["items"] = [item for item in bucket["items"] if item["provider_id"] != chosen["provider_id"]]
         provider = get_provider_by_id(chosen["provider_id"])
         if not provider:
             continue
-        req_body = deepcopy(body)
+        req_body = normalize_responses_upstream_body(body, chosen) if kind == "responses" else deepcopy(body)
         req_body["model"] = chosen["actual_model"]
         route_fields = log_route_fields(chosen, route_bucket)
         tried.append({"provider_id": chosen["provider_id"], "actual_model": chosen["actual_model"], **route_fields})
@@ -1782,9 +1785,7 @@ async def relay_non_stream(
                     return JSONResponse(data, status_code=response.status_code)
                 return JSONResponse({"raw": text}, status_code=response.status_code)
             reason = classify_error(response.status_code, text[:1000])
-            if route_bucket != "paid_fallback":
-                seen_non_paid_reasons.append(reason)
-            if should_mark_runtime_failure(reason):
+            if should_mark_runtime_failure(reason, kind):
                 await mark_runtime_failure(kind, model, chosen["provider_id"], reason)
             await append_request_log(
                 {
@@ -1890,40 +1891,18 @@ async def relay_stream(
         return
 
     attempts = min(MAX_RETRIES_PER_REQUEST, total_candidates)
-    seen_non_paid_reasons: list[str] = []
     for _ in range(attempts):
         selected = select_route_candidate(buckets)
         if not selected:
             break
         chosen, route_bucket = selected
-        if paid_fallback_blocked_by_request_shape(kind, route_bucket, controls, seen_non_paid_reasons):
-            await append_request_log(
-                {
-                    "request_id": request_id,
-                    "kind": kind,
-                    "stream": True,
-                    "requested_model": model,
-                    "success": False,
-                    "error_type": "paid_fallback_blocked_after_invalid_request",
-                    "route_controls": controls,
-                    "request_shape": request_shape(body, incoming_headers),
-                }
-            )
-            yield response_failed_event(
-                request_id,
-                model,
-                "paid_fallback_blocked_after_invalid_request",
-                "Paid fallback skipped after non-paid Responses upstreams rejected the request shape",
-            )
-            yield b"data: [DONE]\n\n"
-            return
         for bucket in buckets:
             bucket["items"] = [item for item in bucket["items"] if item["provider_id"] != chosen["provider_id"]]
         provider = get_provider_by_id(chosen["provider_id"])
         if not provider:
             continue
 
-        req_body = deepcopy(body)
+        req_body = normalize_responses_upstream_body(body, chosen) if kind == "responses" else deepcopy(body)
         req_body["model"] = chosen["actual_model"]
         route_fields = log_route_fields(chosen, route_bucket)
         start = now()
@@ -1943,8 +1922,6 @@ async def relay_stream(
                             raw = await response.aread()
                             reason = classify_error(response.status_code, raw.decode("utf-8", "ignore")[:1000])
                             endpoint_reasons.append(reason)
-                            if route_bucket != "paid_fallback":
-                                seen_non_paid_reasons.append(reason)
                             await append_request_log(
                                 {
                                     "request_id": request_id,

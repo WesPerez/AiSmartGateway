@@ -55,6 +55,7 @@ ROUTER_PARAM_OVERRIDE = {
                 "Originator",
                 "Session_id",
                 "X-Codex-Beta-Features",
+                "X-Codex-Turn-Metadata",
                 "X-Stainless-Arch",
                 "X-Stainless-Lang",
                 "X-Stainless-OS",
@@ -399,6 +400,9 @@ def sync_source_channel_models(
     healthy_by_channel: dict[int, set[str]],
     seen_channel_ids: set[int],
 ) -> int:
+    # Source channel model lists are operator declarations in New API, not
+    # runtime health state. Keep them stable; Smart Gateway uses health_state
+    # for effective routing and cooldowns.
     return 0
 
 
@@ -596,11 +600,8 @@ def sync(args: argparse.Namespace) -> None:
 
         providers = [provider_from_channel(row) for row in source_rows]
         for row, provider in zip(source_rows, providers):
-            channel_id = int(row["id"])
             if int(row["status"] or 0) != 1:
                 provider["declared_models"] = []
-            elif channel_id in seen_channel_ids:
-                provider["declared_models"] = sorted(healthy_by_channel.get(channel_id, set()))
         source_channel_ids = [int(row["id"]) for row in source_rows]
         if not providers:
             raise SystemExit(f"No New API channels found in group {SOURCE_GROUP!r}")

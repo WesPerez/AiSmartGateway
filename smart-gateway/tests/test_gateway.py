@@ -193,6 +193,19 @@ def test_provider_headers_adds_responses_beta(gateway):
     assert headers["OpenAI-Beta"] == "responses=v1"
 
 
+def test_normalize_responses_upstream_body_adds_codex_required_defaults(gateway):
+    body = {"model": "gpt-5.5", "input": [{"role": "user", "content": "ping"}], "stream": True}
+    chosen = {"actual_model": "gpt-5.5"}
+
+    req_body = gateway.normalize_responses_upstream_body(body, chosen)
+
+    assert req_body["model"] == "gpt-5.5"
+    assert req_body["instructions"] == ""
+    assert req_body["store"] is False
+    assert "instructions" not in body
+    assert "store" not in body
+
+
 @pytest.mark.asyncio()
 @respx.mock
 async def test_probe_lists_only_really_healthy_models(gateway):
@@ -260,7 +273,7 @@ async def test_probe_respects_cooldown_and_force_rechecks(gateway):
 
 @pytest.mark.asyncio()
 @respx.mock
-async def test_probe_success_does_not_override_runtime_failure_cooldown(gateway):
+async def test_probe_success_overrides_responses_request_shape_runtime_failure(gateway):
     respx.get("https://p1.example/v1/models").mock(return_value=httpx.Response(200, json={"data": [{"id": "good-model"}]}))
     respx.get("https://p2.example/v1/models").mock(return_value=httpx.Response(200, json={"data": []}))
     respx.post("https://p1.example/v1/chat/completions").mock(return_value=httpx.Response(200, json={"id": "ok"}))
@@ -288,9 +301,9 @@ async def test_probe_success_does_not_override_runtime_failure_cooldown(gateway)
     await gateway.probe_all()
 
     item = gateway.HEALTH["responses"]["good-model"]["p1::good-model"]
-    assert item["healthy"] is False
-    assert item["reason"] == "runtime_failure:invalid_request"
-    assert item["next_probe_at"] == next_probe_at
+    assert item["healthy"] is True
+    assert item["reason"] == "ok"
+    assert item["next_probe_at"] > next_probe_at
 
 
 @pytest.mark.asyncio()
@@ -414,7 +427,7 @@ async def test_non_stream_uses_paid_fallback_only_after_primary_fails(gateway, m
 
 
 @pytest.mark.asyncio()
-async def test_non_stream_blocks_paid_fallback_after_responses_invalid_request(gateway, monkeypatch):
+async def test_non_stream_uses_paid_fallback_after_responses_invalid_request(gateway, monkeypatch):
     gateway.PROVIDERS = [
         {
             "id": "primary",
@@ -468,12 +481,13 @@ async def test_non_stream_blocks_paid_fallback_after_responses_invalid_request(g
             "responses",
         )
 
-    assert response.status_code == 503
-    assert paid_route.call_count == 0
+    assert paid_route.call_count == 1
+    assert response.status_code == 200
     payload = json.loads(response.body.decode())
-    assert payload["error"]["details"]["reason"] == "paid_fallback_blocked_after_invalid_request"
+    assert payload["id"] == "paid-ok"
     logs = gateway.read_recent_request_logs()
-    assert logs[0]["error_type"] == "paid_fallback_blocked_after_invalid_request"
+    assert logs[0]["provider_id"] == "paid"
+    assert logs[0]["route_bucket"] == "paid_fallback"
 
 
 @pytest.mark.asyncio()
@@ -708,6 +722,41 @@ def test_healthy_candidate_buckets_keeps_explore_after_primary(gateway, monkeypa
     assert candidates[1]["_explore"] is True
 
 
+def test_responses_probe_retry_runs_before_paid_fallback(gateway):
+    gateway.HEALTH = {
+        "responses": {
+            "good-model": {
+                "primary::good-model": {
+                    "provider_id": "primary",
+                    "actual_model": "good-model",
+                    "healthy": False,
+                    "kind": "responses",
+                    "priority": 100,
+                    "weight": 100,
+                    "route_group": "primary",
+                    "source": "upstream_models+declared",
+                    "reason": "runtime_failure:invalid_request",
+                    "next_probe_at": int(gateway.now()) + 3600,
+                },
+                "paid": {
+                    "provider_id": "paid",
+                    "actual_model": "good-model",
+                    "healthy": True,
+                    "priority": 10,
+                    "weight": 1000,
+                    "route_group": "paid_fallback",
+                    "fallback_only": True,
+                },
+            }
+        },
+        "chat": {},
+    }
+
+    buckets = gateway.healthy_candidate_buckets("good-model", "responses")
+
+    assert [bucket["name"] for bucket in buckets] == ["probe_retry", "paid_fallback"]
+
+
 def test_exploration_does_not_include_paid_shadow(gateway, monkeypatch):
     monkeypatch.setattr(gateway.random, "random", lambda: 0.0)
     monkeypatch.setattr(gateway, "ROUTE_EXPLORATION_RATE", 1.0)
@@ -802,6 +851,7 @@ def test_healthy_candidates_includes_shadow_upstream_models(gateway):
                     "actual_model": "good-model",
                     "healthy": False,
                     "source": "upstream_models",
+                    "kind": "responses",
                     "priority": 100,
                     "weight": 1,
                     "reason": "not_found",
@@ -827,6 +877,7 @@ def test_healthy_candidates_skips_shadow_runtime_failure_during_cooldown(gateway
                     "actual_model": "good-model",
                     "healthy": False,
                     "source": "upstream_models",
+                    "kind": "responses",
                     "priority": 100,
                     "weight": 1,
                     "reason": "runtime_failure:not_found",
@@ -849,6 +900,7 @@ def test_healthy_candidates_allows_forced_shadow_during_runtime_failure_cooldown
                     "actual_model": "good-model",
                     "healthy": False,
                     "source": "upstream_models",
+                    "kind": "responses",
                     "priority": 100,
                     "weight": 1,
                     "reason": "runtime_failure:model_unsupported",
@@ -865,7 +917,7 @@ def test_healthy_candidates_allows_forced_shadow_during_runtime_failure_cooldown
     assert candidates[0]["_shadow"] is True
 
 
-def test_healthy_candidates_skips_runtime_invalid_request_during_cooldown(gateway):
+def test_healthy_candidates_retries_runtime_invalid_request_for_responses(gateway):
     gateway.HEALTH = {
         "responses": {
             "good-model": {
@@ -874,6 +926,7 @@ def test_healthy_candidates_skips_runtime_invalid_request_during_cooldown(gatewa
                     "actual_model": "good-model",
                     "healthy": False,
                     "source": "upstream_models",
+                    "kind": "responses",
                     "priority": 100,
                     "weight": 1,
                     "reason": "runtime_failure:invalid_request",
@@ -886,7 +939,9 @@ def test_healthy_candidates_skips_runtime_invalid_request_during_cooldown(gatewa
 
     candidates = gateway.healthy_candidates("good-model", "responses")
 
-    assert candidates == []
+    assert [item["provider_id"] for item in candidates] == ["p1"]
+    assert candidates[0]["_probe_retry"] is True
+    assert candidates[0]["_shadow"] is True
 
 
 def test_healthy_candidates_allows_forced_runtime_invalid_request(gateway):
@@ -941,8 +996,9 @@ async def test_runtime_failure_sets_probe_cooldown(gateway):
 
 def test_runtime_failure_reason_for_endpoint_failures(gateway):
     assert gateway.should_mark_runtime_failure("invalid_request") is False
+    assert gateway.should_mark_runtime_failure("invalid_request", "responses") is False
     assert gateway.should_mark_runtime_failure("quota") is True
-    assert gateway.runtime_failure_reason_for_endpoint_failures("responses", ["invalid_request", "invalid_request"]) == "invalid_request"
+    assert gateway.runtime_failure_reason_for_endpoint_failures("responses", ["invalid_request", "invalid_request"]) is None
     assert gateway.runtime_failure_reason_for_endpoint_failures("chat", ["invalid_request"]) is None
     assert gateway.runtime_failure_reason_for_endpoint_failures("responses", ["invalid_request", "server_unavailable"]) == "all_endpoints_failed"
 
@@ -1192,7 +1248,7 @@ async def test_responses_stream_error_uses_response_failed_event(gateway):
 
 
 @pytest.mark.asyncio()
-async def test_responses_stream_invalid_request_cools_down_provider_after_all_endpoints_fail(gateway, monkeypatch):
+async def test_responses_stream_invalid_request_does_not_cool_down_provider_after_all_endpoints_fail(gateway, monkeypatch):
     gateway.PROVIDERS = [
         {
             "id": "p1",
@@ -1259,13 +1315,12 @@ async def test_responses_stream_invalid_request_cools_down_provider_after_all_en
     joined = b"".join(chunks)
     item = gateway.HEALTH["responses"]["good-model"]["p1::good-model"]
     assert b"all_upstreams_failed" in joined
-    assert item["healthy"] is False
-    assert item["reason"] == "runtime_failure:invalid_request"
-    assert item["next_probe_at"] > gateway.now()
+    assert item["healthy"] is True
+    assert item["reason"] == "ok"
 
 
 @pytest.mark.asyncio()
-async def test_responses_stream_blocks_paid_fallback_after_invalid_request(gateway, monkeypatch):
+async def test_responses_stream_uses_paid_fallback_after_invalid_request(gateway, monkeypatch):
     gateway.PROVIDERS = [
         {"id": "primary", "base_url": "https://primary.example/v1", "api_key": "sk-primary", "timeout_seconds": 3, "headers": {}},
         {"id": "paid", "base_url": "https://paid.example/v1", "api_key": "sk-paid", "timeout_seconds": 3, "headers": {}},
@@ -1313,8 +1368,8 @@ async def test_responses_stream_blocks_paid_fallback_after_invalid_request(gatew
         ]
 
     joined = b"".join(chunks)
-    assert paid_route.call_count == 0
-    assert b"paid_fallback_blocked_after_invalid_request" in joined
+    assert paid_route.call_count == 1
+    assert b"data: ok" in joined
 
 
 def make_request(host: str = "example.test") -> Request:

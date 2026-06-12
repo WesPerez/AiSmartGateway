@@ -5,6 +5,8 @@ import json
 import sqlite3
 from pathlib import Path
 
+import yaml
+
 
 def load_sync_module():
     path = Path(__file__).resolve().parents[2] / "scripts" / "sync-newapi-router.py"
@@ -213,3 +215,59 @@ def test_sync_source_channel_models_keeps_declared_source_models(tmp_path):
     assert updated[1] == "old-model,healthy-model"
     assert updated[2] == "declared-model"
     assert updated[3] == "stale-model"
+
+
+def test_sync_keeps_provider_declared_models_independent_from_health(tmp_path):
+    sync = load_sync_module()
+    db_path = tmp_path / "one-api.db"
+    con = make_db(db_path)
+    con.execute(
+        """
+        insert into channels (id, name, status, base_url, models, tag, "group", priority, weight, key)
+        values
+          (1, 'seen-upstream', 1, 'https://seen.example', 'old-model,healthy-model', 'gateway-source', 'default', 10, 100, 'sk-seen')
+        """
+    )
+    con.commit()
+    con.close()
+    health_path = tmp_path / "health_state.json"
+    health_path.write_text(
+        json.dumps(
+            {
+                "health": {
+                    "responses": {
+                        "healthy-model": {
+                            "newapi_ch1_seen-upstream::healthy-model": {
+                                "provider_id": "newapi_ch1_seen-upstream",
+                                "local_model": "healthy-model",
+                                "healthy": True,
+                            }
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / ".env").write_text("MASTER_API_KEY=master\nADMIN_TOKEN=admin\n", encoding="utf-8")
+    args = type(
+        "Args",
+        (),
+        {
+            "db": str(db_path),
+            "providers": str(tmp_path / "providers.yaml"),
+            "env": str(tmp_path / ".env"),
+            "health_state": str(health_path),
+            "gateway_url": "http://127.0.0.1:1",
+            "router_groups": "default",
+            "no_backup": True,
+            "bootstrap": False,
+            "auto_adopt_default_channels": False,
+            "force_reload": False,
+        },
+    )()
+
+    sync.sync(args)
+
+    providers = yaml.safe_load((tmp_path / "providers.yaml").read_text(encoding="utf-8"))["providers"]
+    assert providers[0]["declared_models"] == ["old-model", "healthy-model"]

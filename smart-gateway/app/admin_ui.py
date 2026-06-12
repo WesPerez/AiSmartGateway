@@ -1291,13 +1291,17 @@ ADMIN_HTML = """
 
     function kindStatusChip(kind, data) {
       if (!data) return `<span class="chip dark">${kind} 无记录</span>`;
-      const cls = data.healthy ? "ok" : "warn";
-      const text = data.healthy ? "健康" : "异常";
+      const requestShapeUnverified = kind === "responses" && ["invalid_request", "responses_request_shape_unverified", "runtime_failure:invalid_request", "runtime_failure:responses_request_shape_unverified"].includes(data.reason || "");
+      const cls = data.healthy ? "ok" : (requestShapeUnverified ? "dark" : "warn");
+      const text = data.healthy ? "健康" : (requestShapeUnverified ? "待真实请求验证" : "异常");
       return `<span class="chip ${cls}">${kind} ${text}${data.latency_ms == null ? "" : " " + data.latency_ms + "ms"}</span>`;
     }
 
     function upstreamDetail(row) {
       const reasons = Array.from(row.reasons).filter((reason) => reason && reason !== "ok").slice(0, 3);
+      if (reasons.some((reason) => ["invalid_request", "responses_request_shape_unverified", "runtime_failure:invalid_request", "runtime_failure:responses_request_shape_unverified"].includes(reason))) {
+        return "Responses 探活/当前请求形态被上游拒绝，保留为真实请求重试候选";
+      }
       if (row.healthy_count <= 0 && reasons.length) return reasons.join(", ");
       const mapped = Array.from(row.actual_models).filter((actual) => actual && actual !== row.model).sort();
       if (mapped.length) return `映射 ${mapped.join(", ")}`;
