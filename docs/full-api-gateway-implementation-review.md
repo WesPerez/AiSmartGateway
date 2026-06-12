@@ -77,6 +77,33 @@ The gateway therefore supports:
 - On-demand retry candidates for models whose probe request shape is known to
   be weaker than a real client request.
 
+The source channel `models` field in New API is treated as an operator
+declaration and must not be destructively pruned just because current runtime
+health is bad. Smart Gateway health state controls effective routing; New API
+channel declarations remain the operator's candidate list.
+
+## Responses `invalid_request`
+
+Responses probes are weaker than real Codex requests. A provider returning
+`400 invalid_request` or `invalid codex request` to a minimal synthetic probe is
+not enough evidence to mark the provider/model unavailable.
+
+Current behavior:
+
+- Responses probe `invalid_request` is classified as request-shape-unverified.
+- Runtime Responses `invalid_request` does not trigger long runtime cooldown.
+- Such providers remain bounded retry candidates before paid fallback.
+- Paid fallback is never blocked only because a non-paid provider returned
+  `invalid_request`.
+
+Recommended next behavior:
+
+- Use real client request shape for bounded verification.
+- Confirm the same provider/model/kind/request-shape class up to three times
+  before marking it real-shape-invalid.
+- Do not replay after a stream has started.
+- Clear the verification failure counter immediately on runtime success.
+
 ## Responses API Streaming
 
 For OpenAI Responses-compatible streaming clients, the gateway must not close
@@ -97,6 +124,22 @@ Recommended source-pool workflow:
 4. Run the sync script periodically to generate Smart Gateway provider config.
 5. Manage end-user tokens, groups, quota, and subscriptions in New API.
 6. Use Smart Gateway only for route policy, health matrix, and final upstream logs.
+
+New API router channel settings should preserve Codex/Responses semantics:
+
+- body pass-through enabled
+- `store` pass-through enabled
+- Codex/OpenAI request headers passed through
+- upstream model auto-sync disabled on the router channel
+
+The router channel is a New API channel, not a user group. User groups such as
+`default` and `vip` remain New API concepts.
+
+## Related Documents
+
+- [Current New API / Smart Gateway boundary](current-newapi-smart-gateway-boundary.zh-CN.md)
+- [New API, Sub2API, and AI Smart Gateway operations](NEWAPI.md)
+- [Recent routing retrospective](retrospective-routing-review.zh-CN.md)
 
 ## Security Notes
 

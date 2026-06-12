@@ -1,0 +1,315 @@
+# New API, Sub2API, and AI Smart Gateway Operations
+
+This is the public, sanitized successor to the older `NEWAPI.txt` deployment
+note. It describes the current architecture. It intentionally omits production
+domains, real server paths, API keys, tokens, cookies, database paths, request
+logs, and private provider details.
+
+## Current Architecture
+
+```text
+Client / Codex / OpenAI-compatible tool
+  -> New API public endpoint
+  -> New API channel: Smart Gateway Router
+  -> AI Smart Gateway
+  -> authorized upstream providers
+```
+
+New API is the public front door. AI Smart Gateway is the downstream routing
+engine behind New API. Sub2API is a separate New API-based gateway project and
+may be used as an upstream provider or as a reference deployment, but it is not
+the public control plane for this project unless the operator explicitly makes
+it so.
+
+## Project Roles
+
+### New API
+
+New API owns public management:
+
+- Users, tokens, quota, subscriptions, and groups.
+- Public API keys issued to clients.
+- User-facing request logs and billing records.
+- Channel creation for real upstream credentials.
+- Model management, model visibility, and pricing/multiplier settings.
+
+Real upstream channels should be created in New API and tagged
+`gateway-source`. The Smart Gateway router itself is also a New API channel,
+usually named `Smart Gateway Router`, but it is not a user group.
+
+### AI Smart Gateway
+
+AI Smart Gateway owns downstream routing:
+
+- Sync tagged New API channels into a runtime provider pool.
+- Keep model health by API kind: `chat` and `responses`.
+- Route by route group, priority, weight, runtime health, and fallback policy.
+- Handle multi-base-url providers as one logical provider.
+- Cool down repeated unsupported/quota/rate-limit/server failures.
+- Log final upstream flow: selected provider, route bucket, model, latency,
+  error type, and request shape summary.
+- Normalize Responses requests for Codex-like upstreams where safe.
+
+Smart Gateway is not a second user/token/subscription system.
+
+### Sub2API
+
+Sub2API is a separate repository and stack. It provides a New API deployment
+with a sidecar for provider probes, optional automation, and backups. In this
+architecture it can serve two roles:
+
+- A separate upstream channel that New API or Smart Gateway can call.
+- A reference/legacy scaffold for New API operations.
+
+It should not duplicate Smart Gateway's route-level decision making unless an
+operator intentionally runs it as another independent gateway.
+
+## Public Client Configuration
+
+Clients should use the New API public endpoint and a New API-issued token:
+
+```text
+Base URL: https://api.example.com
+API Key: token generated in New API
+```
+
+For clients that require `/v1`, the compatibility form may be kept:
+
+```text
+Base URL: https://api.example.com/v1
+```
+
+Do not distribute Smart Gateway's internal master key to end users. That key is
+for the New API router channel and trusted operator checks only.
+
+## Upstream Management Workflow
+
+1. Add the real upstream in New API channel management.
+2. Put the upstream's real base URL and credential in New API.
+3. Add the channel tag `gateway-source`.
+4. Keep the source channel in the normal New API group used for channels.
+5. Run the sync script or click the Smart Gateway sync action.
+6. Verify the source appears in Smart Gateway's source pool and health views.
+
+The sync script generates Smart Gateway provider config from New API channels.
+It must not destructively rewrite source channel model declarations just because
+runtime health is currently bad. Runtime health belongs in Smart Gateway state;
+operator declarations belong in New API channels.
+
+## Source Pool Policy
+
+Provider route groups:
+
+- `primary`: normal preferred upstreams.
+- `opportunistic`: low-cost or temporary upstreams that may be unstable.
+- `backup`: lower priority but still valid.
+- `paid_fallback`: expensive fallback used after other candidates fail.
+
+Cost labels are display/analysis metadata. Actual paid fallback behavior should
+be determined by route group/fallback flags, not by the display cost label.
+
+Priority is considered before weight. Weight is used among candidates at the
+same effective priority level. Runtime latency can influence ordering inside
+the same bucket where implemented, but it must not override the fallback policy.
+
+## Model Discovery
+
+Upstream `/models` is a hint, not truth. Some providers return stale or partial
+model lists while still accepting real requests. Some list models that later
+fail at runtime.
+
+The current model sources are:
+
+- New API channel-declared models.
+- Upstream `/models` when available.
+- Canonical aliases and provider model maps.
+- Runtime successes discovered from health state.
+
+The public New API model list should be driven by the Smart Gateway router
+channel and Smart Gateway's effective availability. Operators can still disable
+models in New API model management; sync should respect those manual disables.
+
+## Health Detection Strategy
+
+Health is tracked by:
+
+```text
+API kind -> local model -> provider -> actual upstream model
+```
+
+The system distinguishes:
+
+- `ok`: successful probe or runtime request.
+- `model_unsupported` / `not_found`: likely wrong model for that upstream.
+- `quota`: balance or quota issue.
+- `rate_limited`: temporary limit.
+- `server_unavailable`: 5xx or upstream gateway failure.
+- `auth_or_forbidden`: credential or permission problem.
+- `responses_request_shape_unverified`: the fixed probe or current request
+  shape was rejected, but that does not prove the model is unavailable for a
+  real Codex-shaped request.
+
+Cooldowns should apply to unsupported models, quota, rate limits, server
+errors, auth errors, and exceptions. Responses request-shape failures should be
+handled separately because they often mean the probe is weaker than a real
+client request.
+
+## Responses and Codex Compatibility
+
+Codex-like clients usually use `/v1/responses`, stream mode, and a richer body
+than a minimal probe. Important fields/headers can include:
+
+- `instructions`
+- `store`
+- `tools`
+- `reasoning`
+- `text`
+- `metadata`
+- `OpenAI-Beta`
+- `Originator`
+- `Session_id`
+- `X-Codex-Beta-Features`
+- `X-Codex-Turn-Metadata`
+- `X-Stainless-*`
+- `User-Agent`
+
+New API's router channel should enable body pass-through and header pass-through
+for the Codex/OpenAI headers above. Smart Gateway should preserve those headers
+to the upstream while always replacing the upstream authorization with the
+provider credential.
+
+Smart Gateway currently normalizes Responses bodies by adding safe defaults
+such as `instructions: ""` and `store: false` when absent. It does not invent
+large tool lists or hidden Codex metadata.
+
+## `invalid_request` Handling
+
+The important lesson from the recent anyrouter incident is:
+
+```text
+400 invalid_request from a minimal probe is not enough evidence to mark a
+Responses model/provider unavailable.
+```
+
+Current behavior:
+
+- Probe `invalid_request` for Responses becomes request-shape-unverified.
+- Runtime `invalid_request` for Responses does not long-cooldown the provider.
+- Such providers remain retry candidates before paid fallback.
+- Paid fallback is not blocked merely because a non-paid provider returned
+  `invalid_request`.
+
+Recommended next optimization:
+
+1. When a real client request gets `invalid_request` before any stream chunk,
+   retry the same logical provider with the real request shape up to a bounded
+   confirmation count.
+2. Prefer spreading the three confirmations across real request attempts or a
+   short verification window, rather than blindly spending three identical
+   retries every user request.
+3. Key the result by provider, model, API kind, endpoint URL, and request-shape
+   class.
+4. If all confirmations fail with the same semantic error, mark it
+   `real_shape_invalid` for a short cooldown.
+5. If any confirmation succeeds, immediately mark the provider/model/kind
+   healthy and route normally.
+
+This gives a better balance than either extreme:
+
+- Do not trust a weak synthetic probe.
+- Do not hammer a provider forever when real requests repeatedly prove the same
+  shape is invalid.
+
+## Route Order
+
+The current route buckets are intended to preserve availability:
+
+```text
+healthy primary
+-> healthy backup/other
+-> Responses request-shape retry candidates
+-> exploration/shadow candidates
+-> paid fallback
+```
+
+This was a stopgap to keep potentially usable primary providers in play before
+paid fallback while avoiding client hard failures. The route order should be
+revisited after real-request verification is implemented. A cleaner final model
+would treat request-shape-unverified primary providers as a primary sub-state
+with a bounded verification budget, not as a generic bucket between backup and
+fallback.
+
+## Operations UI
+
+New API UI is for public gateway administration:
+
+- Users and tokens.
+- Groups and subscriptions.
+- Channels.
+- Model management.
+- Pricing and model ratios.
+- Public request logs and billing.
+
+Smart Gateway UI is for route operations:
+
+- Runtime model health.
+- Health matrix.
+- Final upstream route logs.
+- Source pool strategy.
+- Per-upstream model status.
+- Sync/reload controls.
+
+Smart Gateway UI should not replace New API's channel/user/token system.
+
+## Known Operational Issues and Lessons
+
+- A client-side model catalog can make a request appear to target another model
+  in the client UI. Always check Gateway request logs for the actual requested
+  model and final upstream model.
+- `413 Payload Too Large` is usually an upstream/provider gateway body limit.
+  The client must compact the conversation or the provider must raise its body
+  size limit.
+- New API may require two-factor authentication or Passkey for sensitive admin
+  actions such as viewing keys. This is a New API security policy, not a Smart
+  Gateway routing issue.
+- A channel test may fail while real usage succeeds if the channel test sends a
+  weaker or different request shape.
+- `/models` can be empty or stale and still not prove that real requests are
+  impossible.
+- Multi-base-url variants of the same provider should remain one logical
+  provider so the same quota pool is not counted multiple times.
+
+## Security
+
+Never commit:
+
+- `.env`
+- provider config with real keys
+- New API database files
+- request logs
+- health-state runtime caches
+- cookies, bearer tokens, refresh tokens, or session data
+- production domains or private server paths in public docs
+
+Use placeholders such as:
+
+```text
+https://api.example.com
+example-redacted-key
+provider-primary
+provider-paid-fallback
+```
+
+## Verification
+
+Before pushing public changes:
+
+```bash
+python -m py_compile smart-gateway/app/main.py scripts/sync-newapi-router.py
+pytest -q smart-gateway/tests
+git status --short --ignored
+git grep -n -I -E 'sk-[A-Za-z0-9_-]{12,}|password|secret|token|api[_-]?key'
+```
+
+Review grep hits manually. Code identifiers such as `ADMIN_TOKEN` or
+`api_key_env` are acceptable; real secret values are not.

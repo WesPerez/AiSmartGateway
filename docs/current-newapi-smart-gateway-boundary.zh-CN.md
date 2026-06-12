@@ -19,8 +19,10 @@ https://api.example.com
 2. 渠道管理：新增、删除真实上游 Base URL 和 Key。
 3. 模型管理：模型展示、权限、价格和倍率。
 4. 对外请求日志：用户、token、扣费、New API channel。
+5. 安全策略：例如敏感操作要求两步验证或 Passkey。
 
 真实上游通道应保持在正常用户分组中，并设置渠道标签 `gateway-source`。
+`Smart Gateway Router` 是 New API 渠道，不是用户分组。
 
 ## Smart Gateway 负责
 
@@ -29,6 +31,7 @@ https://api.example.com
 3. 按主力、机会、备份、付费兜底策略选择真实上游。
 4. 对模型不存在、余额不足、限流、服务异常做冷却。
 5. 记录最终真实上游、路由桶、成本层级、失败原因和耗时。
+6. 对 Responses `invalid_request` 区分“请求形态待验证”和“模型真实不可用”。
 
 ## 运维入口
 
@@ -49,11 +52,24 @@ Smart Gateway 后台是路由运维视图，不是第二套用户/令牌/订阅�
 6. 关闭模型：在 New API 模型管理里关闭模型。同步脚本应尊重关闭状态。
 7. 模型价格/倍率：在 New API 模型管理或倍率配置里维护。
 8. 最终流向日志：New API 看用户和扣费；Smart Gateway 看最终真实上游和路由原因。
+9. 源渠道模型声明：不要因为健康失败自动清空；实际可用性由 Smart Gateway 运行时健康决定。
 
 ## 多 Base URL
 
 同一个上游如果有多个兼容 Base URL，不应拆成多个 New API 渠道，否则同一个额度池会被权重计算成多份。应保留一个逻辑渠道，并在 Smart Gateway provider 内部配置多个 `base_urls`。
 
+## Responses 与真实请求验证
+
+固定探活请求可能弱于真实 Codex/Responses 请求。遇到
+`invalid_request`、`invalid codex request` 这类错误时，不应直接判定模型不可用。
+
+当前策略是保留这类上游为“请求形态待验证”候选，并允许在付费兜底前做有限重试。后续最佳策略应按真实请求形态做最多三次确认：三次同类真实失败后短冷却，任意一次真实成功则立即恢复健康。
+
 ## 应急写入
 
 Smart Gateway 直接写 provider 配置的接口默认应保持禁用。正常情况下，所有上游都应从 New API 渠道同步而来。
+
+## 相关文档
+
+- `docs/NEWAPI.md`：当前 New API、Sub2API、AI Smart Gateway 关系和运维说明。
+- `docs/retrospective-routing-review.zh-CN.md`：最近路由、健康检测、anyrouter、`invalid_request` 问题回顾。
