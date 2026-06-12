@@ -5,5 +5,6 @@ Requires=docker.service
 
 [Service]
 Type=oneshot
+EnvironmentFile=-/etc/default/ai-smart-gateway-sync-newapi
 WorkingDirectory=/opt/AiSmartGateway
-ExecStart=/opt/AiSmartGateway/scripts/sync-newapi-router.py --router-groups default,vip --no-backup
+ExecStart=/opt/AiSmartGateway/scripts/sync-newapi-router.py --db ${NEWAPI_DB} --router-groups ${ROUTER_GROUPS} --gateway-url ${GATEWAY_URL} --no-backup --force-reload

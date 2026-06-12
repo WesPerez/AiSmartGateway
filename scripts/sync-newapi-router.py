@@ -45,6 +45,14 @@ def resolve_path(path: str, alternates: list[str]) -> Path:
     return candidate
 
 
+def resolve_newapi_db(path: str, env: dict[str, str]) -> Path:
+    alternates = ["/newapi-data/one-api.db"]
+    data_dir = env.get("NEWAPI_DATA_DIR") or os.getenv("NEWAPI_DATA_DIR")
+    if data_dir:
+        alternates.insert(0, str(Path(data_dir) / "one-api.db"))
+    return resolve_path(path, alternates)
+
+
 def load_env(path: Path) -> dict[str, str]:
     env: dict[str, str] = {}
     if not path.exists():
@@ -348,10 +356,10 @@ def connect_network() -> None:
 
 
 def sync(args: argparse.Namespace) -> None:
-    db_path = resolve_path(args.db, ["/newapi-data/one-api.db"])
     providers_path = resolve_path(args.providers, ["/workspace/config/providers.yaml", "/app/config/providers.yaml"])
     env_path = resolve_path(args.env, ["/workspace/.env"])
     env = load_env(env_path)
+    db_path = resolve_newapi_db(args.db, env)
     master_key = env.get("MASTER_API_KEY", "")
     admin_token = env.get("ADMIN_TOKEN", "")
     gateway_url = args.gateway_url.rstrip("/")
