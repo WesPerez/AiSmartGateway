@@ -679,16 +679,15 @@ ADMIN_HTML = """
       <section id="tab-providers" class="tabpane hidden">
         <div class="row between" style="margin-bottom: 12px;">
           <div class="sub">源池策略会回写 New API 渠道。新增/删除上游、修改 key、模型权限、用户分组和订阅仍在 New API 管理。</div>
+          <div class="row">
+            <button id="syncBtnProviders" class="primary" title="从 New API 重新拉取源池渠道；没有标签的新启用 default 渠道会自动纳入机会源池">同步 New API 源池</button>
+            <button id="probeBtnProviders" class="primary" title="重新加载本地配置，并按冷却策略启动后台增量探测">重载配置并增量探测</button>
+          </div>
         </div>
         <div class="help">
           <strong>保存源池策略</strong>：把本页策略写回 New API 渠道标签并同步到 Gateway。
           <strong>同步 New API 源池</strong>：以 New API 渠道为准重新生成源池；新启用且未打标签的 default 渠道会自动纳入机会源池。
           <strong>重载配置并增量探测</strong>：不保存页面改动，只让 Gateway 重新读取配置并后台检测到期通道。
-        </div>
-        <div class="row" style="margin-bottom: 14px;">
-          <button id="savePolicyBtn" class="primary" title="保存当前页的启停、路由桶、优先级、权重、Base URL 和声明模型">保存源池策略</button>
-          <button id="syncBtnProviders" class="primary" title="从 New API 重新拉取源池渠道；没有标签的新启用 default 渠道会自动纳入机会源池">同步 New API 源池</button>
-          <button id="probeBtnProviders" class="primary" title="重新加载本地配置，并按冷却策略启动后台增量探测">重载配置并增量探测</button>
         </div>
         <div class="policy-hero">
           <div class="panel policy-filter">
@@ -702,6 +701,9 @@ ADMIN_HTML = """
           <div id="routeBoard" class="route-board"></div>
         </div>
         <div class="notice">维护流程：New API 录入真实上游和 key；这里调整启停、策略层级、优先级、权重和声明模型。付费兜底只由策略层级“5 付费兜底”决定。</div>
+        <div class="row" style="margin-bottom: 14px;">
+          <button id="savePolicyBtn" class="primary" title="保存当前页的启停、路由桶、优先级、权重、Base URL 和声明模型">保存源池策略</button>
+        </div>
         <div class="tablewrap">
           <table class="policy-table">
             <thead>
