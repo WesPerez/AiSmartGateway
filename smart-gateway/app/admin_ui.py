@@ -32,7 +32,7 @@ ADMIN_HTML = """
       background: var(--panel);
     }
     .wrap {
-      width: min(1360px, calc(100vw - 32px));
+      width: min(1760px, calc(100vw - 32px));
       margin: 0 auto;
     }
     .topbar {
@@ -286,7 +286,7 @@ ADMIN_HTML = """
     }
     .policy-hero {
       display: grid;
-      grid-template-columns: minmax(260px, 360px) minmax(0, 1fr);
+      grid-template-columns: minmax(280px, 380px) minmax(0, 1fr);
       gap: 14px;
       margin-bottom: 14px;
     }
@@ -297,7 +297,7 @@ ADMIN_HTML = """
     }
     .route-board {
       display: grid;
-      grid-template-columns: repeat(5, minmax(190px, 1fr));
+      grid-template-columns: repeat(5, minmax(220px, 1fr));
       gap: 10px;
     }
     .route-lane {
@@ -337,10 +337,6 @@ ADMIN_HTML = """
       background: #fff;
       padding: 9px;
     }
-    .route-card.top {
-      border-color: #99f6e4;
-      box-shadow: inset 3px 0 0 var(--accent);
-    }
     .route-card-title {
       display: flex;
       justify-content: space-between;
@@ -364,15 +360,24 @@ ADMIN_HTML = """
     .models-mini .chip {
       font-size: 11px;
       padding: 1px 5px;
-      max-width: 180px;
+      max-width: 220px;
       overflow: hidden;
       text-overflow: ellipsis;
     }
-    .policy-table th:nth-child(1), .policy-table td:nth-child(1) { min-width: 220px; }
-    .policy-table th:nth-child(2), .policy-table td:nth-child(2) { min-width: 170px; }
+    .model-kind {
+      color: var(--muted);
+      font-size: 10px;
+      margin-left: 4px;
+      font-family: ui-sans-serif, system-ui, sans-serif;
+    }
+    .wide-table {
+      max-height: 760px;
+    }
+    .policy-table th:nth-child(1), .policy-table td:nth-child(1) { min-width: 240px; }
+    .policy-table th:nth-child(2), .policy-table td:nth-child(2) { min-width: 190px; }
     .policy-table th:nth-child(3), .policy-table td:nth-child(3) { min-width: 120px; }
-    .policy-table th:nth-child(4), .policy-table td:nth-child(4) { min-width: 280px; }
-    .policy-table th:nth-child(5), .policy-table td:nth-child(5) { min-width: 260px; }
+    .policy-table th:nth-child(4), .policy-table td:nth-child(4) { min-width: 340px; }
+    .policy-table th:nth-child(5), .policy-table td:nth-child(5) { min-width: 420px; }
     .policy-table th:nth-child(6), .policy-table td:nth-child(6) { min-width: 140px; }
     .pill {
       display: inline-flex;
@@ -493,6 +498,7 @@ ADMIN_HTML = """
         <button class="tab active" data-tab="overview">运行概览</button>
         <button class="tab" data-tab="models">运行时模型</button>
         <button class="tab" data-tab="matrix">健康矩阵</button>
+        <button class="tab" data-tab="upstreams">上游模型状态</button>
         <button class="tab" data-tab="logs">路由日志</button>
         <button class="tab" data-tab="providers">源池策略</button>
       </div>
@@ -615,6 +621,34 @@ ADMIN_HTML = """
         <div id="logsPager" class="pager"></div>
       </section>
 
+      <section id="tab-upstreams" class="tabpane hidden">
+        <div class="row between" style="margin-bottom: 12px;">
+          <div class="sub">按上游查看每个模型的当前健康、接口支持、延迟、最近检测和下次探测。这里只显示启用源池上游。</div>
+          <div class="row" style="min-width: 320px;">
+            <input id="upstreamFilter" placeholder="搜索上游或模型">
+          </div>
+        </div>
+        <div class="tablewrap wide-table">
+          <table>
+            <thead>
+              <tr>
+                <th>上游</th>
+                <th>策略</th>
+                <th>模型</th>
+                <th>接口</th>
+                <th>状态</th>
+                <th>延迟</th>
+                <th>最近检测</th>
+                <th>下次探测</th>
+                <th>实际模型/原因</th>
+              </tr>
+            </thead>
+            <tbody id="upstreamsBody"></tbody>
+          </table>
+        </div>
+        <div id="upstreamsPager" class="pager"></div>
+      </section>
+
       <section id="tab-providers" class="tabpane hidden">
         <div class="row between" style="margin-bottom: 12px;">
           <div class="sub">源池策略会回写 New API 渠道。新增/删除上游、修改 key、模型权限、用户分组和订阅仍在 New API 管理。</div>
@@ -640,7 +674,7 @@ ADMIN_HTML = """
           </div>
           <div id="routeBoard" class="route-board"></div>
         </div>
-        <div class="notice">维护流程：New API 录入真实上游和 key；这里调整启停、策略层级、成本类型、优先级、权重和声明模型。保存后会自动写回 New API 渠道标签并同步 Smart Gateway。</div>
+        <div class="notice">维护流程：New API 录入真实上游和 key；这里调整启停、策略层级、费用类型、优先级、权重和声明模型。选择“付费兜底”或费用类型为“付费”都会进入最后兜底层。</div>
         <div class="tablewrap">
           <table class="policy-table">
             <thead>
@@ -668,7 +702,7 @@ ADMIN_HTML = """
     let logsData = { logs: [] };
     let providerDrafts = {};
     const pageSize = 25;
-    const pages = { models: 1, matrix: 1, logs: 1, providers: 1 };
+    const pages = { models: 1, matrix: 1, upstreams: 1, logs: 1, providers: 1 };
 
     const $ = (id) => document.getElementById(id);
     const token = () => localStorage.getItem(tokenKey) || "";
@@ -827,6 +861,18 @@ ADMIN_HTML = """
       );
     }
 
+    function mergeModelKinds(items) {
+      const byModel = new Map();
+      for (const entry of items) {
+        const row = byModel.get(entry.model) || { model: entry.model, kinds: new Set(), bestLatency: null };
+        if (entry.kind) row.kinds.add(entry.kind);
+        const latency = entry.item?.latency_ms;
+        if (latency != null && (row.bestLatency == null || latency < row.bestLatency)) row.bestLatency = latency;
+        byModel.set(entry.model, row);
+      }
+      return Array.from(byModel.values()).sort((a, b) => compareText(a.model, b.model));
+    }
+
     function enabledProviderRows() {
       syncVisibleProviderDrafts();
       return providers
@@ -838,7 +884,7 @@ ADMIN_HTML = """
           const policy = p.editable_policy || {};
           const route = providerValue(p, "route_group", policy.route_group || p.route_group || "primary");
           const cost = providerValue(p, "cost_tier", policy.cost_tier || p.cost_tier || "free");
-          const fallback = String(providerValue(p, "fallback_only", String((policy.fallback_only ?? p.fallback_only) === true))) === "true" || route === "paid_fallback" || cost === "paid";
+          const fallback = route === "paid_fallback" || cost === "paid";
           const runtime = p.runtime || {};
           return {
             provider: p,
@@ -857,10 +903,12 @@ ADMIN_HTML = """
 
     function candidateRowsForModel(model) {
       if (!model) return [];
-      const rows = [];
+      const byProvider = new Map();
       for (const item of healthyModelProviders(model)) {
         const provider = providers.find((p) => p.id === item.provider_id) || providers.find((p) => p.name === item.provider);
-        rows.push({
+        const key = item.provider_id || item.provider;
+        const existing = byProvider.get(key);
+        const row = existing || {
           provider,
           provider_name: item.provider,
           route_group: item.route_group || "primary",
@@ -868,11 +916,16 @@ ADMIN_HTML = """
           priority: Number(item.priority || 0),
           weight: Number(item.weight || 0),
           latency_ms: item.latency_ms,
-          kind: item.kind,
-          actual_model: item.actual_model
-        });
+          kinds: new Set(),
+          actual_models: new Set(),
+          fallback_only: false
+        };
+        row.kinds.add(item.kind);
+        if (item.actual_model) row.actual_models.add(item.actual_model);
+        if (item.latency_ms != null && (row.latency_ms == null || item.latency_ms < row.latency_ms)) row.latency_ms = item.latency_ms;
+        byProvider.set(key, row);
       }
-      return rows;
+      return Array.from(byProvider.values());
     }
 
     function sortedRouteRows(rows) {
@@ -908,18 +961,22 @@ ADMIN_HTML = """
     }
 
     function providerHealthyModels(providerId) {
-      const models = new Set();
+      const byModel = new Map();
       for (const kind of ["chat", "responses"]) {
         const health = state?.health?.[kind] || {};
         for (const model of Object.keys(health)) {
           for (const item of Object.values(health[model] || {})) {
             if (item.healthy && item.provider_id === providerId) {
-              models.add(`${model} (${kind})`);
+              const kinds = byModel.get(model) || new Set();
+              kinds.add(kind);
+              byModel.set(model, kinds);
             }
           }
         }
       }
-      return Array.from(models).sort();
+      return Array.from(byModel.entries())
+        .map(([model, kinds]) => ({ model, kinds: Array.from(kinds).sort() }))
+        .sort((a, b) => compareText(a.model, b.model));
     }
 
     function updateModelOptions() {
@@ -928,11 +985,15 @@ ADMIN_HTML = """
     }
 
     function smallModelChips(items, limit = 8) {
-      const shown = items.slice(0, limit);
-      const rest = items.length - shown.length;
+      const merged = mergeModelKinds(items);
+      const shown = merged.slice(0, limit);
+      const rest = merged.length - shown.length;
       return `
         <div class="models-mini">
-          ${shown.map((entry) => `<span class="chip ok mono" title="${escapeHtml(entry.model + " / " + entry.kind)}">${escapeHtml(entry.model)} ${entry.kind}</span>`).join("")}
+          ${shown.map((entry) => {
+            const kinds = Array.from(entry.kinds).sort();
+            return `<span class="chip ok mono" title="${escapeHtml(entry.model + " / " + kinds.join(", "))}">${escapeHtml(entry.model)}<span class="model-kind">${escapeHtml(kinds.join("+"))}</span></span>`;
+          }).join("")}
           ${rest > 0 ? `<span class="chip dark">+${rest}</span>` : ""}
         </div>
       `;
@@ -943,17 +1004,18 @@ ADMIN_HTML = """
       const name = row.provider_name || provider.name || provider.id || "unknown";
       const latency = row.latency_ms ?? row.avg_latency_ms;
       const models = selectedModel
-        ? [{ model: selectedModel, kind: row.kind || "" }]
+        ? [{ model: selectedModel, kind: Array.from(row.kinds || []).sort().join("+") }]
         : providerHealthyModelDetails(provider.id || "", "");
+      const actualModels = row.actual_models ? Array.from(row.actual_models).sort() : [];
       return `
-        <div class="route-card ${isTop ? "top" : ""}">
+        <div class="route-card">
           <div class="route-card-title">
             <span>${escapeHtml(name)}</span>
             <span class="pill ${row.fallback_only || row.cost_tier === "paid" ? "warn" : "ok"}">${escapeHtml(costLabel(row.cost_tier, row.fallback_only))}</span>
           </div>
           <div class="route-meta">
             优先级 ${row.priority} / 权重 ${row.weight}${latency == null ? "" : ` / ${latency} ms`}<br>
-            ${selectedModel && row.actual_model ? `实际模型 <span class="mono">${escapeHtml(row.actual_model)}</span>` : `健康 ${row.healthy ?? models.length} / 异常 ${row.unhealthy ?? 0}`}
+            ${selectedModel && actualModels.length ? `实际模型 <span class="mono">${escapeHtml(actualModels.join(", "))}</span>` : `健康 ${row.healthy ?? models.length} / 异常 ${row.unhealthy ?? 0}`}
           </div>
           ${smallModelChips(models)}
         </div>
@@ -1096,6 +1158,104 @@ ADMIN_HTML = """
       renderPager("matrix", page.total, page.totalPages);
     }
 
+    function buildUpstreamRows() {
+      const enabledIds = new Set(enabledProviderRows().map((row) => row.provider.id).filter(Boolean));
+      const byKey = new Map();
+      for (const kind of ["chat", "responses"]) {
+        const group = state?.health?.[kind] || {};
+        for (const model of Object.keys(group)) {
+          for (const item of Object.values(group[model] || {})) {
+            const providerId = item.provider_id || "";
+            if (!enabledIds.has(providerId)) continue;
+            const key = `${providerId}::${model}`;
+            const provider = providers.find((p) => p.id === providerId) || {};
+            const policy = provider.editable_policy || {};
+            const row = byKey.get(key) || {
+              provider,
+              provider_id: providerId,
+              provider_name: item.provider_name || provider.name || providerId,
+              model,
+              route_group: item.route_group || policy.route_group || provider.route_group || "",
+              cost_tier: item.cost_tier || policy.cost_tier || provider.cost_tier || "",
+              priority: Number(item.priority ?? policy.priority ?? provider.priority ?? 0),
+              weight: Number(item.weight ?? policy.weight ?? provider.weight ?? 0),
+              kinds: {},
+              checked_at: 0,
+              next_probe_at: null,
+              best_latency: null,
+              healthy_count: 0,
+              total_count: 0,
+              reasons: new Set(),
+              actual_models: new Set()
+            };
+            row.kinds[kind] = {
+              healthy: !!item.healthy,
+              latency_ms: item.latency_ms,
+              checked_at: item.checked_at,
+              next_probe_at: item.next_probe_at,
+              reason: item.reason || item.skip_reason || "",
+              actual_model: item.actual_model || ""
+            };
+            row.total_count += 1;
+            if (item.healthy) row.healthy_count += 1;
+            if (item.reason || item.skip_reason) row.reasons.add(item.reason || item.skip_reason);
+            if (item.actual_model) row.actual_models.add(item.actual_model);
+            if (item.checked_at && item.checked_at > row.checked_at) row.checked_at = item.checked_at;
+            if (item.next_probe_at && (row.next_probe_at == null || item.next_probe_at < row.next_probe_at)) row.next_probe_at = item.next_probe_at;
+            if (item.latency_ms != null && (row.best_latency == null || item.latency_ms < row.best_latency)) row.best_latency = item.latency_ms;
+            byKey.set(key, row);
+          }
+        }
+      }
+      const keyword = ($("upstreamFilter")?.value || "").trim().toLowerCase();
+      return Array.from(byKey.values()).filter((row) => {
+        if (!keyword) return true;
+        return `${row.provider_name} ${row.provider_id} ${row.model} ${Array.from(row.actual_models).join(" ")}`.toLowerCase().includes(keyword);
+      }).sort((a, b) =>
+        Number(b.healthy_count > 0) - Number(a.healthy_count > 0) ||
+        compareText(a.provider_name, b.provider_name) ||
+        (routeOrder[a.route_group] ?? 99) - (routeOrder[b.route_group] ?? 99) ||
+        Number(b.priority) - Number(a.priority) ||
+        compareText(a.model, b.model)
+      );
+    }
+
+    function kindStatusChip(kind, data) {
+      if (!data) return `<span class="chip dark">${kind} 无记录</span>`;
+      const cls = data.healthy ? "ok" : "warn";
+      const text = data.healthy ? "健康" : "异常";
+      return `<span class="chip ${cls}">${kind} ${text}${data.latency_ms == null ? "" : " " + data.latency_ms + "ms"}</span>`;
+    }
+
+    function renderUpstreams() {
+      const rows = buildUpstreamRows();
+      const page = paginate("upstreams", rows);
+      $("upstreamsBody").innerHTML = page.items.map((row) => {
+        const actual = Array.from(row.actual_models).sort().join(", ");
+        const reasons = Array.from(row.reasons).slice(0, 3).join(", ");
+        return `
+          <tr>
+            <td>
+              <div class="cell-main">${escapeHtml(row.provider_name)}</div>
+              <div class="cell-sub mono">${escapeHtml(row.provider_id)}</div>
+            </td>
+            <td>
+              <div>${routeLabel(row.route_group)} / ${costLabel(row.cost_tier)}</div>
+              <div class="cell-sub">优先 ${row.priority} / 权重 ${row.weight}</div>
+            </td>
+            <td class="mono">${escapeHtml(row.model)}</td>
+            <td><div class="chiprow">${kindStatusChip("chat", row.kinds.chat)}${kindStatusChip("responses", row.kinds.responses)}</div></td>
+            <td>${statusPill(row.healthy_count > 0, row.healthy_count > 0 && row.healthy_count < row.total_count)}</td>
+            <td>${row.best_latency == null ? "" : row.best_latency + " ms"}</td>
+            <td>${formatTs(row.checked_at, "未检测")}</td>
+            <td>${formatTs(row.next_probe_at)}</td>
+            <td class="mono">${escapeHtml(actual || reasons)}</td>
+          </tr>
+        `;
+      }).join("");
+      renderPager("upstreams", page.total, page.totalPages);
+    }
+
     function renderLogs(data) {
       const page = paginate("logs", data.logs || []);
       $("logsBody").innerHTML = page.items.map((row) => {
@@ -1152,7 +1312,8 @@ ADMIN_HTML = """
               <select data-field="enabled">${option("true", "启用", enabledValue)}${option("false", "停用", enabledValue)}</select>
               <select data-field="route_group">${routeOptions}</select>
               <select data-field="cost_tier">${option("free", "免费", costValue)}${option("metered", "计量", costValue)}${option("paid", "付费", costValue)}${option("unknown", "未知", costValue)}</select>
-              <select data-field="fallback_only">${option("false", "非仅兜底", fallbackValue)}${option("true", "仅兜底", fallbackValue)}</select>
+              <input type="hidden" data-field="fallback_only" value="${escapeHtml(fallbackValue)}">
+              <div class="cell-sub">付费兜底由策略层级或费用类型自动决定</div>
             </div>
           </td>
           <td>
@@ -1172,7 +1333,7 @@ ADMIN_HTML = """
               <label>声明模型</label>
               <textarea class="provider-models" data-field="models">${escapeHtml(models)}</textarea>
               <label>实际健康模型</label>
-              <div class="chiprow">${healthyModels.length ? healthyModels.slice(0, 18).map((m) => `<span class="chip ok mono">${escapeHtml(m)}</span>`).join("") + (healthyModels.length > 18 ? `<span class="chip dark">+${healthyModels.length - 18}</span>` : "") : '<span class="muted">暂无健康模型</span>'}</div>
+              <div class="chiprow">${healthyModels.length ? healthyModels.slice(0, 18).map((m) => `<span class="chip ok mono">${escapeHtml(m.model)}<span class="model-kind">${escapeHtml(m.kinds.join("+"))}</span></span>`).join("") + (healthyModels.length > 18 ? `<span class="chip dark">+${healthyModels.length - 18}</span>` : "") : '<span class="muted">暂无健康模型</span>'}</div>
             </div>
           </td>
           <td>
@@ -1231,12 +1392,14 @@ ADMIN_HTML = """
         const key = providerKey(provider);
         const draft = providerDrafts[key] || {};
         const get = (field, fallback) => draft[field] ?? fallback ?? "";
+        const routeGroup = get("route_group", policy.route_group || provider.route_group);
+        const costTier = get("cost_tier", policy.cost_tier || provider.cost_tier);
         return {
           id: Number(key),
           enabled: String(get("enabled", String((policy.enabled ?? provider.enabled) !== false))) === "true",
-          route_group: get("route_group", policy.route_group || provider.route_group),
-          cost_tier: get("cost_tier", policy.cost_tier || provider.cost_tier),
-          fallback_only: String(get("fallback_only", String((policy.fallback_only ?? provider.fallback_only) === true))) === "true",
+          route_group: routeGroup,
+          cost_tier: costTier,
+          fallback_only: routeGroup === "paid_fallback" || costTier === "paid",
           priority: Number(get("priority", policy.priority ?? provider.priority ?? 0) || 0),
           weight: Number(get("weight", policy.weight ?? provider.weight ?? 100) || 100),
           base_url: get("base_url", policy.base_url || provider.base_url || ""),
@@ -1259,6 +1422,7 @@ ADMIN_HTML = """
       renderOverview(overview);
       renderModels(overview);
       renderMatrix(overview);
+      renderUpstreams();
       renderLogs(logs);
       renderProviders();
       updateModelOptions();
@@ -1281,7 +1445,19 @@ ADMIN_HTML = """
     });
 
     $("refreshBtn").addEventListener("click", async () => {
-      try { await loadAll(); } catch (err) { showLogin(err.message); }
+      const btn = $("refreshBtn");
+      btn.disabled = true;
+      const oldText = btn.textContent;
+      btn.textContent = "刷新中";
+      try {
+        await loadAll();
+        setNotice("已刷新当前页面数据。");
+      } catch (err) {
+        showLogin(err.message);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = oldText;
+      }
     });
 
     $("probeBtn").addEventListener("click", async () => {
@@ -1342,6 +1518,7 @@ ADMIN_HTML = """
       pages[name] = (pages[name] || 1) + Number(btn.dataset.dir || 0);
       if (name === "models") renderModels(state);
       if (name === "matrix") renderMatrix(state);
+      if (name === "upstreams") renderUpstreams();
       if (name === "logs") renderLogs(logsData);
       if (name === "providers") {
         renderProviders();
@@ -1360,6 +1537,10 @@ ADMIN_HTML = """
     });
 
     $("modelFilter").addEventListener("input", renderRouteBoard);
+    $("upstreamFilter").addEventListener("input", () => {
+      pages.upstreams = 1;
+      renderUpstreams();
+    });
 
     document.addEventListener("input", (event) => {
       if (!event.target.closest("#tab-providers")) return;

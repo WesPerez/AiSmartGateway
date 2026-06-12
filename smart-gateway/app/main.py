@@ -549,7 +549,7 @@ def update_newapi_source_policy(updates: list[dict[str, Any]]) -> int:
                 raise ValueError(f"unsupported route_group: {route_group}")
             if cost_tier not in allowed_costs:
                 raise ValueError(f"unsupported cost_tier: {cost_tier}")
-            fallback_only = parse_bool(update.get("fallback_only"), False) or route_group == "paid_fallback"
+            fallback_only = route_group == "paid_fallback" or cost_tier == "paid" or parse_bool(update.get("fallback_only"), False)
             status = 1 if parse_bool(update.get("enabled"), True) else 0
             weight = max(1, min(10000, int(update.get("weight") or 100)))
             priority = int(update.get("priority") if update.get("priority") is not None else 0)
@@ -1424,10 +1424,14 @@ def healthy_candidate_buckets(model: str, kind: str, controls: dict[str, Any] | 
     all_items = [item for item in all_items if provider_matches_controls(item, controls)]
     healthy = [item for item in all_items if item.get("healthy")]
     primary = sorted_route_bucket(
-        [item for item in healthy if item.get("route_group", "primary") == "primary" and not item.get("fallback_only")]
+        [
+            item
+            for item in healthy
+            if item.get("route_group", "primary") == "primary" and not item.get("fallback_only") and item.get("cost_tier") != "paid"
+        ]
     )
     backup = sorted_route_bucket(
-        [item for item in healthy if item.get("route_group") == "backup" and not item.get("fallback_only")]
+        [item for item in healthy if item.get("route_group") == "backup" and not item.get("fallback_only") and item.get("cost_tier") != "paid"]
     )
     paid = sorted_route_bucket(
         [

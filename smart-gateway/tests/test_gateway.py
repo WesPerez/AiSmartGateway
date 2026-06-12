@@ -466,6 +466,29 @@ def test_select_route_candidate_uses_priority_before_weight(gateway, monkeypatch
     assert selected_weights == [["high-light", "high-heavy"]]
 
 
+def test_paid_cost_tier_is_routed_as_paid_fallback(gateway):
+    gateway.HEALTH = {
+        "chat": {
+            "good-model": {
+                "paid-cost": {
+                    "provider_id": "paid-cost",
+                    "actual_model": "good-model",
+                    "healthy": True,
+                    "priority": 100,
+                    "weight": 100,
+                    "route_group": "primary",
+                    "cost_tier": "paid",
+                },
+            }
+        },
+        "responses": {},
+    }
+
+    buckets = gateway.healthy_candidate_buckets("good-model", "chat")
+
+    assert [bucket["name"] for bucket in buckets] == ["paid_fallback"]
+
+
 def test_healthy_candidate_buckets_order_paid_last(gateway, monkeypatch):
     monkeypatch.setattr(gateway, "ROUTE_EXPLORATION_RATE", 0.0)
     gateway.HEALTH = {
