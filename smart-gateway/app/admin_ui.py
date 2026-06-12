@@ -119,6 +119,22 @@ ADMIN_HTML = """
     .row.between {
       justify-content: space-between;
     }
+    .upstream-toolbar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 12px;
+    }
+    .upstream-filters {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex: 0 0 auto;
+    }
+    .upstream-filters input {
+      width: 180px;
+    }
     input, textarea, select {
       width: 100%;
       border: 1px solid var(--line);
@@ -604,11 +620,10 @@ ADMIN_HTML = """
                 <th>时间</th>
                 <th>请求ID</th>
                 <th>接口</th>
-                <th>模型</th>
+                <th>请求模型</th>
                 <th>上游</th>
                 <th>路由</th>
-                <th>成本</th>
-                <th>实际模型</th>
+                <th>上游模型</th>
                 <th>状态</th>
                 <th>耗时</th>
                 <th>Token</th>
@@ -622,14 +637,14 @@ ADMIN_HTML = """
       </section>
 
       <section id="tab-upstreams" class="tabpane hidden">
-        <div class="row between" style="margin-bottom: 12px;">
-          <div class="sub">按上游查看每个模型的当前健康、接口支持、延迟、最近检测和下次探测。这里只显示启用源池上游。</div>
-          <div class="row" style="min-width: 520px;">
+        <div class="upstream-toolbar">
+          <div class="upstream-filters">
             <input id="upstreamFilter" list="upstreamOptions" placeholder="输入或选择上游">
             <datalist id="upstreamOptions"></datalist>
             <input id="upstreamModelFilter" list="upstreamModelOptions" placeholder="输入或选择模型">
             <datalist id="upstreamModelOptions"></datalist>
           </div>
+          <div class="sub">按上游查看每个模型的当前健康、接口支持、延迟、最近检测和下次探测。这里只显示启用源池上游。</div>
         </div>
         <div class="tablewrap wide-table">
           <table>
@@ -656,7 +671,7 @@ ADMIN_HTML = """
         <div class="row between" style="margin-bottom: 12px;">
           <div class="sub">源池策略会回写 New API 渠道。新增/删除上游、修改 key、模型权限、用户分组和订阅仍在 New API 管理。</div>
           <div class="row">
-            <button id="savePolicyBtn" class="primary" title="保存当前页的启停、路由桶、成本层级、优先级、权重、Base URL 和声明模型">保存源池策略</button>
+            <button id="savePolicyBtn" class="primary" title="保存当前页的启停、路由桶、优先级、权重、Base URL 和声明模型">保存源池策略</button>
             <button id="syncBtnProviders" class="primary" title="从 New API 重新拉取源池渠道；没有标签的新启用 default 渠道会自动纳入机会源池">同步 New API 源池</button>
             <button id="probeBtnProviders" class="primary" title="重新加载本地配置，并按冷却策略启动后台增量探测">重载配置并增量探测</button>
           </div>
@@ -677,7 +692,7 @@ ADMIN_HTML = """
           </div>
           <div id="routeBoard" class="route-board"></div>
         </div>
-        <div class="notice">维护流程：New API 录入真实上游和 key；这里调整启停、策略层级、费用标记、优先级、权重和声明模型。付费兜底只由策略层级“5 付费兜底”决定；费用类型仅用于免费/计量/未知标记和展示。</div>
+        <div class="notice">维护流程：New API 录入真实上游和 key；这里调整启停、策略层级、优先级、权重和声明模型。付费兜底只由策略层级“5 付费兜底”决定。</div>
         <div class="tablewrap">
           <table class="policy-table">
             <thead>
@@ -767,15 +782,6 @@ ADMIN_HTML = """
       return routeMeta[value]?.short || value || "";
     }
 
-    function costLabel(value, fallbackOnly = false) {
-      const label = ({
-        free: "免费",
-        metered: "计量",
-        paid: "付费"
-      })[value] || value || "";
-      return fallbackOnly ? `${label} 仅兜底` : label;
-    }
-
     const routeOrder = {
       explore: -1,
       primary: 0,
@@ -785,13 +791,6 @@ ADMIN_HTML = """
       probe_retry: 4,
       shadow: 5,
       paid_fallback: 6
-    };
-
-    const costOrder = {
-      free: 0,
-      metered: 1,
-      paid: 2,
-      unknown: 3
     };
 
     function compareText(a, b) {
@@ -1032,7 +1031,7 @@ ADMIN_HTML = """
         <div class="route-card">
           <div class="route-card-title">
             <span>${escapeHtml(name)}</span>
-            <span class="pill ${row.fallback_only || row.cost_tier === "paid" ? "warn" : "ok"}">${escapeHtml(costLabel(row.cost_tier, row.fallback_only))}</span>
+            <span class="pill ${row.fallback_only || row.route_group === "paid_fallback" ? "warn" : "ok"}">${escapeHtml(routeLabel(row.route_group))}</span>
           </div>
           <div class="route-meta">
             优先级 ${row.priority} / 权重 ${row.weight}${latency == null ? "" : ` / ${latency} ms`}<br>
@@ -1265,7 +1264,7 @@ ADMIN_HTML = """
               <div class="cell-sub mono">${escapeHtml(row.provider_id)}</div>
             </td>
             <td>
-              <div>${routeLabel(row.route_group)} / ${costLabel(row.cost_tier)}</div>
+              <div>${routeLabel(row.route_group)}</div>
               <div class="cell-sub">优先 ${row.priority} / 权重 ${row.weight}</div>
             </td>
             <td class="mono">${escapeHtml(row.model)}</td>
@@ -1294,7 +1293,6 @@ ADMIN_HTML = """
             <td class="mono">${row.requested_model || ""}</td>
             <td>${row.provider_id || ""}</td>
             <td>${routeLabel(row.route_bucket || row.route_group)}</td>
-            <td>${costLabel(row.cost_tier, row.fallback_only)}</td>
             <td class="mono">${row.actual_model || ""}</td>
             <td>${statusPill(!!row.success)}</td>
             <td>${row.latency_ms == null ? "" : row.latency_ms + " ms"}</td>
@@ -1314,8 +1312,6 @@ ADMIN_HTML = """
       const baseUrls = (policy.base_urls || p.base_urls || [policy.base_url || p.base_url || ""]).join("\\n");
       const enabledValue = String(providerValue(p, "enabled", String((policy.enabled ?? p.enabled) !== false)));
       const routeValue = providerValue(p, "route_group", policy.route_group || p.route_group);
-      const costValue = providerValue(p, "cost_tier", policy.cost_tier || p.cost_tier);
-      const editableCostValue = costValue === "paid" ? "metered" : costValue;
       const fallbackValue = String(providerValue(p, "fallback_only", String((policy.fallback_only ?? p.fallback_only) === true)));
       const priorityValue = providerValue(p, "priority", policy.priority ?? p.priority ?? 0);
       const weightValue = providerValue(p, "weight", policy.weight ?? p.weight ?? 100);
@@ -1337,7 +1333,7 @@ ADMIN_HTML = """
             <div class="stack provider-selects">
               <select data-field="enabled">${option("true", "启用", enabledValue)}${option("false", "停用", enabledValue)}</select>
               <select data-field="route_group">${routeOptions}</select>
-              <select data-field="cost_tier">${option("free", "免费", editableCostValue)}${option("metered", "计量", editableCostValue)}${option("unknown", "未知", editableCostValue)}</select>
+              <input type="hidden" data-field="cost_tier" value="unknown">
               <input type="hidden" data-field="fallback_only" value="${escapeHtml(fallbackValue)}">
               <div class="cell-sub">付费兜底只由策略层级决定</div>
             </div>
@@ -1399,7 +1395,6 @@ ADMIN_HTML = """
         return Number(bEnabled) - Number(aEnabled) ||
           (routeOrder[ap.route_group || a.route_group] ?? 99) - (routeOrder[bp.route_group || b.route_group] ?? 99) ||
           Number(aFallback) - Number(bFallback) ||
-          (costOrder[ap.cost_tier || a.cost_tier] ?? 99) - (costOrder[bp.cost_tier || b.cost_tier] ?? 99) ||
           Number(bp.priority ?? b.priority ?? 0) - Number(ap.priority ?? a.priority ?? 0) ||
           Number(bp.weight ?? b.weight ?? 0) - Number(ap.weight ?? a.weight ?? 0) ||
           Number(br.healthy ?? 0) - Number(ar.healthy ?? 0) ||
@@ -1419,13 +1414,11 @@ ADMIN_HTML = """
         const draft = providerDrafts[key] || {};
         const get = (field, fallback) => draft[field] ?? fallback ?? "";
         const routeGroup = get("route_group", policy.route_group || provider.route_group);
-        const rawCostTier = get("cost_tier", policy.cost_tier || provider.cost_tier);
-        const costTier = rawCostTier === "paid" ? "metered" : rawCostTier;
         return {
           id: Number(key),
           enabled: String(get("enabled", String((policy.enabled ?? provider.enabled) !== false))) === "true",
           route_group: routeGroup,
-          cost_tier: costTier,
+          cost_tier: "unknown",
           fallback_only: routeGroup === "paid_fallback",
           priority: Number(get("priority", policy.priority ?? provider.priority ?? 0) || 0),
           weight: Number(get("weight", policy.weight ?? provider.weight ?? 100) || 100),
