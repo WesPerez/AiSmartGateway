@@ -691,14 +691,79 @@ def backup_config_file(path: Path) -> str | None:
     return str(backup)
 
 
-def provider_headers(provider: dict[str, Any]) -> dict[str, str]:
+PASSTHROUGH_REQUEST_HEADERS = {
+    "openai-beta",
+    "openai-organization",
+    "openai-project",
+    "x-stainless-arch",
+    "x-stainless-lang",
+    "x-stainless-os",
+    "x-stainless-package-version",
+    "x-stainless-retry-count",
+    "x-stainless-runtime",
+    "x-stainless-runtime-version",
+    "x-request-id",
+    "user-agent",
+}
+
+
+def provider_headers(provider: dict[str, Any], incoming_headers: dict[str, str] | None = None, kind: str | None = None) -> dict[str, str]:
     headers = {
         "Authorization": f"Bearer {provider['api_key']}",
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
+    for key, value in (incoming_headers or {}).items():
+        if key.lower() in PASSTHROUGH_REQUEST_HEADERS and value:
+            headers[key] = value
+    if kind == "responses" and not any(key.lower() == "openai-beta" for key in headers):
+        headers["OpenAI-Beta"] = "responses=v1"
     headers.update({str(k): str(v) for k, v in (provider.get("headers") or {}).items()})
+    headers["Authorization"] = f"Bearer {provider['api_key']}"
     return headers
+
+
+def request_shape(body: dict[str, Any], incoming_headers: dict[str, str] | None = None) -> dict[str, Any]:
+    headers = incoming_headers or {}
+    input_value = body.get("input")
+    messages_value = body.get("messages")
+    tools_value = body.get("tools")
+    input_roles: list[str] = []
+    input_content_types: list[str] = []
+    if isinstance(input_value, list):
+        for item in input_value[:20]:
+            if isinstance(item, dict):
+                role = item.get("role")
+                if isinstance(role, str) and role not in input_roles:
+                    input_roles.append(role)
+                content = item.get("content")
+                content_items = content if isinstance(content, list) else [content]
+                for content_item in content_items[:20]:
+                    if isinstance(content_item, dict):
+                        content_type = content_item.get("type")
+                        if isinstance(content_type, str) and content_type not in input_content_types:
+                            input_content_types.append(content_type)
+    return {
+        "body_keys": sorted(str(key) for key in body.keys()),
+        "input_type": type(input_value).__name__ if "input" in body else "",
+        "input_count": len(input_value) if isinstance(input_value, list) else None,
+        "input_roles": input_roles,
+        "input_content_types": input_content_types,
+        "messages_count": len(messages_value) if isinstance(messages_value, list) else None,
+        "tools_count": len(tools_value) if isinstance(tools_value, list) else None,
+        "has_prompt_cache_key": "prompt_cache_key" in body,
+        "has_reasoning": "reasoning" in body,
+        "has_text": "text" in body,
+        "store": body.get("store"),
+        "stream": body.get("stream"),
+        "max_output_tokens": body.get("max_output_tokens"),
+        "metadata_keys": sorted(str(key) for key in (body.get("metadata") or {}).keys()) if isinstance(body.get("metadata"), dict) else [],
+        "incoming_header_keys": sorted(
+            key.lower()
+            for key in headers
+            if key.lower() in PASSTHROUGH_REQUEST_HEADERS or key.lower().startswith("x-gateway-")
+        ),
+    }
 
 
 def upstream_url(provider: dict[str, Any], path: str) -> str:
@@ -1413,6 +1478,16 @@ def runtime_failure_reason_for_endpoint_failures(kind: str, endpoint_reasons: li
     return None
 
 
+def paid_fallback_blocked_by_request_shape(kind: str, route_bucket: str, controls: dict[str, Any], seen_reasons: list[str]) -> bool:
+    if kind != "responses":
+        return False
+    if route_bucket != "paid_fallback":
+        return False
+    if controls.get("provider_id") or controls.get("route_group"):
+        return False
+    return "invalid_request" in seen_reasons
+
+
 def exploration_enabled(controls: dict[str, Any]) -> bool:
     if ROUTE_EXPLORATION_MAX_CANDIDATES <= 0 or ROUTE_EXPLORATION_RATE <= 0:
         return False
@@ -1501,10 +1576,10 @@ def healthy_candidate_buckets(model: str, kind: str, controls: dict[str, Any] | 
     for item in shadow:
         item["_shadow"] = True
     buckets = [
-        {"name": "explore", "items": explore},
         {"name": "primary", "items": primary},
         {"name": "backup", "items": backup},
         {"name": "other", "items": other},
+        {"name": "explore", "items": explore},
         {"name": "probe_retry", "items": retryable_probe},
         {"name": "shadow", "items": shadow},
         {"name": "paid_fallback", "items": paid},
@@ -1596,6 +1671,7 @@ async def relay_non_stream(
     body: dict[str, Any],
     kind: str,
     controls: dict[str, Any] | None = None,
+    incoming_headers: dict[str, str] | None = None,
 ) -> JSONResponse:
     controls = controls or {}
     request_id = f"gw_{uuid.uuid4().hex[:16]}"
@@ -1622,12 +1698,33 @@ async def relay_non_stream(
         )
     tried = []
     last_error: dict[str, Any] | None = None
+    seen_non_paid_reasons: list[str] = []
     attempts = min(MAX_RETRIES_PER_REQUEST, total_candidates)
     for _ in range(attempts):
         selected = select_route_candidate(buckets)
         if not selected:
             break
         chosen, route_bucket = selected
+        if paid_fallback_blocked_by_request_shape(kind, route_bucket, controls, seen_non_paid_reasons):
+            last_error = {
+                "status_code": 400,
+                "reason": "paid_fallback_blocked_after_invalid_request",
+                "body": "Non-paid Responses upstreams returned invalid_request; paid fallback skipped to avoid masking request compatibility errors.",
+                "tried": tried,
+            }
+            await append_request_log(
+                {
+                    "request_id": request_id,
+                    "kind": kind,
+                    "stream": bool(body.get("stream", False)),
+                    "requested_model": model,
+                    "success": False,
+                    "error_type": "paid_fallback_blocked_after_invalid_request",
+                    "route_controls": controls,
+                    "request_shape": request_shape(body, incoming_headers),
+                }
+            )
+            break
         for bucket in buckets:
             bucket["items"] = [item for item in bucket["items"] if item["provider_id"] != chosen["provider_id"]]
         provider = get_provider_by_id(chosen["provider_id"])
@@ -1647,7 +1744,7 @@ async def relay_non_stream(
                 endpoint_url = ""
                 for candidate_url in upstream_urls(provider, path):
                     endpoint_url = candidate_url
-                    response = await client.post(candidate_url, headers=provider_headers(provider), json=req_body)
+                    response = await client.post(candidate_url, headers=provider_headers(provider, incoming_headers, kind), json=req_body)
                     if 200 <= response.status_code < 300:
                         break
                 if response is None:
@@ -1682,6 +1779,8 @@ async def relay_non_stream(
                     return JSONResponse(data, status_code=response.status_code)
                 return JSONResponse({"raw": text}, status_code=response.status_code)
             reason = classify_error(response.status_code, text[:1000])
+            if route_bucket != "paid_fallback":
+                seen_non_paid_reasons.append(reason)
             if should_mark_runtime_failure(reason):
                 await mark_runtime_failure(kind, model, chosen["provider_id"], reason)
             await append_request_log(
@@ -1701,6 +1800,7 @@ async def relay_non_stream(
                     "error_sample": redact_text(text, 500),
                     "usage": extract_usage(data),
                     "route_controls": controls,
+                    "request_shape": request_shape(body, incoming_headers),
                     **route_fields,
                 }
             )
@@ -1742,6 +1842,7 @@ async def relay_stream(
     body: dict[str, Any],
     kind: str,
     controls: dict[str, Any] | None = None,
+    incoming_headers: dict[str, str] | None = None,
 ):
     controls = controls or {}
     request_id = f"gw_{uuid.uuid4().hex[:16]}"
@@ -1786,11 +1887,33 @@ async def relay_stream(
         return
 
     attempts = min(MAX_RETRIES_PER_REQUEST, total_candidates)
+    seen_non_paid_reasons: list[str] = []
     for _ in range(attempts):
         selected = select_route_candidate(buckets)
         if not selected:
             break
         chosen, route_bucket = selected
+        if paid_fallback_blocked_by_request_shape(kind, route_bucket, controls, seen_non_paid_reasons):
+            await append_request_log(
+                {
+                    "request_id": request_id,
+                    "kind": kind,
+                    "stream": True,
+                    "requested_model": model,
+                    "success": False,
+                    "error_type": "paid_fallback_blocked_after_invalid_request",
+                    "route_controls": controls,
+                    "request_shape": request_shape(body, incoming_headers),
+                }
+            )
+            yield response_failed_event(
+                request_id,
+                model,
+                "paid_fallback_blocked_after_invalid_request",
+                "Paid fallback skipped after non-paid Responses upstreams rejected the request shape",
+            )
+            yield b"data: [DONE]\n\n"
+            return
         for bucket in buckets:
             bucket["items"] = [item for item in bucket["items"] if item["provider_id"] != chosen["provider_id"]]
         provider = get_provider_by_id(chosen["provider_id"])
@@ -1812,11 +1935,13 @@ async def relay_stream(
                 follow_redirects=True,
             ) as client:
                 for endpoint_url in upstream_urls(provider, path):
-                    async with client.stream("POST", endpoint_url, headers=provider_headers(provider), json=req_body) as response:
+                    async with client.stream("POST", endpoint_url, headers=provider_headers(provider, incoming_headers, kind), json=req_body) as response:
                         if response.status_code < 200 or response.status_code >= 300:
                             raw = await response.aread()
                             reason = classify_error(response.status_code, raw.decode("utf-8", "ignore")[:1000])
                             endpoint_reasons.append(reason)
+                            if route_bucket != "paid_fallback":
+                                seen_non_paid_reasons.append(reason)
                             await append_request_log(
                                 {
                                     "request_id": request_id,
@@ -1833,6 +1958,7 @@ async def relay_stream(
                                     "error_type": reason,
                                     "error_sample": redact_text(raw.decode("utf-8", "ignore"), 500),
                                     "route_controls": controls,
+                                    "request_shape": request_shape(body, incoming_headers),
                                     **route_fields,
                                 }
                             )
@@ -1959,9 +2085,10 @@ async def chat_completions(request: Request, authorization: str | None = Header(
         return JSONResponse({"error": {"message": "Unauthorized", "type": "auth_error"}}, status_code=401)
     body = await request.json()
     controls = request_route_controls(request)
+    incoming_headers = dict(getattr(request, "headers", {}) or {})
     if body.get("stream", False):
-        return StreamingResponse(relay_stream("/chat/completions", body, "chat", controls), media_type="text/event-stream")
-    return await relay_non_stream("/chat/completions", body, "chat", controls)
+        return StreamingResponse(relay_stream("/chat/completions", body, "chat", controls, incoming_headers), media_type="text/event-stream")
+    return await relay_non_stream("/chat/completions", body, "chat", controls, incoming_headers)
 
 
 @app.post("/v1")
@@ -1975,9 +2102,10 @@ async def responses(request: Request, authorization: str | None = Header(default
         return JSONResponse({"error": {"message": "Unauthorized", "type": "auth_error"}}, status_code=401)
     body = await request.json()
     controls = request_route_controls(request)
+    incoming_headers = dict(getattr(request, "headers", {}) or {})
     if body.get("stream", False):
-        return StreamingResponse(relay_stream("/responses", body, "responses", controls), media_type="text/event-stream")
-    return await relay_non_stream("/responses", body, "responses", controls)
+        return StreamingResponse(relay_stream("/responses", body, "responses", controls, incoming_headers), media_type="text/event-stream")
+    return await relay_non_stream("/responses", body, "responses", controls, incoming_headers)
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])

@@ -27,6 +27,25 @@ DEFAULT_GROUP = "default"
 DEFAULT_ROUTER_GROUPS = ["default", "vip"]
 ROUTER_NAME = "Smart Gateway Router"
 ROUTER_BASE_URL = "http://smart-gateway:8000"
+ROUTER_SETTING = {
+    "force_format": False,
+    "thinking_to_content": False,
+    "proxy": "",
+    "pass_through_body_enabled": True,
+    "system_prompt": "",
+    "system_prompt_override": False,
+}
+ROUTER_SETTINGS = {
+    "allow_service_tier": True,
+    "disable_store": True,
+    "allow_safety_identifier": True,
+    "allow_include_obfuscation": True,
+    "upstream_model_update_check_enabled": False,
+    "upstream_model_update_auto_sync_enabled": False,
+    "upstream_model_update_ignored_models": [],
+    "upstream_model_update_last_detected_models": [],
+    "upstream_model_update_last_check_time": 0,
+}
 DEFAULT_MODEL_RATIO = 0.5
 MODEL_RATIO_KEY = "ModelRatio"
 MODEL_RATIO_ARCHIVE_KEY = "SmartGatewayModelRatioArchive"
@@ -244,6 +263,10 @@ def write_json_option(con: sqlite3.Connection, key: str, value: dict[str, Any]) 
         """,
         (key, text),
     )
+
+
+def table_columns(con: sqlite3.Connection, table: str) -> set[str]:
+    return {str(row[1]) for row in con.execute(f"pragma table_info({table})").fetchall()}
 
 
 def model_ratio_default(model: str, ratios: dict[str, Any], archive: dict[str, Any]) -> Any:
@@ -588,30 +611,54 @@ def sync(args: argparse.Namespace) -> None:
         discovered_models = load_router_models(master_key, gateway_url)
         models = filter_models_csv(discovered_models, disabled_models(con))
         now_ts = int(time.time())
+        channel_columns = table_columns(con, "channels")
+        router_extra_columns = [column for column in ("setting", "settings") if column in channel_columns]
+        router_extra_values = {
+            "setting": json.dumps(ROUTER_SETTING, ensure_ascii=False, separators=(",", ":")),
+            "settings": json.dumps(ROUTER_SETTINGS, ensure_ascii=False, separators=(",", ":")),
+        }
         existing = con.execute("select id from channels where name = ? or base_url = ?", (ROUTER_NAME, ROUTER_BASE_URL)).fetchone()
         if existing:
+            extra_set = "".join(f", {column} = ?" for column in router_extra_columns)
             con.execute(
-                """
+                f"""
                 update channels
                 set type = 1, key = ?, base_url = ?, models = ?, "group" = ?, status = 1,
                     priority = 1000, weight = 100, auto_ban = 0, test_model = 'gpt-5.5',
-                    tag = '',
+                    tag = ''{extra_set},
                     remark = 'New API front door -> Smart Gateway intelligent upstream router'
                 where id = ?
                 """,
-                (master_key, ROUTER_BASE_URL, models, DEFAULT_GROUP, existing["id"]),
+                (
+                    master_key,
+                    ROUTER_BASE_URL,
+                    models,
+                    DEFAULT_GROUP,
+                    *(router_extra_values[column] for column in router_extra_columns),
+                    existing["id"],
+                ),
             )
             router_id = existing["id"]
         else:
+            extra_insert_columns = "".join(f", {column}" for column in router_extra_columns)
+            extra_placeholders = "".join(", ?" for _ in router_extra_columns)
             con.execute(
-                """
+                f"""
                 insert into channels (
                     type, key, status, name, weight, created_time, base_url, models,
-                    "group", priority, auto_ban, test_model, remark
-                ) values (1, ?, 1, ?, 100, ?, ?, ?, ?, 1000, 0, 'gpt-5.5',
+                    "group", priority, auto_ban, test_model{extra_insert_columns}, remark
+                ) values (1, ?, 1, ?, 100, ?, ?, ?, ?, 1000, 0, 'gpt-5.5'{extra_placeholders},
                     'New API front door -> Smart Gateway intelligent upstream router')
                 """,
-                (master_key, ROUTER_NAME, now_ts, ROUTER_BASE_URL, models, DEFAULT_GROUP),
+                (
+                    master_key,
+                    ROUTER_NAME,
+                    now_ts,
+                    ROUTER_BASE_URL,
+                    models,
+                    DEFAULT_GROUP,
+                    *(router_extra_values[column] for column in router_extra_columns),
+                ),
             )
             router_id = int(con.execute("select last_insert_rowid()").fetchone()[0])
         model_ratio_added, model_ratio_removed = sync_model_ratio(con, models)

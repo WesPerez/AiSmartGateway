@@ -167,6 +167,32 @@ def test_with_channel_fields_treats_only_status_one_as_enabled(gateway):
     assert gateway.with_channel_fields(provider, {"status": 0, "base_url": "https://p1.example"})["enabled"] is False
 
 
+def test_provider_headers_passthrough_keeps_upstream_authorization(gateway):
+    headers = gateway.provider_headers(
+        {"api_key": "sk-upstream", "headers": {}},
+        {
+            "authorization": "Bearer sk-user",
+            "openai-beta": "responses=v1",
+            "x-stainless-runtime": "node",
+            "user-agent": "codex-test",
+            "x-not-allowed": "drop",
+        },
+    )
+
+    assert headers["Authorization"] == "Bearer sk-upstream"
+    assert headers["openai-beta"] == "responses=v1"
+    assert headers["x-stainless-runtime"] == "node"
+    assert headers["user-agent"] == "codex-test"
+    assert "x-not-allowed" not in headers
+
+
+def test_provider_headers_adds_responses_beta(gateway):
+    headers = gateway.provider_headers({"api_key": "sk-upstream", "headers": {}}, {}, "responses")
+
+    assert headers["Authorization"] == "Bearer sk-upstream"
+    assert headers["OpenAI-Beta"] == "responses=v1"
+
+
 @pytest.mark.asyncio()
 @respx.mock
 async def test_probe_lists_only_really_healthy_models(gateway):
@@ -310,17 +336,20 @@ async def test_non_stream_failover_marks_failed_provider(gateway, monkeypatch):
 
     with respx.mock:
         respx.post("https://p1.example/v1/chat/completions").mock(return_value=httpx.Response(500, json={"error": "down"}))
-        respx.post("https://p2.example/v1/chat/completions").mock(return_value=httpx.Response(200, json={"id": "ok"}))
+        p2_route = respx.post("https://p2.example/v1/chat/completions").mock(return_value=httpx.Response(200, json={"id": "ok"}))
         response = await gateway.relay_non_stream(
             "/chat/completions",
             {"model": "good-model", "messages": [{"role": "user", "content": "ping"}]},
             "chat",
+            incoming_headers={"openai-beta": "responses=v1", "authorization": "Bearer sk-user"},
         )
         assert response.status_code == 200
         assert json.loads(response.body.decode())["id"] == "ok"
 
     assert gateway.HEALTH["chat"]["good-model"]["p1"]["healthy"] is False
     assert gateway.HEALTH["chat"]["good-model"]["p2"]["healthy"] is True
+    assert p2_route.calls.last.request.headers["Authorization"] == "Bearer sk-p2"
+    assert p2_route.calls.last.request.headers["openai-beta"] == "responses=v1"
     logs = gateway.read_recent_request_logs()
     assert logs[0]["success"] is True
     assert logs[0]["provider_id"] == "p2"
@@ -382,6 +411,69 @@ async def test_non_stream_uses_paid_fallback_only_after_primary_fails(gateway, m
     logs = gateway.read_recent_request_logs()
     assert logs[0]["provider_id"] == "paid"
     assert logs[0]["route_bucket"] == "paid_fallback"
+
+
+@pytest.mark.asyncio()
+async def test_non_stream_blocks_paid_fallback_after_responses_invalid_request(gateway, monkeypatch):
+    gateway.PROVIDERS = [
+        {
+            "id": "primary",
+            "base_url": "https://primary.example/v1",
+            "base_urls": ["https://primary.example/v1", "https://primary-alt.example/v1"],
+            "api_key": "sk-primary",
+            "timeout_seconds": 3,
+            "headers": {},
+        },
+        {"id": "paid", "base_url": "https://paid.example/v1", "api_key": "sk-paid", "timeout_seconds": 3, "headers": {}},
+    ]
+    gateway.HEALTH = {
+        "responses": {
+            "good-model": {
+                "primary": {
+                    "provider_id": "primary",
+                    "actual_model": "good-model",
+                    "healthy": True,
+                    "priority": 100,
+                    "weight": 1,
+                    "route_group": "primary",
+                    "cost_tier": "free",
+                },
+                "paid": {
+                    "provider_id": "paid",
+                    "actual_model": "good-model",
+                    "healthy": True,
+                    "priority": 10,
+                    "weight": 1000,
+                    "route_group": "paid_fallback",
+                    "cost_tier": "paid",
+                    "fallback_only": True,
+                },
+            }
+        },
+        "chat": {},
+    }
+    monkeypatch.setattr(gateway, "pick_weighted", lambda candidates: candidates[0])
+
+    with respx.mock:
+        respx.post("https://primary.example/v1/responses").mock(
+            return_value=httpx.Response(400, json={"error": {"message": "invalid codex request", "code": "invalid_responses_request"}})
+        )
+        respx.post("https://primary-alt.example/v1/responses").mock(
+            return_value=httpx.Response(400, json={"error": {"message": "invalid codex request", "code": "invalid_responses_request"}})
+        )
+        paid_route = respx.post("https://paid.example/v1/responses").mock(return_value=httpx.Response(200, json={"id": "paid-ok"}))
+        response = await gateway.relay_non_stream(
+            "/responses",
+            {"model": "good-model", "input": "ping", "stream": False},
+            "responses",
+        )
+
+    assert response.status_code == 503
+    assert paid_route.call_count == 0
+    payload = json.loads(response.body.decode())
+    assert payload["error"]["details"]["reason"] == "paid_fallback_blocked_after_invalid_request"
+    logs = gateway.read_recent_request_logs()
+    assert logs[0]["error_type"] == "paid_fallback_blocked_after_invalid_request"
 
 
 @pytest.mark.asyncio()
@@ -567,7 +659,7 @@ def test_healthy_candidate_buckets_order_paid_last(gateway, monkeypatch):
     ]
 
 
-def test_healthy_candidate_buckets_can_explore_shadow_before_primary(gateway, monkeypatch):
+def test_healthy_candidate_buckets_keeps_explore_after_primary(gateway, monkeypatch):
     monkeypatch.setattr(gateway.random, "random", lambda: 0.0)
     monkeypatch.setattr(gateway, "ROUTE_EXPLORATION_RATE", 1.0)
     monkeypatch.setattr(gateway, "ROUTE_EXPLORATION_MAX_CANDIDATES", 1)
@@ -611,9 +703,9 @@ def test_healthy_candidate_buckets_can_explore_shadow_before_primary(gateway, mo
     buckets = gateway.healthy_candidate_buckets("good-model", "chat")
     candidates = gateway.healthy_candidates("good-model", "chat")
 
-    assert [bucket["name"] for bucket in buckets] == ["explore", "primary", "paid_fallback"]
-    assert [item["provider_id"] for item in candidates] == ["opportunistic", "primary", "paid"]
-    assert candidates[0]["_explore"] is True
+    assert [bucket["name"] for bucket in buckets] == ["primary", "explore", "paid_fallback"]
+    assert [item["provider_id"] for item in candidates] == ["primary", "opportunistic", "paid"]
+    assert candidates[1]["_explore"] is True
 
 
 def test_exploration_does_not_include_paid_shadow(gateway, monkeypatch):
@@ -1172,6 +1264,59 @@ async def test_responses_stream_invalid_request_cools_down_provider_after_all_en
     assert item["next_probe_at"] > gateway.now()
 
 
+@pytest.mark.asyncio()
+async def test_responses_stream_blocks_paid_fallback_after_invalid_request(gateway, monkeypatch):
+    gateway.PROVIDERS = [
+        {"id": "primary", "base_url": "https://primary.example/v1", "api_key": "sk-primary", "timeout_seconds": 3, "headers": {}},
+        {"id": "paid", "base_url": "https://paid.example/v1", "api_key": "sk-paid", "timeout_seconds": 3, "headers": {}},
+    ]
+    gateway.HEALTH = {
+        "responses": {
+            "good-model": {
+                "primary": {
+                    "provider_id": "primary",
+                    "actual_model": "good-model",
+                    "healthy": True,
+                    "priority": 100,
+                    "weight": 1,
+                    "route_group": "primary",
+                    "cost_tier": "free",
+                },
+                "paid": {
+                    "provider_id": "paid",
+                    "actual_model": "good-model",
+                    "healthy": True,
+                    "priority": 10,
+                    "weight": 100,
+                    "route_group": "paid_fallback",
+                    "cost_tier": "paid",
+                    "fallback_only": True,
+                },
+            }
+        },
+        "chat": {},
+    }
+    monkeypatch.setattr(gateway, "pick_weighted", lambda candidates: candidates[0])
+
+    with respx.mock:
+        respx.post("https://primary.example/v1/responses").mock(
+            return_value=httpx.Response(400, json={"error": {"message": "invalid codex request", "code": "invalid_responses_request"}})
+        )
+        paid_route = respx.post("https://paid.example/v1/responses").mock(return_value=httpx.Response(200, text="data: ok\n\n"))
+        chunks = [
+            chunk
+            async for chunk in gateway.relay_stream(
+                "/responses",
+                {"model": "good-model", "input": "ping", "stream": True},
+                "responses",
+            )
+        ]
+
+    joined = b"".join(chunks)
+    assert paid_route.call_count == 0
+    assert b"paid_fallback_blocked_after_invalid_request" in joined
+
+
 def make_request(host: str = "example.test") -> Request:
     return Request(
         {
@@ -1352,7 +1497,7 @@ async def test_v1_root_aliases_models_and_chat(gateway, monkeypatch):
     models = await gateway.v1_index("Bearer master")
     assert [item["id"] for item in models["data"]] == ["good-model"]
 
-    async def fake_relay_non_stream(path, body, kind, controls=None):
+    async def fake_relay_non_stream(path, body, kind, controls=None, incoming_headers=None):
         return gateway.JSONResponse({"path": path, "kind": kind, "model": body["model"]})
 
     class BodyRequest:

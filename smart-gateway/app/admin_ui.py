@@ -796,14 +796,14 @@ ADMIN_HTML = """
     }
 
     const routeOrder = {
-      explore: -1,
       primary: 0,
       backup: 1,
       opportunistic: 2,
       other: 3,
-      probe_retry: 4,
-      shadow: 5,
-      paid_fallback: 6
+      explore: 4,
+      probe_retry: 5,
+      shadow: 6,
+      paid_fallback: 7
     };
 
     function compareText(a, b) {
