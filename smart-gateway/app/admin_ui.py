@@ -958,21 +958,40 @@ ADMIN_HTML = """
       if (!upstreams.length) return '<span class="muted">无健康上游</span>';
       const byProvider = new Map();
       for (const item of upstreams) {
-        const current = byProvider.get(item.provider);
-        if (!current || Number(item.priority) > Number(current.priority) || Number(item.weight) > Number(current.weight)) {
-          byProvider.set(item.provider, item);
+        const current = byProvider.get(item.provider) || {
+          provider: item.provider,
+          priority: Number(item.priority || 0),
+          weight: Number(item.weight || 0),
+          latency_ms: item.latency_ms,
+          kinds: new Set()
+        };
+        current.kinds.add(item.kind);
+        current.priority = Math.max(Number(current.priority || 0), Number(item.priority || 0));
+        current.weight = Math.max(Number(current.weight || 0), Number(item.weight || 0));
+        if (item.latency_ms != null && (current.latency_ms == null || item.latency_ms < current.latency_ms)) {
+          current.latency_ms = item.latency_ms;
         }
+        byProvider.set(item.provider, current);
       }
       const items = Array.from(byProvider.values()).sort((a, b) =>
         Number(b.priority) - Number(a.priority) ||
         Number(b.weight) - Number(a.weight) ||
+        Number(a.latency_ms ?? 999999) - Number(b.latency_ms ?? 999999) ||
         compareText(a.provider, b.provider)
       );
       return `
         <div class="chiprow">
-          ${items.map((item) => `<span class="chip ok">${escapeHtml(item.provider)} W${item.weight}</span>`).join("")}
+          ${items.map((item) => `<span class="chip ok">${escapeHtml(item.provider)} <span class="model-kind">${escapeHtml(Array.from(item.kinds).sort().join("+"))}</span> W${item.weight}</span>`).join("")}
         </div>
       `;
+    }
+
+    function modelStatusPill(model) {
+      const chatOk = Number(model.chat_ok || 0);
+      const responsesOk = Number(model.responses_ok || 0);
+      if (chatOk > 0 && responsesOk > 0) return '<span class="pill ok">全健康</span>';
+      if (chatOk > 0 || responsesOk > 0) return '<span class="pill warn">部分健康</span>';
+      return '<span class="pill bad">不可用</span>';
     }
 
     function providerHealthyModels(providerId) {
@@ -1139,7 +1158,7 @@ ADMIN_HTML = """
           <td>${m.chat_ok}</td>
           <td>${m.responses_ok}</td>
           <td>${modelProviderSummary(m.id)}</td>
-          <td>${statusPill(m.chat_ok > 0 || m.responses_ok > 0, m.chat_ok === 0 || m.responses_ok === 0)}</td>
+          <td>${modelStatusPill(m)}</td>
         </tr>
       `;
       }).join("");
