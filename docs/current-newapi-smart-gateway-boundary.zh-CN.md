@@ -63,7 +63,17 @@ Smart Gateway 后台是路由运维视图，不是第二套用户/令牌/订阅�
 固定探活请求可能弱于真实 Codex/Responses 请求。遇到
 `invalid_request`、`invalid codex request` 这类错误时，不应直接判定模型不可用。
 
-当前策略是保留这类上游为“请求形态待验证”候选，并允许在付费兜底前做有限重试。后续最佳策略应按真实请求形态做最多三次确认：三次同类真实失败后短冷却，任意一次真实成功则立即恢复健康。
+当前策略是保留这类上游为“请求形态待验证”候选，并允许在付费兜底前做有限重试。真正有效的验证必须使用真实 Codex 请求形态，或使用已捕获并脱敏的 Codex-shape 模板，而不是手写的极简 `curl` 请求。
+
+一次真实 Codex CLI 请求即使 prompt 很小，body 也可能有约 38 KB，包含完整 `instructions`、真实 `input`、`reasoning` 和 `Originator`、`Session-Id`、`Thread-Id`、`X-Codex-Beta-Features`、`X-Codex-Turn-Metadata` 等 header。手写小 JSON 返回 `invalid codex request`，不能证明真实 Codex 不可用。
+
+判断规则：
+
+1. 固定探活失败只作为 hint。
+2. 真实运行时请求成功是最强健康证据。
+3. 对同一 provider/model/kind/request-shape fingerprint，真实形态连续 3 次失败后才标记 `real_shape_invalid` 并短冷却。
+4. 任意一次真实形态成功，立即恢复健康并清空失败计数。
+5. 多 Base URL 的同一逻辑上游，应逐个 base URL 验证，但仍归并为一个 provider。
 
 ## 应急写入
 

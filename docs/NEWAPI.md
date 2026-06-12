@@ -182,6 +182,46 @@ Smart Gateway currently normalizes Responses bodies by adding safe defaults
 such as `instructions: ""` and `store: false` when absent. It does not invent
 large tool lists or hidden Codex metadata.
 
+## Real Codex Shape Verification
+
+Low-cost probes are useful for cheap screening, but they are not authoritative
+for Codex/Responses compatibility. A correct verification path must be based on
+a real Codex request shape, not on a hand-written minimal `curl` body.
+
+The verified Codex CLI shape from `codex_exec 0.139.0` has these properties:
+
+- `POST /v1/responses`
+- streaming SSE response expected through `Accept: text/event-stream`
+- large request body, about 38 KB even for a tiny prompt, because Codex sends
+  full agent instructions and runtime context
+- `instructions` populated with the Codex agent instructions
+- `input` as the real Codex conversation payload
+- `reasoning` present when reasoning effort is configured
+- headers including `Originator: codex_exec`, `User-Agent: codex_exec/...`,
+  `Session-Id`, `Thread-Id`, `X-Codex-Beta-Features`, and
+  `X-Codex-Turn-Metadata`
+
+This distinction matters. A simplified probe or hand-written JSON body can
+return `400 invalid codex request` while the real Codex request shape succeeds.
+Therefore:
+
+- Minimal probe failures are only hints.
+- Runtime client requests are the strongest evidence.
+- Synthetic verification must replay a captured/sanitized Codex-shape template,
+  not a small generic Responses body.
+- Authorization is always replaced with the provider key; captured user tokens
+  must never be stored or replayed.
+- Captured verification templates must be stored redacted, bounded in size, and
+  versioned by client kind, API kind, and request-shape fingerprint.
+
+The anyrouter incident confirmed this rule. With a captured real Codex request
+body/headers and the provider key injected, both configured anyrouter base URLs
+returned valid SSE `200 OK` three times:
+
+- `https://anyrouter.top/v1/responses`: 3/3 successful real-shape checks.
+- `https://a-ocnfniawgw.cn-shanghai.fcapp.run/v1/responses`: 3/3 successful
+  real-shape checks.
+
 ## `invalid_request` Handling
 
 The important lesson from the recent anyrouter incident is:
@@ -198,6 +238,8 @@ Current behavior:
   request shape before the provider is judged unavailable.
 - Verification is keyed by the request-shape fingerprint. The default threshold
   is 3 real request failures for the same provider/model/API kind/request shape.
+- For Codex clients, verification must use the real Codex request shape or a
+  captured/sanitized Codex-shape template. A minimal probe is not enough.
 - Before 3 confirmations, such providers remain retry candidates before paid
   fallback.
 - After 3 confirmations, the provider/model/kind is marked
@@ -216,6 +258,7 @@ The default verification/cooldown knobs are:
 This gives a better balance than either extreme:
 
 - Do not trust a weak synthetic probe.
+- Do not treat a hand-written request as proof of Codex incompatibility.
 - Do not hammer a provider forever when real requests repeatedly prove the same
   shape is invalid.
 
@@ -232,11 +275,11 @@ healthy primary
 ```
 
 This was a stopgap to keep potentially usable primary providers in play before
-paid fallback while avoiding client hard failures. The route order should be
-revisited after real-request verification is implemented. A cleaner final model
-would treat request-shape-unverified primary providers as a primary sub-state
-with a bounded verification budget, not as a generic bucket between backup and
-fallback.
+paid fallback while avoiding client hard failures. The cleaner target model is
+to treat request-shape-unverified primary providers as a primary sub-state with
+a bounded verification budget, not as a generic bucket between backup and
+fallback. The verification budget should prefer real runtime requests and use
+captured Codex-shape templates only for explicit admin-triggered diagnostics.
 
 ## Operations UI
 

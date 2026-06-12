@@ -199,21 +199,41 @@ Responses invalid_request 不等于模型不可用，应进入请求形态待验
 
 当前仍不足：
 
-- 固定探活仍不能证明真实 Codex 请求是否可用。
-- curl 伪造的请求不等于真实 Codex CLI 请求。
-- 真正应该使用实际用户请求形态做 bounded verification。
+- 固定探活不能证明真实 Codex 请求是否可用。
+- 手写或简化的 curl 请求不等于真实 Codex CLI 请求。
+- 真正应该使用实际用户请求形态，或已捕获并脱敏的真实 Codex-shape 模板做 bounded verification。
 
-建议下一步实现：
+正确策略：
 
 1. 当 Responses 上游在真实请求上返回 `invalid_request`，且失败发生在 stream 第一块之前，记录为 `shape_verification_needed`。
-2. 对同一 provider/model/kind/endpoint/request-shape-class 做最多 3 次真实形态确认。
+2. 对同一 provider/model/kind/request-shape-fingerprint 做最多 3 次真实形态确认。
 3. 三次可以在短时间窗口内跨真实请求累计，而不是每个用户请求都立即打三次。
 4. 如果三次都返回同类 `invalid_request`，标记为 `real_shape_invalid` 并短冷却。
 5. 如果任一次成功，立即标记健康并清除该 shape 的失败计数。
 6. 对非幂等或已经开始 stream 的请求不重放。
 7. 对失败前没有任何 token 输出的 400，可以尝试同 provider 的备用 base URL。
+8. 管理员主动诊断时，可以使用捕获/脱敏后的真实 Codex-shape 模板发起验证；不能用手写极简请求代替。
 
 这比“固定探活失败就判死”和“永远不判死”都更合理。
+
+### 真实 Codex shape 验证结论
+
+这次重新验证时，先用本地捕获代理接收 `codex exec 0.139.0` 的真实请求，再把捕获到的 body/header 原样转发到 anyrouter，只替换为 provider 的真实 `Authorization`。
+
+真实 Codex 请求特征：
+
+- `POST /v1/responses`。
+- `Accept: text/event-stream`。
+- 即使 prompt 很小，body 也约 38 KB。
+- body 包含完整 Codex `instructions`、真实 `input`、`reasoning` 等字段。
+- header 包含 `Originator: codex_exec`、`User-Agent: codex_exec/...`、`Session-Id`、`Thread-Id`、`X-Codex-Beta-Features`、`X-Codex-Turn-Metadata`。
+
+验证结果：
+
+- `https://anyrouter.top/v1/responses`：真实 Codex shape 连续 3 次 `HTTP 200`，SSE 正常返回。
+- `https://a-ocnfniawgw.cn-shanghai.fcapp.run/v1/responses`：真实 Codex shape 连续 3 次 `HTTP 200`，SSE 正常返回。
+
+因此，anyrouter 的 `gpt-5.5 / responses` 不能因为手写小 JSON 或固定探活返回 `invalid codex request` 被判不可用。正确结论是：真实 Codex shape 可用，探活 shape 不可信。
 
 ## anyrouter 事件总结
 
@@ -232,9 +252,9 @@ Responses invalid_request 不等于模型不可用，应进入请求形态待验
 
 仍需验证：
 
-- 真实 Codex 客户端请求经过 New API 后，Gateway 日志里是否能看到完整 body 和 headers。
-- anyrouter 在真实 Codex 请求形态下是否恢复成功。
-- 如果仍失败，是否需要请求体字段级 diff，而不是继续靠固定探活。
+- New API -> Gateway -> anyrouter 的完整链路是否完全保留上述真实 Codex shape。
+- Gateway 当前日志是否足够展示 request-shape fingerprint、确认计数和 base URL 结果。
+- 如果完整链路仍失败，应做字段级 diff，而不是继续靠固定探活。
 
 ## UI 与管理功能演进
 
@@ -528,6 +548,7 @@ Smart Gateway 后台逐步增加和调整了：
 - Responses `invalid_request` 真实请求三次确认机制：探活形态失败不直接误杀；真实客户端请求同一请求形态连续 3 次失败后才标记 `runtime_failure:real_shape_invalid` 并短冷却。
 - 成功真实请求会立即反写健康状态，并清空 request-shape failure counter。
 - 上游模型状态页显示探活/真实请求验证和冷却策略。
+- 真实 Codex shape 捕获验证确认：anyrouter 两个 base URL 均 3/3 成功。
 - UI 显示优化。
 - 测试覆盖。
 
@@ -536,9 +557,10 @@ Smart Gateway 后台逐步增加和调整了：
 优先级最高：
 
 1. 将 `probe_retry` 改造成 provider 主状态的 verification budget，而不是单独 route bucket。
-2. 在路由日志列表中增加“真实请求确认计数、shape fingerprint、确认状态”。
-3. 增加管理员手动清除某个 provider/model/kind 冷却和验证计数的按钮。
-4. 用真实 Codex 请求日志继续验证 anyrouter 通过 New API + Gateway 的完整链路。
+2. 增加管理员“真实 Codex shape 诊断”按钮：使用捕获/脱敏模板，对指定 provider/model/kind/base URL 做 1-3 次小预算验证。
+3. 在路由日志列表中增加“真实请求确认计数、shape fingerprint、确认状态、base URL 结果”。
+4. 增加管理员手动清除某个 provider/model/kind 冷却和验证计数的按钮。
+5. 验证 New API -> Gateway -> anyrouter 完整链路是否和直连真实 Codex shape 一致。
 
 中优先级：
 
@@ -563,8 +585,10 @@ Smart Gateway 后台逐步增加和调整了：
 - 它保留了 New API 源渠道模型声明。
 - 它让真实请求日志成为判断依据。
 - 它已经把 Responses `invalid_request` 从“文档建议”落到服务器实际路由逻辑里。
+- 它确认了真实 Codex shape 才是 anyrouter 可用性的判断标准。
 
 但它还不是最终最优：
 
 - 仍需要把 request-shape verification 从 route bucket 抽象成健康子状态。
-- 仍需要用真实 Codex 请求日志验证 anyrouter 通过 New API + Gateway 的完整链路。
+- 仍需要把真实 Codex shape 诊断做成后台可操作功能，并脱敏保存模板。
+- 仍需要用字段级 diff 验证完整链路是否改变了 Codex body/header。

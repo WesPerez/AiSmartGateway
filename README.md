@@ -50,6 +50,7 @@ Core behavior:
 - Pull provider model lists, then verify models with real minimal requests.
 - Cache provider model lists and cooldown probe failures to avoid wasting token quota on repeated checks.
 - Maintain health by API kind, canonical model, provider, and actual model.
+- Treat Responses `invalid_request` from weak probes as request-shape-unverified; verify Codex providers with real Codex-shaped requests before marking them unavailable.
 - Return only currently healthy models to New API through the router channel.
 - Fail over current `/v1/chat/completions` and `/v1/responses` requests to another healthy upstream for the same model.
 - Expose `/gateway-admin/` for authenticated route operations.

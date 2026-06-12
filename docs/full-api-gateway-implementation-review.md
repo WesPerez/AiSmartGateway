@@ -91,18 +91,23 @@ not enough evidence to mark the provider/model unavailable.
 Current behavior:
 
 - Responses probe `invalid_request` is classified as request-shape-unverified.
-- Runtime Responses `invalid_request` does not trigger long runtime cooldown.
-- Such providers remain bounded retry candidates before paid fallback.
+- Runtime Responses `invalid_request` is tracked as a request-shape
+  verification signal rather than a generic provider failure.
+- Such providers remain bounded retry candidates before paid fallback until the
+  real-shape failure threshold is reached.
 - Paid fallback is never blocked only because a non-paid provider returned
   `invalid_request`.
+- Runtime success clears the request-shape failure counter immediately.
 
-Recommended next behavior:
+Correct verification behavior:
 
-- Use real client request shape for bounded verification.
-- Confirm the same provider/model/kind/request-shape class up to three times
-  before marking it real-shape-invalid.
+- Use real client request shape for bounded verification. For Codex, this means
+  the captured/sanitized Codex CLI shape, not a hand-written minimal body.
+- Confirm the same provider/model/kind/request-shape class up to three times,
+  using the request-shape fingerprint, before marking it real-shape-invalid.
 - Do not replay after a stream has started.
 - Clear the verification failure counter immediately on runtime success.
+- Store only redacted shape metadata/templates; never persist user tokens.
 
 ## Responses API Streaming
 
