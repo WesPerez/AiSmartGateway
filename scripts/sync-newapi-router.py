@@ -204,8 +204,26 @@ def load_router_models(master_key: str, gateway_url: str) -> str:
             data = json.loads(response.read().decode("utf-8"))
     except Exception:
         return "gpt-5.5"
-    models = sorted({str(item.get("id")) for item in data.get("data", []) if isinstance(item, dict) and item.get("id")})
+    models = sorted(
+        {str(item.get("id")) for item in data.get("data", []) if isinstance(item, dict) and item.get("id")},
+        key=model_sort_rank,
+    )
     return ",".join(models) if models else "gpt-5.5"
+
+
+def model_sort_rank(model: str) -> tuple[int, str]:
+    model_id = str(model or "").lower()
+    if model_id.startswith("gpt") or "/gpt" in model_id:
+        return (0, model_id)
+    if model_id.startswith("claude") or "/claude" in model_id:
+        return (1, model_id)
+    if model_id.startswith("gemini") or "/gemini" in model_id:
+        return (2, model_id)
+    if model_id.startswith("deepseek") or "/deepseek" in model_id:
+        return (3, model_id)
+    if model_id.startswith("glm") or "/glm" in model_id:
+        return (4, model_id)
+    return (9, model_id)
 
 
 def load_json_option(con: sqlite3.Connection, key: str) -> dict[str, Any]:
@@ -287,7 +305,7 @@ def disabled_models(con: sqlite3.Connection) -> set[str]:
 
 def filter_models_csv(models_csv: str, disabled: set[str]) -> str:
     models = [item.strip() for item in models_csv.split(",") if item.strip() and item.strip() not in disabled]
-    return ",".join(sorted(dict.fromkeys(models)))
+    return ",".join(sorted(dict.fromkeys(models), key=model_sort_rank))
 
 
 def channel_id_from_provider_id(provider_id: str | None) -> int | None:

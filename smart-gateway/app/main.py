@@ -608,7 +608,7 @@ def provider_runtime_summary() -> dict[str, dict[str, Any]]:
 def build_models_summary() -> list[dict[str, Any]]:
     models = []
     all_models = set((HEALTH.get("chat") or {}).keys()) | set((HEALTH.get("responses") or {}).keys())
-    for model in sorted(all_models):
+    for model in sorted(all_models, key=model_sort_rank):
         chat_items = (HEALTH.get("chat", {}).get(model) or {}).values()
         response_items = (HEALTH.get("responses", {}).get(model) or {}).values()
         chat_ok = sum(1 for item in chat_items if item.get("healthy"))
@@ -616,6 +616,21 @@ def build_models_summary() -> list[dict[str, Any]]:
         if chat_ok >= MIN_HEALTHY_PROVIDERS or responses_ok >= MIN_HEALTHY_PROVIDERS:
             models.append({"id": model, "chat_ok": chat_ok, "responses_ok": responses_ok})
     return models
+
+
+def model_sort_rank(model: str) -> tuple[int, str]:
+    model_id = str(model or "").lower()
+    if model_id.startswith("gpt") or "/gpt" in model_id:
+        return (0, model_id)
+    if model_id.startswith("claude") or "/claude" in model_id:
+        return (1, model_id)
+    if model_id.startswith("gemini") or "/gemini" in model_id:
+        return (2, model_id)
+    if model_id.startswith("deepseek") or "/deepseek" in model_id:
+        return (3, model_id)
+    if model_id.startswith("glm") or "/glm" in model_id:
+        return (4, model_id)
+    return (9, model_id)
 
 
 def public_base_url(request: Request) -> str:
@@ -1288,7 +1303,7 @@ async def list_models(authorization: str | None = Header(default=None)):
     async with STATE_LOCK:
         models = []
         all_models = set((HEALTH.get("chat") or {}).keys()) | set((HEALTH.get("responses") or {}).keys())
-        for model in sorted(all_models):
+        for model in sorted(all_models, key=model_sort_rank):
             chat_ok = sum(1 for item in (HEALTH.get("chat", {}).get(model) or {}).values() if item.get("healthy"))
             resp_ok = sum(1 for item in (HEALTH.get("responses", {}).get(model) or {}).values() if item.get("healthy"))
             if chat_ok >= MIN_HEALTHY_PROVIDERS or resp_ok >= MIN_HEALTHY_PROVIDERS:

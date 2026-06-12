@@ -994,6 +994,16 @@ ADMIN_HTML = """
       return '<span class="pill bad">不可用</span>';
     }
 
+    function modelSortRank(modelId) {
+      const id = String(modelId || "").toLowerCase();
+      if (id.startsWith("gpt") || id.includes("/gpt")) return 0;
+      if (id.startsWith("claude") || id.includes("/claude")) return 1;
+      if (id.startsWith("gemini") || id.includes("/gemini")) return 2;
+      if (id.startsWith("deepseek") || id.includes("/deepseek")) return 3;
+      if (id.startsWith("glm") || id.includes("/glm")) return 4;
+      return 9;
+    }
+
     function providerHealthyModels(providerId) {
       const byModel = new Map();
       for (const kind of ["chat", "responses"]) {
@@ -1147,6 +1157,7 @@ ADMIN_HTML = """
 
     function renderModels(data) {
       const ordered = [...data.models].sort((a, b) =>
+        modelSortRank(a.id) - modelSortRank(b.id) ||
         (b.chat_ok + b.responses_ok) - (a.chat_ok + a.responses_ok) ||
         compareText(a.id, b.id)
       );
