@@ -408,7 +408,7 @@ ADMIN_HTML = """
                 <th>模型</th>
                 <th>Chat 健康数</th>
                 <th>Responses 健康数</th>
-                <th>可用上游</th>
+                <th>上游摘要</th>
                 <th>状态</th>
               </tr>
             </thead>
@@ -644,6 +644,27 @@ ADMIN_HTML = """
       );
     }
 
+    function modelProviderSummary(model) {
+      const upstreams = healthyModelProviders(model);
+      if (!upstreams.length) return '<span class="muted">无健康上游</span>';
+      const providers = new Set(upstreams.map((item) => item.provider));
+      const routeCounts = {};
+      for (const item of upstreams) {
+        const label = routeLabel(item.route_group) || item.route_group || "未分组";
+        routeCounts[label] = (routeCounts[label] || 0) + 1;
+      }
+      const fastest = upstreams
+        .filter((item) => item.latency_ms != null)
+        .sort((a, b) => Number(a.latency_ms) - Number(b.latency_ms))[0];
+      const parts = Object.entries(routeCounts).map(([name, count]) => `${name} ${count}`);
+      return `
+        <div class="stack">
+          <span>${providers.size} 个上游 / ${upstreams.length} 条健康通道</span>
+          <span class="muted">${parts.join("，")}${fastest ? ` / 最快 ${escapeHtml(fastest.provider)} ${fastest.latency_ms} ms` : ""}</span>
+        </div>
+      `;
+    }
+
     function providerHealthyModels(providerId) {
       const models = new Set();
       for (const kind of ["chat", "responses"]) {
@@ -709,21 +730,12 @@ ADMIN_HTML = """
       );
       const page = paginate("models", ordered);
       $("modelsBody").innerHTML = page.items.map((m) => {
-        const upstreams = healthyModelProviders(m.id);
         return `
         <tr>
           <td class="mono">${m.id}</td>
           <td>${m.chat_ok}</td>
           <td>${m.responses_ok}</td>
-          <td>
-            <div class="stack">
-              ${upstreams.length ? upstreams.map((u) => `
-                <div>
-                  ${escapeHtml(u.provider)} <span class="muted">${u.kind} / ${routeLabel(u.route_group)} / ${costLabel(u.cost_tier)} / P${u.priority} W${u.weight}${u.latency_ms == null ? "" : " / " + u.latency_ms + " ms"}</span>
-                </div>
-              `).join("") : '<span class="muted">无健康上游</span>'}
-            </div>
-          </td>
+          <td>${modelProviderSummary(m.id)}</td>
           <td>${statusPill(m.chat_ok > 0 || m.responses_ok > 0, m.chat_ok === 0 || m.responses_ok === 0)}</td>
         </tr>
       `;
