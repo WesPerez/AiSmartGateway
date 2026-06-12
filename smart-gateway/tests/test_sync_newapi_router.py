@@ -162,3 +162,54 @@ def test_auto_adopt_default_channels_tags_only_enabled_plain_channels(tmp_path):
     assert rows["new-upstream"] == "gateway-source,gw:opportunistic,gw:unknown"
     assert rows["disabled-upstream"] == ""
     assert rows["tagged-upstream"] == "custom"
+
+
+def test_sync_source_channel_models_prunes_only_channels_seen_in_health(tmp_path):
+    sync = load_sync_module()
+    con = make_db(tmp_path / "one-api.db")
+    con.execute(
+        """
+        insert into channels (id, name, status, base_url, models, tag, "group", priority, weight, key)
+        values
+          (1, 'seen-upstream', 1, 'https://seen.example', 'old-model,healthy-model', 'gateway-source', 'default', 10, 100, 'sk-seen'),
+          (2, 'new-upstream', 1, 'https://new.example', 'declared-model', 'gateway-source', 'default', 10, 100, 'sk-new'),
+          (3, 'disabled-upstream', 0, 'https://disabled.example', 'stale-model', 'gateway-source', 'default', 10, 100, 'sk-disabled')
+        """
+    )
+    rows = con.execute("select * from channels order by id").fetchall()
+
+    health_path = tmp_path / "health_state.json"
+    health_path.write_text(
+        json.dumps(
+            {
+                "health": {
+                    "chat": {
+                        "healthy-model": {
+                            "newapi_ch1_seen-upstream::healthy-model": {
+                                "provider_id": "newapi_ch1_seen-upstream",
+                                "local_model": "healthy-model",
+                                "healthy": True,
+                            }
+                        },
+                        "old-model": {
+                            "newapi_ch1_seen-upstream::old-model": {
+                                "provider_id": "newapi_ch1_seen-upstream",
+                                "local_model": "old-model",
+                                "healthy": False,
+                            }
+                        },
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    healthy_by_channel, seen_channel_ids = sync.load_healthy_models_by_channel(health_path)
+    changed = sync.sync_source_channel_models(con, rows, healthy_by_channel, seen_channel_ids)
+    updated = dict(con.execute("select id, models from channels order by id").fetchall())
+
+    assert changed == 2
+    assert updated[1] == "healthy-model"
+    assert updated[2] == "declared-model"
+    assert updated[3] == ""

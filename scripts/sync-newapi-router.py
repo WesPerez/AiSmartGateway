@@ -19,6 +19,7 @@ import yaml
 DEFAULT_DB = os.getenv("NEWAPI_DB", "/newapi-data/one-api.db")
 DEFAULT_PROVIDERS = os.getenv("GATEWAY_PROVIDERS_FILE", "config/providers.yaml")
 DEFAULT_ENV = os.getenv("GATEWAY_ENV_FILE", ".env")
+DEFAULT_HEALTH_STATE = os.getenv("GATEWAY_HEALTH_STATE_FILE", "data/health_state.json")
 DEFAULT_GATEWAY_URL = "http://127.0.0.1:18000"
 SOURCE_GROUP = "gateway-source"
 SOURCE_TAG = "gateway-source"
@@ -289,6 +290,68 @@ def filter_models_csv(models_csv: str, disabled: set[str]) -> str:
     return ",".join(sorted(dict.fromkeys(models)))
 
 
+def channel_id_from_provider_id(provider_id: str | None) -> int | None:
+    match = re.match(r"^newapi_ch(\d+)_", provider_id or "")
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def load_healthy_models_by_channel(path: Path) -> tuple[dict[int, set[str]], set[int]]:
+    if not path.exists():
+        return {}, set()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}, set()
+    health = data.get("health") if isinstance(data, dict) else {}
+    if not isinstance(health, dict):
+        return {}, set()
+
+    healthy: dict[int, set[str]] = {}
+    seen: set[int] = set()
+    for kind in ("chat", "responses"):
+        model_groups = health.get(kind) or {}
+        if not isinstance(model_groups, dict):
+            continue
+        for local_model, items in model_groups.items():
+            if not isinstance(items, dict):
+                continue
+            for item in items.values():
+                if not isinstance(item, dict):
+                    continue
+                channel_id = channel_id_from_provider_id(str(item.get("provider_id") or ""))
+                if channel_id is None:
+                    continue
+                seen.add(channel_id)
+                model_name = str(item.get("local_model") or local_model or "").strip()
+                if item.get("healthy") and model_name:
+                    healthy.setdefault(channel_id, set()).add(model_name)
+    return healthy, seen
+
+
+def sync_source_channel_models(
+    con: sqlite3.Connection,
+    source_rows: list[sqlite3.Row],
+    healthy_by_channel: dict[int, set[str]],
+    seen_channel_ids: set[int],
+) -> int:
+    changed = 0
+    for row in source_rows:
+        channel_id = int(row["id"])
+        if int(row["status"] or 0) != 1:
+            next_models = ""
+        elif channel_id in seen_channel_ids:
+            next_models = ",".join(sorted(healthy_by_channel.get(channel_id, set())))
+        else:
+            continue
+        if (row["models"] or "") == next_models:
+            continue
+        con.execute("update channels set models = ? where id = ?", (next_models, channel_id))
+        changed += 1
+    return changed
+
+
 def sync_router_abilities(
     con: sqlite3.Connection,
     router_id: int,
@@ -412,6 +475,7 @@ def sync(args: argparse.Namespace) -> None:
     env_path = resolve_path(args.env, ["/workspace/.env"])
     env = load_env(env_path)
     db_path = resolve_newapi_db(args.db, env)
+    health_state_path = resolve_path(getattr(args, "health_state", DEFAULT_HEALTH_STATE), ["/data/health_state.json"])
     master_key = env.get("MASTER_API_KEY", "")
     admin_token = env.get("ADMIN_TOKEN", "")
     gateway_url = args.gateway_url.rstrip("/")
@@ -477,7 +541,16 @@ def sync(args: argparse.Namespace) -> None:
                 (f"%,{SOURCE_TAG},%", SOURCE_GROUP, ROUTER_BASE_URL, ROUTER_NAME),
             ).fetchall()
 
+        healthy_by_channel, seen_channel_ids = load_healthy_models_by_channel(health_state_path)
+        source_models_changed = sync_source_channel_models(con, source_rows, healthy_by_channel, seen_channel_ids)
+
         providers = [provider_from_channel(row) for row in source_rows]
+        for row, provider in zip(source_rows, providers):
+            channel_id = int(row["id"])
+            if int(row["status"] or 0) != 1:
+                provider["declared_models"] = []
+            elif channel_id in seen_channel_ids:
+                provider["declared_models"] = sorted(healthy_by_channel.get(channel_id, set()))
         source_channel_ids = [int(row["id"]) for row in source_rows]
         if not providers:
             raise SystemExit(f"No New API channels found in group {SOURCE_GROUP!r}")
@@ -537,6 +610,7 @@ def sync(args: argparse.Namespace) -> None:
     print(f"provider config changed: {providers_changed}")
     print(f"model ratios added: {model_ratio_added}")
     print(f"model ratios removed from active set: {model_ratio_removed}")
+    print(f"source channel models pruned: {source_models_changed}")
     print(f"router abilities synced: {abilities_synced}")
     print(f"model rows added: {model_rows_added}")
     print(f"router groups: {','.join(router_groups)}")
@@ -550,6 +624,7 @@ def main() -> None:
     parser.add_argument("--db", default=DEFAULT_DB)
     parser.add_argument("--providers", default=DEFAULT_PROVIDERS)
     parser.add_argument("--env", default=DEFAULT_ENV)
+    parser.add_argument("--health-state", default=DEFAULT_HEALTH_STATE)
     parser.add_argument("--gateway-url", default=os.getenv("SMART_GATEWAY_INTERNAL_URL", DEFAULT_GATEWAY_URL))
     parser.add_argument("--router-groups", default="", help="comma-separated New API groups served by Smart Gateway Router")
     parser.add_argument("--bootstrap", action="store_true", help="move current default direct channels to gateway-source first")
