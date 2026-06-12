@@ -847,6 +847,7 @@ async def probe_all(force: bool = False) -> None:
     new_health: dict[str, dict[str, dict[str, Any]]] = {"chat": {}, "responses": {}}
     probes_run = 0
     probe_limit = max(1, PROBE_MAX_PER_CYCLE)
+    candidates: list[dict[str, Any]] = []
     for provider in PROVIDERS:
         fetched = [] if provider.get("models_from_declared_only") else await get_models_for_provider(provider, force=force)
         signature = provider_signature(provider)
@@ -884,48 +885,82 @@ async def probe_all(force: bool = False) -> None:
                     previous = None
                 previous_signature = previous.get("provider_signature") if previous else None
                 due = force or not previous or previous_signature != signature or float(previous.get("next_probe_at") or 0) <= now()
-                if due and probes_run < probe_limit:
-                    result = await probe_one(provider, local_model, actual_model, kind)
-                    probes_run += 1
-                    item.update(
-                        {
-                            "healthy": bool(result.get("healthy")),
-                            "reason": result.get("reason"),
-                            "status_code": result.get("status_code"),
-                            "latency_ms": result.get("latency_ms"),
-                            "checked_at": int(now()),
-                            "next_probe_at": int(now()) + probe_cooldown_seconds(result.get("reason"), bool(result.get("healthy"))),
-                            "sample": result.get("sample", ""),
-                            "skipped": False,
-                            "skip_reason": "",
-                        }
-                    )
-                else:
-                    if previous is None:
-                        item.update(
-                            {
-                                "healthy": False,
-                                "reason": "probe_budget_exhausted" if due else "pending_probe",
-                                "status_code": None,
-                                "latency_ms": None,
-                                "checked_at": None,
-                                "next_probe_at": int(now()) + PROBE_INTERVAL_SECONDS,
-                                "sample": "",
-                                "skipped": True,
-                                "skip_reason": "probe_budget",
-                            }
-                        )
-                    else:
-                        item = preserve_probe_state(item, previous)
-                by_model = new_health.setdefault(kind, {}).setdefault(local_model, {})
-                current = by_model.get(matrix_key)
-                if current is None:
-                    by_model[matrix_key] = item
-                elif item.get("healthy") and not current.get("healthy"):
-                    by_model[matrix_key] = item
-                elif item.get("healthy") == current.get("healthy"):
-                    if (item.get("latency_ms") or 999999) < (current.get("latency_ms") or 999999):
-                        by_model[matrix_key] = item
+                candidates.append(
+                    {
+                        "provider": provider,
+                        "item": item,
+                        "kind": kind,
+                        "local_model": local_model,
+                        "actual_model": actual_model,
+                        "matrix_key": matrix_key,
+                        "previous": previous,
+                        "due": due,
+                    }
+                )
+
+    candidates.sort(
+        key=lambda candidate: (
+            0 if candidate["previous"] is None or not candidate["previous"].get("checked_at") else 1,
+            0 if candidate["due"] else 1,
+            -int(candidate["item"].get("priority", 0)),
+            -int(candidate["item"].get("weight", 0)),
+            candidate["item"].get("provider_name") or "",
+            candidate["local_model"],
+            candidate["kind"],
+        )
+    )
+
+    for candidate in candidates:
+        provider = candidate["provider"]
+        item = candidate["item"]
+        kind = candidate["kind"]
+        local_model = candidate["local_model"]
+        actual_model = candidate["actual_model"]
+        matrix_key = candidate["matrix_key"]
+        previous = candidate["previous"]
+        due = candidate["due"]
+        if due and probes_run < probe_limit:
+            result = await probe_one(provider, local_model, actual_model, kind)
+            probes_run += 1
+            item.update(
+                {
+                    "healthy": bool(result.get("healthy")),
+                    "reason": result.get("reason"),
+                    "status_code": result.get("status_code"),
+                    "latency_ms": result.get("latency_ms"),
+                    "checked_at": int(now()),
+                    "next_probe_at": int(now()) + probe_cooldown_seconds(result.get("reason"), bool(result.get("healthy"))),
+                    "sample": result.get("sample", ""),
+                    "skipped": False,
+                    "skip_reason": "",
+                }
+            )
+        else:
+            if previous is None:
+                item.update(
+                    {
+                        "healthy": False,
+                        "reason": "probe_budget_exhausted" if due else "pending_probe",
+                        "status_code": None,
+                        "latency_ms": None,
+                        "checked_at": None,
+                        "next_probe_at": int(now()) + PROBE_INTERVAL_SECONDS,
+                        "sample": "",
+                        "skipped": True,
+                        "skip_reason": "probe_budget",
+                    }
+                )
+            else:
+                item = preserve_probe_state(item, previous)
+        by_model = new_health.setdefault(kind, {}).setdefault(local_model, {})
+        current = by_model.get(matrix_key)
+        if current is None:
+            by_model[matrix_key] = item
+        elif item.get("healthy") and not current.get("healthy"):
+            by_model[matrix_key] = item
+        elif item.get("healthy") == current.get("healthy"):
+            if (item.get("latency_ms") or 999999) < (current.get("latency_ms") or 999999):
+                by_model[matrix_key] = item
     async with STATE_LOCK:
         HEALTH.clear()
         HEALTH.update(new_health)
@@ -1100,6 +1135,7 @@ async def admin_save_source_policy(
                 str(SYNC_NEWAPI_SCRIPT),
                 "--router-groups",
                 os.getenv("NEW_API_ROUTER_GROUPS", "default,vip"),
+                "--auto-adopt-default-channels",
                 "--force-reload",
                 "--no-backup",
             ],
@@ -1190,6 +1226,7 @@ async def admin_sync_newapi(
             str(SYNC_NEWAPI_SCRIPT),
             "--router-groups",
             os.getenv("NEW_API_ROUTER_GROUPS", "default,vip"),
+            "--auto-adopt-default-channels",
             "--force-reload",
             "--no-backup",
         ],

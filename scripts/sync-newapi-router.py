@@ -424,6 +424,20 @@ def sync(args: argparse.Namespace) -> None:
     con = sqlite3.connect(db_path)
     con.row_factory = sqlite3.Row
     try:
+        if args.auto_adopt_default_channels:
+            con.execute(
+                """
+                update channels
+                set tag = ?, "group" = ?, priority = case when coalesce(priority, 0) <= 0 then 50 else priority end,
+                    weight = case when coalesce(weight, 0) <= 0 then 100 else weight end
+                where coalesce(name, '') != ?
+                  and coalesce(base_url, '') != ?
+                  and "group" = ?
+                  and coalesce(status, 1) = 1
+                  and coalesce(tag, '') = ''
+                """,
+                ("gateway-source,gw:opportunistic,gw:unknown", DEFAULT_GROUP, ROUTER_NAME, ROUTER_BASE_URL, DEFAULT_GROUP),
+            )
         source_rows = con.execute(
             """
             select * from channels
@@ -539,6 +553,7 @@ def main() -> None:
     parser.add_argument("--gateway-url", default=os.getenv("SMART_GATEWAY_INTERNAL_URL", DEFAULT_GATEWAY_URL))
     parser.add_argument("--router-groups", default="", help="comma-separated New API groups served by Smart Gateway Router")
     parser.add_argument("--bootstrap", action="store_true", help="move current default direct channels to gateway-source first")
+    parser.add_argument("--auto-adopt-default-channels", action="store_true", help="tag enabled default New API channels without tags as gateway-source")
     parser.add_argument("--no-backup", action="store_true", help="skip backup files; useful for frequent automatic sync")
     parser.add_argument("--force-reload", action="store_true", help="reload Smart Gateway even when provider config is unchanged")
     args = parser.parse_args()

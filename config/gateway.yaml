@@ -42,6 +42,7 @@ model_include:
   - claude-*
   - doubao-*
   - glm-*
+  - mimo-*
 
 model_exclude:
   - "*embedding*"
