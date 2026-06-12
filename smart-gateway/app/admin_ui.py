@@ -389,6 +389,7 @@ ADMIN_HTML = """
                 <th>探测路径</th>
                 <th>状态</th>
                 <th>延迟</th>
+                <th>最近检测</th>
                 <th>下次探测</th>
                 <th>原因</th>
               </tr>
@@ -478,6 +479,10 @@ ADMIN_HTML = """
       return `<span class="pill ${cls}">${text}</span>`;
     }
 
+    function formatTs(ts, empty = "") {
+      return ts ? new Date(ts * 1000).toLocaleString() : empty;
+    }
+
     function routeLabel(value) {
       return ({
         primary: "主力",
@@ -512,7 +517,7 @@ ADMIN_HTML = """
       $("sourceTag").value = data.source_tag || "gateway-source";
       $("routerGroups").value = data.router_groups || "default,vip";
       $("adminUrl").value = data.admin_url;
-      setNotice(`最后探测: ${data.last_probe_at ? new Date(data.last_probe_at * 1000).toLocaleString() : "未完成"}`);
+      setNotice(`最后探测: ${formatTs(data.last_probe_at, "未完成")}`);
     }
 
     function renderModels(data) {
@@ -543,7 +548,8 @@ ADMIN_HTML = """
                 <td class="mono">${item.probe_path || ""}</td>
                 <td>${statusPill(!!item.healthy)}</td>
                 <td>${item.latency_ms == null ? "" : item.latency_ms + " ms"}</td>
-                <td>${item.next_probe_at ? new Date(item.next_probe_at * 1000).toLocaleString() : ""}</td>
+                <td>${formatTs(item.checked_at, "未检测")}</td>
+                <td>${formatTs(item.next_probe_at)}</td>
                 <td class="mono">${item.reason || item.skip_reason || ""}</td>
               </tr>
             `);
@@ -559,7 +565,7 @@ ADMIN_HTML = """
         const tokens = usage.total_tokens == null ? "" : usage.total_tokens;
         return `
           <tr>
-            <td>${row.ts ? new Date(row.ts * 1000).toLocaleString() : ""}</td>
+            <td>${formatTs(row.ts)}</td>
             <td class="mono">${row.request_id || ""}</td>
             <td class="mono">${row.kind || ""}${row.stream ? " stream" : ""}</td>
             <td class="mono">${row.requested_model || ""}</td>
