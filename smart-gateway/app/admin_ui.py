@@ -667,7 +667,7 @@ ADMIN_HTML = """
                 <th>延迟</th>
                 <th>最近检测</th>
                 <th>下次探测</th>
-                <th>实际模型/原因</th>
+                <th>详情</th>
               </tr>
             </thead>
             <tbody id="upstreamsBody"></tbody>
@@ -1266,12 +1266,20 @@ ADMIN_HTML = """
       return `<span class="chip ${cls}">${kind} ${text}${data.latency_ms == null ? "" : " " + data.latency_ms + "ms"}</span>`;
     }
 
+    function upstreamDetail(row) {
+      const reasons = Array.from(row.reasons).filter((reason) => reason && reason !== "ok").slice(0, 3);
+      if (row.healthy_count <= 0 && reasons.length) return reasons.join(", ");
+      const mapped = Array.from(row.actual_models).filter((actual) => actual && actual !== row.model).sort();
+      if (mapped.length) return `映射 ${mapped.join(", ")}`;
+      if (row.healthy_count > 0 && row.healthy_count < row.total_count && reasons.length) return reasons.join(", ");
+      return "";
+    }
+
     function renderUpstreams() {
       const rows = buildUpstreamRows();
       const page = paginate("upstreams", rows);
       $("upstreamsBody").innerHTML = page.items.map((row) => {
-        const actual = Array.from(row.actual_models).sort().join(", ");
-        const reasons = Array.from(row.reasons).slice(0, 3).join(", ");
+        const detail = upstreamDetail(row);
         const latency = row.best_healthy_latency ?? row.best_failed_latency;
         return `
           <tr>
@@ -1289,7 +1297,7 @@ ADMIN_HTML = """
             <td>${latency == null ? "" : latency + " ms"}</td>
             <td>${formatTs(row.checked_at, "未检测")}</td>
             <td>${formatTs(row.next_probe_at)}</td>
-            <td class="mono">${escapeHtml(actual || reasons)}</td>
+            <td class="mono">${escapeHtml(detail)}</td>
           </tr>
         `;
       }).join("");
