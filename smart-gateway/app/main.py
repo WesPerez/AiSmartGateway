@@ -830,7 +830,19 @@ PASSTHROUGH_REQUEST_HEADERS = {
 }
 
 
-def provider_headers(provider: dict[str, Any], incoming_headers: dict[str, str] | None = None, kind: str | None = None) -> dict[str, str]:
+def set_header(headers: dict[str, str], key: str, value: str) -> None:
+    for existing in list(headers.keys()):
+        if existing.lower() == key.lower():
+            headers.pop(existing, None)
+    headers[key] = value
+
+
+def provider_headers(
+    provider: dict[str, Any],
+    incoming_headers: dict[str, str] | None = None,
+    kind: str | None = None,
+    extra_headers: dict[str, str] | None = None,
+) -> dict[str, str]:
     headers = {
         "Authorization": f"Bearer {provider['api_key']}",
         "Content-Type": "application/json",
@@ -838,11 +850,15 @@ def provider_headers(provider: dict[str, Any], incoming_headers: dict[str, str] 
     }
     for key, value in (incoming_headers or {}).items():
         if key.lower() in PASSTHROUGH_REQUEST_HEADERS and value:
-            headers[key] = value
+            set_header(headers, key, value)
     if kind == "responses" and not any(key.lower() == "openai-beta" for key in headers):
-        headers["OpenAI-Beta"] = "responses=v1"
-    headers.update({str(k): str(v) for k, v in (provider.get("headers") or {}).items()})
-    headers["Authorization"] = f"Bearer {provider['api_key']}"
+        set_header(headers, "OpenAI-Beta", "responses=v1")
+    for key, value in (extra_headers or {}).items():
+        if value:
+            set_header(headers, str(key), str(value))
+    for key, value in (provider.get("headers") or {}).items():
+        set_header(headers, str(key), str(value))
+    set_header(headers, "Authorization", f"Bearer {provider['api_key']}")
     return headers
 
 
@@ -967,6 +983,29 @@ def codex_shape_diagnostic_headers() -> dict[str, str]:
         "x-client-request-id": "gateway-diagnostic",
         "session-id": "gateway-diagnostic",
         "thread-id": "gateway-diagnostic",
+    }
+
+
+def codex_compat_adapter_headers(request_id: str, stream: bool) -> dict[str, str]:
+    metadata = {
+        "session_id": request_id,
+        "thread_id": request_id,
+        "thread_source": "gateway-chat-adapter",
+        "turn_id": request_id,
+        "sandbox": "seccomp",
+        "request_kind": "turn",
+        "window_id": f"gateway-chat-adapter:{request_id[-8:]}",
+    }
+    return {
+        "Accept": "text/event-stream" if stream else "application/json",
+        "originator": "codex_exec",
+        "user-agent": "codex_exec/0.139.0 (gateway-chat-adapter)",
+        "x-codex-beta-features": "terminal_resize_reflow",
+        "x-codex-turn-metadata": json.dumps(metadata, ensure_ascii=False, separators=(",", ":")),
+        "x-codex-window-id": metadata["window_id"],
+        "x-client-request-id": request_id,
+        "session-id": request_id,
+        "thread-id": request_id,
     }
 
 
@@ -1233,6 +1272,37 @@ def chat_body_to_responses_body(body: dict[str, Any], chosen: dict[str, Any]) ->
     return req_body
 
 
+def chat_body_to_codex_compat_responses_body(body: dict[str, Any], chosen: dict[str, Any]) -> dict[str, Any]:
+    converted = responses_input_from_chat_messages(body.get("messages"))
+    if converted is None:
+        raise ValueError("chat body cannot be safely adapted to codex-compatible responses")
+    instructions, input_value = converted
+    effort = "low"
+    reasoning = body.get("reasoning")
+    if isinstance(reasoning, dict) and reasoning.get("effort"):
+        effort = str(reasoning["effort"])
+    elif body.get("reasoning_effort"):
+        effort = str(body["reasoning_effort"])
+    req_body = codex_shape_diagnostic_body(chosen["actual_model"], effort=effort)
+    for key in ("tools", "tool_choice", "parallel_tool_calls"):
+        req_body.pop(key, None)
+    req_body["instructions"] = instructions
+    req_body["input"] = input_value
+    req_body["store"] = False
+    req_body["stream"] = bool(body.get("stream", False))
+    req_body["prompt_cache_key"] = f"gateway-chat-adapter-{chosen['actual_model']}"
+    req_body["client_metadata"] = {
+        "x-codex-window-id": f"gateway-chat-adapter:{chosen['actual_model']}",
+        "x-codex-installation-id": "gateway-chat-adapter",
+    }
+    if "max_tokens" in body:
+        req_body["max_output_tokens"] = body.get("max_tokens")
+    for key in ("temperature", "top_p", "stop", "user", "metadata"):
+        if key in body:
+            req_body[key] = body[key]
+    return req_body
+
+
 def prepare_upstream_body(body: dict[str, Any], chosen: dict[str, Any], client_kind: str) -> dict[str, Any]:
     upstream_kind = chosen.get("_upstream_kind") or client_kind
     if upstream_kind == client_kind:
@@ -1242,8 +1312,22 @@ def prepare_upstream_body(body: dict[str, Any], chosen: dict[str, Any], client_k
     if client_kind == "responses" and upstream_kind == "chat":
         return responses_body_to_chat_body(body, chosen)
     if client_kind == "chat" and upstream_kind == "responses":
+        if chosen.get("_codex_compat_adapter"):
+            return normalize_responses_upstream_body(chat_body_to_codex_compat_responses_body(body, chosen), chosen)
         return normalize_responses_upstream_body(chat_body_to_responses_body(body, chosen), chosen)
     raise ValueError(f"unsupported format adapter: {upstream_kind} -> {client_kind}")
+
+
+def upstream_request_headers(
+    provider: dict[str, Any],
+    incoming_headers: dict[str, str] | None,
+    upstream_kind: str,
+    chosen: dict[str, Any],
+    request_id: str,
+    stream: bool,
+) -> dict[str, str]:
+    extra_headers = codex_compat_adapter_headers(request_id, stream) if chosen.get("_codex_compat_adapter") else None
+    return provider_headers(provider, incoming_headers, upstream_kind, extra_headers)
 
 
 def extract_chat_response_text(data: Any) -> str:
@@ -2366,6 +2450,9 @@ def annotate_route_item(item: dict[str, Any], client_kind: str, upstream_kind: s
     item["_client_kind"] = client_kind
     item["_upstream_kind"] = upstream_kind
     item["_format_adapter"] = adapter_name(client_kind, upstream_kind)
+    if codex_compat_adapter_candidate(item, client_kind, upstream_kind):
+        item["_format_adapter"] = "codex_responses_to_chat"
+        item["_codex_compat_adapter"] = True
     if client_kind != upstream_kind:
         item["_adapter_latency_penalty_ms"] = ADAPTER_LATENCY_PENALTY_MS
     else:
@@ -2373,15 +2460,14 @@ def annotate_route_item(item: dict[str, Any], client_kind: str, upstream_kind: s
     return item
 
 
-def route_item_format_adapter_allowed(item: dict[str, Any], client_kind: str, upstream_kind: str) -> bool:
-    if client_kind == upstream_kind:
+def codex_compat_adapter_candidate(item: dict[str, Any], client_kind: str, upstream_kind: str) -> bool:
+    if client_kind != "chat" or upstream_kind != "responses":
+        return False
+    if str(item.get("responses_compat_mode") or "") == "codex":
         return True
-    if client_kind == "chat" and upstream_kind == "responses":
-        shape_status = str(item.get("shape_status") or "")
-        shape_source = str(item.get("shape_verification_source") or "")
-        if shape_status == "codex_shape_verified" or shape_source == "diagnostic_codex_shape":
-            return False
-    return True
+    shape_status = str(item.get("shape_status") or "")
+    shape_source = str(item.get("shape_verification_source") or "")
+    return shape_status == "codex_shape_verified" or shape_source in {"diagnostic_codex_shape", "runtime_codex_compat_adapter"}
 
 
 def adaptive_candidate_buckets(
@@ -2400,7 +2486,6 @@ def adaptive_candidate_buckets(
             target.extend(
                 annotate_route_item(item, client_kind, upstream_kind)
                 for item in bucket["items"]
-                if route_item_format_adapter_allowed(item, client_kind, upstream_kind)
             )
     buckets = []
     for name in ROUTE_BUCKET_ORDER:
@@ -2515,7 +2600,13 @@ async def mark_responses_shape_invalid_attempt(
             await save_state()
 
 
-async def mark_runtime_success(kind: str, model: str, provider_id: str, latency_ms: int) -> None:
+async def mark_runtime_success(
+    kind: str,
+    model: str,
+    provider_id: str,
+    latency_ms: int,
+    codex_compat: bool = False,
+) -> None:
     async with STATE_LOCK:
         matched = [
             item
@@ -2533,12 +2624,18 @@ async def mark_runtime_success(kind: str, model: str, provider_id: str, latency_
             item["skip_reason"] = ""
             item["skipped"] = False
             if kind == "responses":
-                item.pop("shape_status", None)
+                if codex_compat:
+                    item["shape_status"] = "codex_shape_verified"
+                    item["shape_verification_source"] = "runtime_codex_compat_adapter"
+                    item["responses_compat_mode"] = "codex"
+                else:
+                    item.pop("shape_status", None)
+                    item.pop("shape_verification_source", None)
+                    item.pop("responses_compat_mode", None)
                 item.pop("shape_invalid_count", None)
                 item.pop("shape_invalid_required", None)
                 item.pop("shape_fingerprint", None)
                 item.pop("shape_invalid_last_at", None)
-                item.pop("shape_verification_source", None)
         if matched:
             await save_state()
 
@@ -2625,11 +2722,13 @@ async def relay_non_stream(
                 endpoint_url = ""
                 for candidate_url in upstream_urls(provider, upstream_path):
                     endpoint_url = candidate_url
-                    response = await client.post(candidate_url, headers=provider_headers(provider, incoming_headers, upstream_kind), json=req_body)
+                    headers = upstream_request_headers(provider, incoming_headers, upstream_kind, chosen, request_id, bool(req_body.get("stream", False)))
+                    response = await client.post(candidate_url, headers=headers, json=req_body)
                     if can_retry_with_partial(upstream_kind, response.status_code, response.text[:1000], req_body):
                         learn_responses_partial_default(chosen)
                         req_body = apply_responses_provider_defaults(req_body, chosen)
-                        response = await client.post(candidate_url, headers=provider_headers(provider, incoming_headers, upstream_kind), json=req_body)
+                        headers = upstream_request_headers(provider, incoming_headers, upstream_kind, chosen, request_id, bool(req_body.get("stream", False)))
+                        response = await client.post(candidate_url, headers=headers, json=req_body)
                     if 200 <= response.status_code < 300:
                         break
                     endpoint_reasons.append(classify_error(response.status_code, response.text[:1000]))
@@ -2642,7 +2741,7 @@ async def relay_non_stream(
             except Exception:
                 data = None
             if 200 <= response.status_code < 300 and not response_has_error_json(data):
-                await mark_runtime_success(upstream_kind, model, chosen["provider_id"], latency_ms)
+                await mark_runtime_success(upstream_kind, model, chosen["provider_id"], latency_ms, bool(chosen.get("_codex_compat_adapter")))
                 client_data = convert_upstream_response_for_client(data, chosen, kind, request_id, model)
                 await append_request_log(
                     {
@@ -2811,7 +2910,8 @@ async def relay_stream(
                 for endpoint_url in upstream_urls(provider, upstream_path):
                     partial_retry_used = False
                     while True:
-                        async with client.stream("POST", endpoint_url, headers=provider_headers(provider, incoming_headers, upstream_kind), json=req_body) as response:
+                        headers = upstream_request_headers(provider, incoming_headers, upstream_kind, chosen, request_id, bool(req_body.get("stream", True)))
+                        async with client.stream("POST", endpoint_url, headers=headers, json=req_body) as response:
                             if response.status_code < 200 or response.status_code >= 300:
                                 raw = await response.aread()
                                 raw_text = raw.decode("utf-8", "ignore")
@@ -2874,7 +2974,7 @@ async def relay_stream(
                                 break
 
                             latency_ms = int((now() - start) * 1000)
-                            await mark_runtime_success(upstream_kind, model, chosen["provider_id"], latency_ms)
+                            await mark_runtime_success(upstream_kind, model, chosen["provider_id"], latency_ms, bool(chosen.get("_codex_compat_adapter")))
                             await append_request_log(
                                 {
                                     "request_id": request_id,

@@ -882,8 +882,9 @@ upstream_kind: 网关实际选择的上游接口格式
 9. 探测矩阵新增“新鲜度”列；模型可用性按上游视角的接口 chip 会显示实时、缓存或冷却。
 10. 健康策略说明新增实时新鲜窗口和跨格式路由说明。
 11. 流式跨格式转换改为按完整 SSE 事件缓冲后再转换，避免一个事件被上游拆成多个网络 chunk 时丢字。
-12. 只由 Codex diagnostic shape 证明可用的 Responses health，不再作为普通 Chat -> Responses 通用转换候选；这类证据只说明 Codex 形态可用，不能证明小 JSON/普通 Chat 转换形态可用。
-13. 通用 `partial` 兼容改为错误驱动：Responses 运行时、minimal probe、Codex diagnostic 只要明确返回缺 `partial`，同一 endpoint 在首块前自动补 `partial=stream` 重试一次，并学习 provider 默认值。
+12. 只由 Codex diagnostic shape 证明可用的 Responses health，不再使用普通小 JSON 的 Chat -> Responses 转换；改为 `codex_responses_to_chat` adapter，给安全 Chat 请求生成 Codex-compatible Responses body 和 Codex identity headers，再把 Responses 结果转回 Chat。
+13. `codex_responses_to_chat` 默认 `reasoning.effort=low`，带 `include=["reasoning.encrypted_content"]`、`prompt_cache_key`、`client_metadata`，不带工具列表；运行时成功后保留 `responses_compat_mode=codex`，避免下次又退回普通小 JSON。
+14. 通用 `partial` 兼容改为错误驱动：Responses 运行时、minimal probe、Codex diagnostic 只要明确返回缺 `partial`，同一 endpoint 在首块前自动补 `partial=stream` 重试一次，并学习 provider 默认值。
 
 ### 当前健康含义
 
@@ -903,7 +904,7 @@ upstream_kind: 网关实际选择的上游接口格式
 - Responses 客户端请求使用 Chat 上游并转回 Responses。
 - Chat 客户端请求使用 Responses 上游并转回 Chat。
 - 双向流式转换可处理拆分 SSE 事件。
-- Codex diagnostic-only Responses 健康不会进入普通 Chat -> Responses 转换候选。
+- Codex diagnostic-only Responses 健康会进入 `codex_responses_to_chat` 转换候选，不再使用会被拒绝的普通小 JSON Responses 形态。
 - 缺 `partial` 的 Responses provider 在探活、非流式运行时、流式运行时都会通用重试。
 
 真实请求回归：
@@ -911,7 +912,7 @@ upstream_kind: 网关实际选择的上游接口格式
 - Volcengine `deepseek-v4-pro`：Responses stream 原生成功；Chat 请求实际选择 Responses 上游并 `responses_to_chat` 成功。
 - Fufu `mimo-v2-flash`：Chat 原生成功，Responses 原生成功。
 - Muyuan `claude-opus-4-8`：Responses 客户端请求非流式和流式均成功降级到 Chat 上游，再转回 Responses；provider 级 `User-Agent: Claude-Code/1.0.0` 继续解决该源的客户端限制。
-- Anyrouter `gpt-5.5`：Codex-shape Responses 健康保持 `shape_status=codex_shape_verified`；强制普通 Chat -> Responses 转换会被过滤成 `no_healthy_upstream`，不会再向上游发送已知会失败的普通转换形态；普通 `gpt-5.5` Chat 自动走 native Chat fallback 成功。
+- Anyrouter `gpt-5.5`：普通 Responses 小 JSON 仍返回 `invalid codex request`；Codex-compatible Chat -> Responses 转换已通过，强制 Anyrouter 和普通自动路由均走 `chat -> responses / codex_responses_to_chat` 并成功返回，health 保留 `responses_compat_mode=codex`。
 - 管理 API 暴露健康新鲜度字段。
 
-完整验证结果：`78 passed`。
+完整验证结果：`79 passed`。

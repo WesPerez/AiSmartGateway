@@ -424,7 +424,7 @@ async def test_chat_request_can_use_responses_upstream_with_safe_adapter(gateway
     assert logs[0]["format_adapter"] == "responses_to_chat"
 
 
-def test_chat_adapter_skips_codex_shape_only_responses_health(gateway):
+def test_chat_adapter_uses_codex_compat_for_codex_shape_responses_health(gateway):
     gateway.HEALTH = {
         "chat": {},
         "responses": {
@@ -448,7 +448,81 @@ def test_chat_adapter_skips_codex_shape_only_responses_health(gateway):
         {"model": "good-model", "messages": [{"role": "user", "content": "ping"}]},
     )
 
-    assert buckets == []
+    assert buckets[0]["items"][0]["_format_adapter"] == "codex_responses_to_chat"
+    assert buckets[0]["items"][0]["_codex_compat_adapter"] is True
+
+
+@pytest.mark.asyncio()
+async def test_chat_request_uses_codex_compat_responses_shape_when_required(gateway, monkeypatch):
+    gateway.PROVIDERS = [
+        {"id": "p1", "base_url": "https://p1.example/v1", "api_key": "sk-p1", "timeout_seconds": 3, "headers": {}},
+    ]
+    gateway.HEALTH = {
+        "responses": {
+            "good-model": {
+                "p1": {
+                    "provider_id": "p1",
+                    "actual_model": "actual-responses",
+                    "healthy": True,
+                    "priority": 100,
+                    "weight": 1,
+                    "shape_status": "codex_shape_verified",
+                    "shape_verification_source": "diagnostic_codex_shape",
+                },
+            }
+        },
+        "chat": {},
+    }
+    monkeypatch.setattr(gateway, "pick_weighted", lambda candidates: candidates[0])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent = json.loads(request.content.decode())
+        assert request.headers["originator"] == "codex_exec"
+        assert "gateway-chat-adapter" in request.headers["user-agent"]
+        assert sent["model"] == "actual-responses"
+        assert sent["instructions"] == "Be brief"
+        assert sent["input"][0]["role"] == "user"
+        assert sent["reasoning"]["effort"] == "low"
+        assert sent["include"] == ["reasoning.encrypted_content"]
+        assert sent["prompt_cache_key"] == "gateway-chat-adapter-actual-responses"
+        assert "client_metadata" in sent
+        assert "tools" not in sent
+        assert "tool_choice" not in sent
+        return httpx.Response(
+            200,
+            json={
+                "id": "resp-ok",
+                "output": [
+                    {"type": "reasoning", "summary": [], "content": []},
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "pong"}],
+                    },
+                ],
+            },
+        )
+
+    with respx.mock:
+        route = respx.post("https://p1.example/v1/responses").mock(side_effect=handler)
+        response = await gateway.relay_non_stream(
+            "/chat/completions",
+            {"model": "good-model", "messages": [{"role": "system", "content": "Be brief"}, {"role": "user", "content": "ping"}]},
+            "chat",
+        )
+
+    assert response.status_code == 200
+    assert route.call_count == 1
+    payload = json.loads(response.body.decode())
+    assert payload["choices"][0]["message"]["content"] == "pong"
+    logs = gateway.read_recent_request_logs()
+    assert logs[0]["kind"] == "chat"
+    assert logs[0]["upstream_kind"] == "responses"
+    assert logs[0]["format_adapter"] == "codex_responses_to_chat"
+    item = gateway.HEALTH["responses"]["good-model"]["p1"]
+    assert item["shape_status"] == "codex_shape_verified"
+    assert item["shape_verification_source"] == "runtime_codex_compat_adapter"
+    assert item["responses_compat_mode"] == "codex"
 
 
 @pytest.mark.asyncio()

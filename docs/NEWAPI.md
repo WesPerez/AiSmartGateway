@@ -372,10 +372,15 @@ requests require native Responses compatibility. Adapted routes carry an
 There is one important safety boundary: a Responses health item verified only by
 the Codex diagnostic shape (`shape_status=codex_shape_verified` or
 `shape_verification_source=diagnostic_codex_shape`) is not treated as a generic
-Chat -> Responses adapter candidate. That evidence proves Codex-style Responses
-works, but it does not prove a small text-only Chat request converted to
-Responses will pass. The router should either use a native Chat candidate or a
-Responses candidate proven by normal/runtime requests.
+small-JSON Chat -> Responses adapter candidate. That evidence proves
+Codex-style Responses works, so the router uses a dedicated
+`codex_responses_to_chat` adapter instead. It converts safe Chat requests into a
+Codex-compatible Responses body with Codex identity headers, low reasoning
+effort, `include=["reasoning.encrypted_content"]`, `prompt_cache_key`,
+`client_metadata`, and no tool list, then converts the upstream Responses result
+back to Chat Completions. Successful runtime use persists
+`responses_compat_mode=codex` so later route decisions keep using the same
+compatible shape.
 
 Streaming adapters buffer complete SSE events before conversion, so a single
 event split across multiple upstream network chunks is not dropped. This applies
@@ -389,10 +394,10 @@ Real validation on 2026-06-13 covered:
 - Fufu `mimo-v2-flash`: native Chat and native Responses both succeeded.
 - Muyuan `claude-opus-4-8`: Responses client requests, both non-stream and
   stream, used the Chat upstream and converted back to Responses successfully.
-- Anyrouter `gpt-5.5`: Codex-shape Responses health remains valid, but forced
-  generic Chat -> Responses conversion is filtered out as `no_healthy_upstream`
-  instead of sending an invalid request to the upstream. Normal `gpt-5.5` Chat
-  routing succeeds through the native Chat fallback.
+- Anyrouter `gpt-5.5`: plain Responses small JSON still returns
+  `invalid codex request`, but Codex-compatible Chat -> Responses conversion now
+  succeeds through `codex_responses_to_chat`; normal `gpt-5.5` Chat routing
+  selects Anyrouter Responses instead of the paid Chat fallback.
 
 ## Operations UI
 
