@@ -173,6 +173,10 @@ def test_classify_error_prefers_semantic_reason(gateway):
         gateway.classify_error(400, '{"error":{"param":"input","code":"invalid_value","message":"bad image"}}')
         == "client_invalid_input"
     )
+    assert (
+        gateway.classify_error(400, '{"code":"MissingParameter","message":"missing tools.function parameter"}')
+        == "client_invalid_input"
+    )
 
 
 def test_with_channel_fields_treats_only_status_one_as_enabled(gateway):
@@ -428,6 +432,110 @@ async def test_chat_request_can_use_responses_upstream_with_safe_adapter(gateway
     assert logs[0]["format_adapter"] == "responses_to_chat"
 
 
+@pytest.mark.asyncio()
+async def test_chat_request_can_use_plain_responses_upstream_with_tools(gateway, monkeypatch):
+    gateway.PROVIDERS = [
+        {"id": "p1", "base_url": "https://p1.example/v1", "api_key": "sk-p1", "timeout_seconds": 3, "headers": {}},
+    ]
+    gateway.HEALTH = {
+        "responses": {
+            "good-model": {
+                "p1": {
+                    "provider_id": "p1",
+                    "actual_model": "actual-responses",
+                    "healthy": True,
+                    "priority": 100,
+                    "weight": 1,
+                    "latency_ms": 20,
+                },
+            }
+        },
+        "chat": {},
+    }
+    monkeypatch.setattr(gateway, "pick_weighted", lambda candidates: candidates[0])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent = json.loads(request.content.decode())
+        assert request.url.path == "/v1/responses"
+        assert "originator" not in request.headers
+        assert sent["model"] == "actual-responses"
+        assert sent["instructions"] == "Top system\n\nBe brief"
+        assert sent["input"][0]["role"] == "user"
+        assert sent["tools"] == [
+            {
+                "type": "function",
+                "name": "lookup",
+                "description": "Lookup a value",
+                "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+            }
+        ]
+        assert sent["tool_choice"] == "auto"
+        assert sent["parallel_tool_calls"] is True
+        return httpx.Response(
+            200,
+            json={
+                "id": "resp-tool",
+                "output": [
+                    {
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "lookup",
+                        "arguments": "{\"query\":\"ping\"}",
+                    },
+                ],
+            },
+        )
+
+    body = {
+        "model": "good-model",
+        "system": "Top system",
+        "messages": [{"role": "system", "content": "Be brief"}, {"role": "user", "content": "ping"}],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "description": "Lookup a value",
+                    "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+                },
+            }
+        ],
+        "tool_choice": "auto",
+        "parallel_tool_calls": True,
+    }
+
+    with respx.mock:
+        route = respx.post("https://p1.example/v1/responses").mock(side_effect=handler)
+        response = await gateway.relay_non_stream("/chat/completions", body, "chat")
+
+    assert response.status_code == 200
+    assert route.call_count == 1
+    payload = json.loads(response.body.decode())
+    message = payload["choices"][0]["message"]
+    assert message["content"] is None
+    assert message["tool_calls"] == [
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": "{\"query\":\"ping\"}"},
+        }
+    ]
+    logs = gateway.read_recent_request_logs()
+    assert logs[0]["kind"] == "chat"
+    assert logs[0]["upstream_kind"] == "responses"
+    assert logs[0]["format_adapter"] == "responses_to_chat"
+
+
+def test_plain_responses_chat_adapter_rejects_legacy_function_fields(gateway):
+    body = {
+        "model": "good-model",
+        "messages": [{"role": "user", "content": "ping"}],
+        "functions": [{"name": "lookup"}],
+    }
+
+    assert gateway.chat_body_can_use_responses_adapter(body) is False
+
+
 def test_chat_adapter_uses_codex_compat_for_codex_shape_responses_health(gateway):
     gateway.HEALTH = {
         "chat": {},
@@ -505,8 +613,8 @@ def test_codex_compat_chat_adapter_allows_tool_stream_body(gateway):
     )
 
     items = [item for bucket in buckets for item in bucket["items"]]
-    assert [item["provider_id"] for item in items] == ["codex"]
-    assert items[0]["_format_adapter"] == "codex_responses_to_chat"
+    assert [item["provider_id"] for item in items] == ["codex", "plain"]
+    assert [item["_format_adapter"] for item in items] == ["codex_responses_to_chat", "responses_to_chat"]
 
 
 def test_codex_compat_chat_adapter_allows_image_url_stream_body(gateway):
@@ -549,7 +657,8 @@ def test_codex_compat_chat_adapter_allows_image_url_stream_body(gateway):
 
     buckets = gateway.adaptive_candidate_buckets("good-model", "chat", body)
     items = [item for bucket in buckets for item in bucket["items"]]
-    assert [item["provider_id"] for item in items] == ["codex"]
+    assert [item["provider_id"] for item in items] == ["codex", "plain"]
+    assert [item["_format_adapter"] for item in items] == ["codex_responses_to_chat", "responses_to_chat"]
 
     converted = gateway.chat_body_to_codex_compat_responses_body(
         body,

@@ -1072,6 +1072,8 @@ def classify_error(status_code: int, text: str) -> str:
         return "model_unsupported"
     if status_code == 400 and "invalid_value" in sample and "input" in sample:
         return "client_invalid_input"
+    if status_code == 400 and "missing" in sample and ("tools.function" in sample or "tool.function" in sample):
+        return "client_invalid_input"
     invalid_request = (
         "invalid codex request",
         "invalid_responses_request",
@@ -1157,6 +1159,38 @@ def safe_text_from_content(content: Any) -> str | None:
                 return None
         return "\n".join(text for text in parts if text)
     return None
+
+
+def safe_instruction_text(content: Any) -> str | None:
+    text = safe_text_from_content(content)
+    if text is not None:
+        return text
+    if isinstance(content, dict):
+        if "content" in content:
+            return safe_instruction_text(content.get("content"))
+        if "text" in content:
+            return str(content.get("text") or "")
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            item_text = safe_instruction_text(item)
+            if item_text is None:
+                return None
+            if item_text:
+                parts.append(item_text)
+        return "\n".join(parts)
+    return None
+
+
+def merge_chat_response_instructions(instructions: str, body: dict[str, Any]) -> str:
+    parts = [instructions] if instructions else []
+    if "system" in body:
+        system_text = safe_instruction_text(body.get("system"))
+        if system_text is None:
+            system_text = json.dumps(body.get("system"), ensure_ascii=False, separators=(",", ":"))
+        if system_text:
+            parts.insert(0, system_text)
+    return "\n\n".join(parts)
 
 
 def codex_responses_content_from_chat_content(content: Any, role: str) -> list[dict[str, Any]] | None:
@@ -1249,33 +1283,7 @@ def chat_messages_from_responses_input(input_value: Any) -> list[dict[str, Any]]
 
 
 def responses_input_from_chat_messages(messages: Any) -> tuple[str, list[dict[str, Any]]] | None:
-    if not isinstance(messages, list) or not messages:
-        return None
-    instructions: list[str] = []
-    inputs: list[dict[str, Any]] = []
-    for item in messages:
-        if not isinstance(item, dict):
-            return None
-        role = str(item.get("role") or "user")
-        content = safe_text_from_content(item.get("content"))
-        if content is None:
-            return None
-        if role in {"system", "developer"}:
-            if content:
-                instructions.append(content)
-            continue
-        if role not in {"user", "assistant"}:
-            return None
-        inputs.append(
-            {
-                "type": "message",
-                "role": role,
-                "content": [{"type": "input_text" if role == "user" else "output_text", "text": content}],
-            }
-        )
-    if not inputs:
-        return None
-    return "\n\n".join(instructions), inputs
+    return codex_responses_input_from_chat_messages(messages)
 
 
 def codex_responses_input_from_chat_messages(messages: Any) -> tuple[str, list[dict[str, Any]]] | None:
@@ -1389,12 +1397,9 @@ RESPONSES_TO_CHAT_UNSAFE_FIELDS = {
     "client_metadata",
 }
 CHAT_TO_RESPONSES_UNSAFE_FIELDS = {
-    "tools",
-    "tool_choice",
     "functions",
     "function_call",
     "response_format",
-    "parallel_tool_calls",
 }
 CHAT_TO_CODEX_RESPONSES_UNSAFE_FIELDS = {
     "functions",
@@ -1411,6 +1416,12 @@ def responses_body_can_use_chat_adapter(body: dict[str, Any]) -> bool:
 
 def chat_body_can_use_responses_adapter(body: dict[str, Any]) -> bool:
     if any(field in body for field in CHAT_TO_RESPONSES_UNSAFE_FIELDS):
+        return False
+    if responses_tools_from_chat_tools(body.get("tools")) is None:
+        return False
+    if "tool_choice" in body and responses_tool_choice_from_chat_tool_choice(body.get("tool_choice")) is None:
+        return False
+    if "parallel_tool_calls" in body and not isinstance(body.get("parallel_tool_calls"), bool):
         return False
     return responses_input_from_chat_messages(body.get("messages")) is not None
 
@@ -1451,15 +1462,25 @@ def chat_body_to_responses_body(body: dict[str, Any], chosen: dict[str, Any]) ->
     converted = responses_input_from_chat_messages(body.get("messages"))
     if converted is None:
         raise ValueError("chat body cannot be safely adapted to responses")
+    tools = responses_tools_from_chat_tools(body.get("tools"))
+    if tools is None:
+        raise ValueError("chat tools cannot be safely adapted to responses")
     instructions, input_value = converted
     req_body: dict[str, Any] = {
         "model": chosen["actual_model"],
         "input": input_value,
-        "instructions": instructions,
+        "instructions": merge_chat_response_instructions(instructions, body),
         "store": False,
     }
     if "max_tokens" in body:
         req_body["max_output_tokens"] = body.get("max_tokens")
+    if tools:
+        req_body["tools"] = tools
+        tool_choice = responses_tool_choice_from_chat_tool_choice(body.get("tool_choice"))
+        if tool_choice is not None:
+            req_body["tool_choice"] = tool_choice
+        if "parallel_tool_calls" in body:
+            req_body["parallel_tool_calls"] = bool(body.get("parallel_tool_calls"))
     for key in ("temperature", "top_p", "stream", "stop", "user", "metadata"):
         if key in body:
             req_body[key] = body[key]
@@ -1483,7 +1504,7 @@ def chat_body_to_codex_compat_responses_body(body: dict[str, Any], chosen: dict[
     req_body = codex_shape_diagnostic_body(chosen["actual_model"], effort=effort)
     for key in ("tools", "tool_choice", "parallel_tool_calls"):
         req_body.pop(key, None)
-    req_body["instructions"] = instructions
+    req_body["instructions"] = merge_chat_response_instructions(instructions, body)
     req_body["input"] = input_value
     req_body["store"] = False
     req_body["stream"] = bool(body.get("stream", False))

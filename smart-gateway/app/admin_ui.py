@@ -207,10 +207,12 @@ ADMIN_HTML = """
     }
     .logs-filters input,
     .logs-filters select {
-      width: 170px;
+      width: 153px;
+      flex: 0 1 153px;
     }
     .logs-filters .wide-filter {
-      width: 230px;
+      width: 207px;
+      flex-basis: 207px;
     }
     .filter-count {
       color: var(--muted);
@@ -248,21 +250,54 @@ ADMIN_HTML = """
     .upstream-availability-table th:nth-child(9), .upstream-availability-table td:nth-child(9) { width: 230px; }
     .upstream-availability-table th:nth-child(10), .upstream-availability-table td:nth-child(10) { width: 170px; }
     .logs-table {
-      min-width: 1580px;
+      width: 100%;
+      min-width: 0;
       table-layout: fixed;
     }
-    .logs-table th:nth-child(1), .logs-table td:nth-child(1) { width: 170px; }
-    .logs-table th:nth-child(2), .logs-table td:nth-child(2) { width: 190px; }
-    .logs-table th:nth-child(3), .logs-table td:nth-child(3) { width: 115px; }
-    .logs-table th:nth-child(4), .logs-table td:nth-child(4) { width: 170px; }
-    .logs-table th:nth-child(5), .logs-table td:nth-child(5) { width: 230px; }
-    .logs-table th:nth-child(6), .logs-table td:nth-child(6) { width: 170px; }
-    .logs-table th:nth-child(7), .logs-table td:nth-child(7) { width: 170px; }
-    .logs-table th:nth-child(8), .logs-table td:nth-child(8) { width: 95px; }
-    .logs-table th:nth-child(9), .logs-table td:nth-child(9) { width: 95px; }
-    .logs-table th:nth-child(10), .logs-table td:nth-child(10) { width: 95px; }
-    .logs-table th:nth-child(11), .logs-table td:nth-child(11) { width: 170px; }
-    .logs-table th:nth-child(12), .logs-table td:nth-child(12) { width: 145px; }
+    .logs-table th:nth-child(1), .logs-table td:nth-child(1) { width: 17%; }
+    .logs-table th:nth-child(2), .logs-table td:nth-child(2) { width: 13%; }
+    .logs-table th:nth-child(3), .logs-table td:nth-child(3) { width: 18%; }
+    .logs-table th:nth-child(4), .logs-table td:nth-child(4) { width: 21%; }
+    .logs-table th:nth-child(5), .logs-table td:nth-child(5) { width: 10%; }
+    .logs-table th:nth-child(6), .logs-table td:nth-child(6) { width: 21%; }
+    .logs-table td {
+      height: 58px;
+      padding-top: 7px;
+      padding-bottom: 7px;
+      vertical-align: middle;
+    }
+    .logs-tablewrap {
+      max-height: none;
+      overflow: hidden;
+    }
+    .logs-table .log-cell {
+      display: flex;
+      min-width: 0;
+      max-height: 46px;
+      flex-direction: column;
+      justify-content: center;
+      gap: 2px;
+      overflow: hidden;
+    }
+    .logs-table .cell-main,
+    .logs-table .cell-sub,
+    .logs-table .log-line {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .logs-table .chiprow {
+      max-width: 100%;
+      flex-wrap: nowrap;
+      overflow: hidden;
+    }
+    .logs-table .chip {
+      max-width: 110px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
     .matrix-helpbar {
       display: grid;
       grid-template-columns: minmax(220px, auto) minmax(0, 1fr);
@@ -801,22 +836,16 @@ ADMIN_HTML = """
             <button id="logsClearFilters" type="button">清空</button>
           </div>
         </div>
-        <div class="tablewrap wide-table">
+        <div class="tablewrap logs-tablewrap">
           <table class="logs-table">
             <thead>
               <tr>
-                <th>时间</th>
-                <th>请求ID</th>
-                <th>接口</th>
-                <th>请求模型</th>
-                <th>上游</th>
-                <th>路由</th>
-                <th>上游模型</th>
-                <th>状态</th>
-                <th>耗时</th>
-                <th>Token</th>
-                <th>形态</th>
-                <th>错误</th>
+                <th>请求</th>
+                <th>接口 / 状态</th>
+                <th>模型</th>
+                <th>流向</th>
+                <th>耗时 / Token</th>
+                <th>详情</th>
               </tr>
             </thead>
             <tbody id="logsBody"></tbody>
@@ -2072,23 +2101,51 @@ ADMIN_HTML = """
       $("logsBody").innerHTML = page.items.map((row) => {
         const usage = row.usage || {};
         const tokens = usage.total_tokens == null ? "" : usage.total_tokens;
+        const requestedModel = row.requested_model || "";
+        const actualModel = row.actual_model || "";
+        const route = routeLabel(row.route_bucket || row.route_group);
+        const adapter = row.format_adapter || "native";
+        const upstreamKind = row.upstream_kind || row.kind || "";
+        const latency = row.latency_ms == null ? "" : `${row.latency_ms} ms`;
+        const endpointStatus = row.status_code ? `HTTP ${row.status_code}` : "";
         return `
           <tr>
-            <td>${formatTs(row.ts)}</td>
-            <td class="mono">${escapeHtml(row.request_id || "")}</td>
-            <td class="mono">${escapeHtml(row.kind || "")}${row.stream ? " stream" : ""}</td>
-            <td class="mono">${escapeHtml(row.requested_model || "")}</td>
-            <td>${escapeHtml(row.provider_id || "")}</td>
-            <td>
-              <div>${escapeHtml(routeLabel(row.route_bucket || row.route_group))}</div>
-              ${row.upstream_kind ? `<div class="cell-sub mono">${escapeHtml(row.upstream_kind)} / ${escapeHtml(row.format_adapter || "native")}</div>` : ""}
+            <td title="${escapeHtml(row.request_id || "")}">
+              <div class="log-cell">
+                <div class="cell-main">${formatTs(row.ts)}</div>
+                <div class="cell-sub mono">${escapeHtml(row.request_id || "")}</div>
+              </div>
             </td>
-            <td class="mono">${escapeHtml(row.actual_model || "")}</td>
-            <td>${logStatusPill(!!row.success)}</td>
-            <td>${row.latency_ms == null ? "" : row.latency_ms + " ms"}</td>
-            <td>${tokens}</td>
-            <td>${logShapeSummary(row)}</td>
-            <td class="mono" title="${escapeHtml(row.error_sample || "")}">${escapeHtml(row.error_type || "")}</td>
+            <td>
+              <div class="log-cell">
+                <div class="log-line">${logStatusPill(!!row.success)} <span class="mono">${escapeHtml(row.kind || "")}${row.stream ? " stream" : ""}</span></div>
+                <div class="cell-sub mono">${escapeHtml(endpointStatus)}</div>
+              </div>
+            </td>
+            <td title="${escapeHtml([requestedModel, actualModel].filter(Boolean).join(" -> "))}">
+              <div class="log-cell">
+                <div class="cell-main mono">${escapeHtml(requestedModel)}</div>
+                <div class="cell-sub mono">${actualModel && actualModel !== requestedModel ? `上游 ${escapeHtml(actualModel)}` : escapeHtml(actualModel || "")}</div>
+              </div>
+            </td>
+            <td title="${escapeHtml([row.provider_id, route, upstreamKind, adapter].filter(Boolean).join(" / "))}">
+              <div class="log-cell">
+                <div class="cell-main">${escapeHtml(row.provider_id || "")}</div>
+                <div class="cell-sub mono">${escapeHtml(route)} / ${escapeHtml(upstreamKind)} / ${escapeHtml(adapter)}</div>
+              </div>
+            </td>
+            <td>
+              <div class="log-cell">
+                <div class="cell-main mono">${escapeHtml(latency)}</div>
+                <div class="cell-sub mono">${tokens === "" ? "" : `${escapeHtml(String(tokens))} tokens`}</div>
+              </div>
+            </td>
+            <td title="${escapeHtml(row.error_sample || "")}">
+              <div class="log-cell">
+                ${logShapeSummary(row) || '<div class="cell-sub">-</div>'}
+                <div class="cell-sub mono">${escapeHtml(row.error_type || "")}</div>
+              </div>
+            </td>
           </tr>
         `;
       }).join("");
