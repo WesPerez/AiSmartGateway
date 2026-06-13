@@ -1919,7 +1919,10 @@ ADMIN_HTML = """
       }).filter((item) => item.id > 0);
     }
 
-    async function loadAll() {
+    async function loadAll(options = {}) {
+      const preserveDrafts = options.preserveDrafts === true;
+      if (preserveDrafts) syncVisibleProviderDrafts();
+      const previousDrafts = preserveDrafts ? { ...providerDrafts } : {};
       showApp();
       const [overview, providerData] = await Promise.all([
         api("/gateway-admin/api/overview"),
@@ -1928,7 +1931,7 @@ ADMIN_HTML = """
       const logs = await api("/gateway-admin/api/request-logs?limit=200");
       state = overview;
       providers = providerData.providers;
-      providerDrafts = {};
+      providerDrafts = preserveDrafts ? previousDrafts : {};
       logsData = logs;
       renderOverview(overview);
       renderMatrix(overview);
@@ -1938,6 +1941,27 @@ ADMIN_HTML = """
       updateModelOptions();
       updateUpstreamOptions();
       renderRouteBoard();
+    }
+
+    function activateTab(tab) {
+      document.querySelectorAll(".tab").forEach((x) => x.classList.remove("active"));
+      document.querySelectorAll(".tabpane").forEach((x) => x.classList.add("hidden"));
+      tab.classList.add("active");
+      $("tab-" + tab.dataset.tab).classList.remove("hidden");
+      if (tab.dataset.tab === "models") renderAvailability();
+      if (tab.dataset.tab === "providers") renderRouteBoard();
+    }
+
+    let tabRefreshSeq = 0;
+    async function refreshAfterTabClick(tab) {
+      const seq = ++tabRefreshSeq;
+      const label = tab.textContent.trim();
+      try {
+        await loadAll({ preserveDrafts: true });
+        if (seq === tabRefreshSeq) setNotice(`已自动刷新“${label}”数据。`);
+      } catch (err) {
+        if (seq === tabRefreshSeq) showLogin(err.message);
+      }
     }
 
     $("loginBtn").addEventListener("click", async () => {
@@ -2056,12 +2080,8 @@ ADMIN_HTML = """
 
     document.querySelectorAll(".tab").forEach((tab) => {
       tab.addEventListener("click", () => {
-        document.querySelectorAll(".tab").forEach((x) => x.classList.remove("active"));
-        document.querySelectorAll(".tabpane").forEach((x) => x.classList.add("hidden"));
-        tab.classList.add("active");
-        $("tab-" + tab.dataset.tab).classList.remove("hidden");
-        if (tab.dataset.tab === "models") renderAvailability();
-        if (tab.dataset.tab === "providers") renderRouteBoard();
+        activateTab(tab);
+        refreshAfterTabClick(tab);
       });
     });
 
