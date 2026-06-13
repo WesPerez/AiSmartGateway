@@ -226,11 +226,15 @@ Smart Gateway currently normalizes Responses bodies by adding safe defaults
 such as `instructions: ""` and `store: false` when absent. It does not invent
 large tool lists or hidden Codex metadata.
 
-Volcengine Coding's OpenAI-compatible `/api/coding/v3/responses` endpoint may
-reject streamed Responses requests without a `partial` parameter. For that
-provider family, Smart Gateway adds `partial: true` for stream requests and
-`partial: false` for non-stream requests when the caller did not provide it.
-This applies to runtime requests, minimal probes, and Codex-shape diagnostics.
+Some OpenAI-compatible Responses providers may reject requests without
+provider-specific optional fields. One observed example is a `MissingParameter`
+error for `partial`. Smart Gateway handles this generically: when a Responses
+runtime request, minimal probe, or Codex-shape diagnostic gets a clear
+missing-`partial` error, it retries once with `partial` inferred from `stream`
+and learns that default for the provider for later requests. This is
+error-driven compatibility, not a model-specific rule. The learned value is an
+in-process compatibility cache; an operator may also set `responses_defaults`
+on a provider if the behavior should be explicit after restart.
 
 For upstreams that restrict accepted clients, provider-level headers may be
 used to force a compatible client identity. One Claude aggregation provider was
@@ -349,8 +353,9 @@ client kind: what the caller sent and expects back
 upstream kind: the provider endpoint Smart Gateway chooses
 ```
 
-Native routes are still preferred. When the request body is a safe text-only
-shape, Smart Gateway may adapt:
+Native routes get a lower score penalty, but the router may still choose a
+converted route when the adjusted latency is better. When the request body is a
+safe text-only shape, Smart Gateway may adapt:
 
 - `/v1/responses` client request -> healthy `/chat/completions` upstream ->
   converted back to a Responses response.
@@ -363,6 +368,31 @@ function calling, `reasoning`, `include`, `prompt_cache_key`,
 requests require native Responses compatibility. Adapted routes carry an
 `adapter_latency_penalty_ms` score penalty and logs include `upstream_kind` and
 `format_adapter` so operators can see when conversion was used.
+
+There is one important safety boundary: a Responses health item verified only by
+the Codex diagnostic shape (`shape_status=codex_shape_verified` or
+`shape_verification_source=diagnostic_codex_shape`) is not treated as a generic
+Chat -> Responses adapter candidate. That evidence proves Codex-style Responses
+works, but it does not prove a small text-only Chat request converted to
+Responses will pass. The router should either use a native Chat candidate or a
+Responses candidate proven by normal/runtime requests.
+
+Streaming adapters buffer complete SSE events before conversion, so a single
+event split across multiple upstream network chunks is not dropped. This applies
+to both Chat stream -> Responses stream and Responses stream -> Chat stream.
+
+Real validation on 2026-06-13 covered:
+
+- Volcengine `deepseek-v4-pro`: native Responses stream succeeded; Chat client
+  request selected the lower-latency Responses upstream and converted back to
+  Chat successfully.
+- Fufu `mimo-v2-flash`: native Chat and native Responses both succeeded.
+- Muyuan `claude-opus-4-8`: Responses client requests, both non-stream and
+  stream, used the Chat upstream and converted back to Responses successfully.
+- Anyrouter `gpt-5.5`: Codex-shape Responses health remains valid, but forced
+  generic Chat -> Responses conversion is filtered out as `no_healthy_upstream`
+  instead of sending an invalid request to the upstream. Normal `gpt-5.5` Chat
+  routing succeeds through the native Chat fallback.
 
 ## Operations UI
 

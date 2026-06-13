@@ -381,7 +381,8 @@ Smart Gateway 后台逐步增加和调整了：
 - 官方说明有两个 base URL：一个兼容 Anthropic 协议，一个兼容 OpenAI 协议。
 - 曾经出现官方有 GLM 新版本但系统只识别旧 GLM 的问题。
 - 结论：Volcengine 不能只信 `/models`，应通过官方声明模型族和过滤规则选择最新 deepseek flash、deepseek pro、GLM。
-- 2026-06-13 复查 `deepseek-v4-pro` 失败时，最近日志显示上游 `/api/coding/v3/responses` 返回 `400 MissingParameter`，缺少 `partial` 参数；修复为对 Volcengine Coding Responses 自动补 `partial`，流式请求为 `true`，非流式请求为 `false`，并应用到运行时请求、minimal probe 和 Codex-shape diagnostic。
+- 2026-06-13 复查 `deepseek-v4-pro` 失败时，最近日志显示上游 `/api/coding/v3/responses` 返回 `400 MissingParameter`，缺少 `partial` 参数；修复方向改为通用 Responses 兼容机制：任意上游在运行时请求、minimal probe 或 Codex-shape diagnostic 中明确返回缺 `partial` 时，Gateway 自动补 `partial=stream` 重试一次，并学习该 provider 的默认值，避免写成单模型或单上游特例。
+- 2026-06-13 真实请求验证确认：Volcengine `deepseek-v4-pro` 的 Responses stream 可通过；普通 Chat 请求在该 provider 上会因为 Responses 延迟更低而走 `responses_to_chat` 转换并成功返回。
 - 后续建议：Volcengine provider 增加版本排序测试，确保 `glm-5.1` 这类官方新模型优先于旧版本。
 
 ### `/models` 为空但可用
@@ -871,7 +872,7 @@ upstream_kind: 网关实际选择的上游接口格式
 ### 已执行优化
 
 1. 新增自适应格式路由，默认开启。
-2. 原生格式仍优先；跨格式候选会增加 `ADAPTER_LATENCY_PENALTY_MS`，默认 250ms。
+2. 原生格式通过 `ADAPTER_LATENCY_PENALTY_MS` 获得偏好，默认 250ms；如果转换后的调整延迟仍更低，路由可以选择跨格式上游。
 3. `/v1/responses` 可以在安全文本形态下选择健康 Chat 上游，再把 Chat 响应转回 Responses。
 4. `/v1/chat/completions` 可以在安全文本形态下选择健康 Responses 上游，再把 Responses 响应转回 Chat Completions。
 5. 带工具调用、function calling、`reasoning`、`include`、`prompt_cache_key`、`previous_response_id`、Codex encrypted reasoning 等复杂字段时，不做降级转换，必须走原生 Responses。
@@ -880,6 +881,9 @@ upstream_kind: 网关实际选择的上游接口格式
 8. 管理 API 对 health item 动态补充 `health_age_seconds`、`health_fresh`、`health_freshness`、`health_fresh_ttl_seconds`，不污染持久化 health state。
 9. 探测矩阵新增“新鲜度”列；模型可用性按上游视角的接口 chip 会显示实时、缓存或冷却。
 10. 健康策略说明新增实时新鲜窗口和跨格式路由说明。
+11. 流式跨格式转换改为按完整 SSE 事件缓冲后再转换，避免一个事件被上游拆成多个网络 chunk 时丢字。
+12. 只由 Codex diagnostic shape 证明可用的 Responses health，不再作为普通 Chat -> Responses 通用转换候选；这类证据只说明 Codex 形态可用，不能证明小 JSON/普通 Chat 转换形态可用。
+13. 通用 `partial` 兼容改为错误驱动：Responses 运行时、minimal probe、Codex diagnostic 只要明确返回缺 `partial`，同一 endpoint 在首块前自动补 `partial=stream` 重试一次，并学习 provider 默认值。
 
 ### 当前健康含义
 
@@ -898,6 +902,16 @@ upstream_kind: 网关实际选择的上游接口格式
 - 复杂 Responses body 不降级到 Chat。
 - Responses 客户端请求使用 Chat 上游并转回 Responses。
 - Chat 客户端请求使用 Responses 上游并转回 Chat。
+- 双向流式转换可处理拆分 SSE 事件。
+- Codex diagnostic-only Responses 健康不会进入普通 Chat -> Responses 转换候选。
+- 缺 `partial` 的 Responses provider 在探活、非流式运行时、流式运行时都会通用重试。
+
+真实请求回归：
+
+- Volcengine `deepseek-v4-pro`：Responses stream 原生成功；Chat 请求实际选择 Responses 上游并 `responses_to_chat` 成功。
+- Fufu `mimo-v2-flash`：Chat 原生成功，Responses 原生成功。
+- Muyuan `claude-opus-4-8`：Responses 客户端请求非流式和流式均成功降级到 Chat 上游，再转回 Responses；provider 级 `User-Agent: Claude-Code/1.0.0` 继续解决该源的客户端限制。
+- Anyrouter `gpt-5.5`：Codex-shape Responses 健康保持 `shape_status=codex_shape_verified`；强制普通 Chat -> Responses 转换会被过滤成 `no_healthy_upstream`，不会再向上游发送已知会失败的普通转换形态；普通 `gpt-5.5` Chat 自动走 native Chat fallback 成功。
 - 管理 API 暴露健康新鲜度字段。
 
-完整验证结果：`68 passed`。
+完整验证结果：`78 passed`。

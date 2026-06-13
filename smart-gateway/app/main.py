@@ -73,6 +73,7 @@ PROVIDERS: list[dict[str, Any]] = []
 HEALTH: dict[str, dict[str, dict[str, Any]]] = {"chat": {}, "responses": {}}
 MODEL_CACHE: dict[str, dict[str, Any]] = {}
 LAST_PROBE_AT: float | None = None
+RESPONSES_COMPAT_DEFAULTS: dict[str, dict[str, Any]] = {}
 
 app = FastAPI(title=APP_NAME)
 
@@ -1036,15 +1037,39 @@ def upstream_path_for_kind(kind: str) -> str:
     return "/responses" if kind == "responses" else "/chat/completions"
 
 
-def responses_partial_required(target: dict[str, Any]) -> bool:
-    urls = [str(target.get("base_url") or ""), *[str(url) for url in (target.get("base_urls") or [])]]
-    return any("volces.com/api/coding" in url or "/api/coding/" in url for url in urls)
-
-
 def apply_responses_provider_defaults(body: dict[str, Any], target: dict[str, Any]) -> dict[str, Any]:
-    if responses_partial_required(target) and "partial" not in body:
+    key = provider_compat_key(target)
+    configured = target.get("responses_defaults") or target.get("response_defaults") or {}
+    learned = RESPONSES_COMPAT_DEFAULTS.get(key) or {}
+    partial_default = configured.get("partial") if isinstance(configured, dict) else None
+    if partial_default is None:
+        partial_default = learned.get("partial")
+    if partial_default == "stream_bool" and "partial" not in body:
         body["partial"] = bool(body.get("stream", False))
+    elif isinstance(partial_default, bool) and "partial" not in body:
+        body["partial"] = partial_default
     return body
+
+
+def provider_compat_key(target: dict[str, Any]) -> str:
+    return str(target.get("provider_id") or target.get("id") or target.get("base_url") or "")
+
+
+def missing_partial_parameter(status_code: int, text: str) -> bool:
+    sample = (text or "").lower()
+    return status_code == 400 and "partial" in sample and (
+        "missing" in sample or "required" in sample or "missingparameter" in sample
+    )
+
+
+def learn_responses_partial_default(target: dict[str, Any]) -> None:
+    key = provider_compat_key(target)
+    if key:
+        RESPONSES_COMPAT_DEFAULTS.setdefault(key, {})["partial"] = "stream_bool"
+
+
+def can_retry_with_partial(kind: str, status_code: int, text: str, body: dict[str, Any]) -> bool:
+    return kind == "responses" and "partial" not in body and missing_partial_parameter(status_code, text)
 
 
 def safe_text_from_content(content: Any) -> str | None:
@@ -1331,6 +1356,22 @@ def iter_sse_data_payloads(text: str) -> list[str]:
     return payloads
 
 
+def pop_complete_sse_events(buffer: bytes) -> tuple[bytes, bytes]:
+    events = bytearray()
+    remaining = buffer
+    while remaining:
+        lf_index = remaining.find(b"\n\n")
+        crlf_index = remaining.find(b"\r\n\r\n")
+        candidates = [(idx, sep_len) for idx, sep_len in ((lf_index, 2), (crlf_index, 4)) if idx >= 0]
+        if not candidates:
+            break
+        idx, sep_len = min(candidates, key=lambda item: item[0])
+        end = idx + sep_len
+        events.extend(remaining[:end])
+        remaining = remaining[end:]
+    return bytes(events), remaining
+
+
 def chat_stream_chunk_to_responses(chunk: bytes, request_id: str, model: str | None) -> bytes:
     out = bytearray()
     for payload in iter_sse_data_payloads(chunk.decode("utf-8", "ignore")):
@@ -1370,6 +1411,36 @@ def responses_stream_chunk_to_chat(chunk: bytes, request_id: str, model: str | N
             }
             out.extend(f"data: {json.dumps(chat_chunk, ensure_ascii=False, separators=(',', ':'))}\n\n".encode())
     return bytes(out)
+
+
+class StreamFormatAdapter:
+    def __init__(self, chosen: dict[str, Any], client_kind: str, request_id: str, model: str | None):
+        self.chosen = chosen
+        self.client_kind = client_kind
+        self.request_id = request_id
+        self.model = model
+        self.buffer = b""
+
+    def feed(self, chunk: bytes) -> bytes:
+        upstream_kind = self.chosen.get("_upstream_kind") or self.client_kind
+        if upstream_kind == self.client_kind:
+            return chunk
+        self.buffer += chunk
+        complete, self.buffer = pop_complete_sse_events(self.buffer)
+        if not complete:
+            return b""
+        return convert_stream_chunk_for_client(complete, self.chosen, self.client_kind, self.request_id, self.model)
+
+    def flush(self) -> bytes:
+        upstream_kind = self.chosen.get("_upstream_kind") or self.client_kind
+        if upstream_kind == self.client_kind or not self.buffer.strip():
+            self.buffer = b""
+            return b""
+        pending = self.buffer
+        self.buffer = b""
+        if not pending.endswith((b"\n\n", b"\r\n\r\n")):
+            pending += b"\n\n"
+        return convert_stream_chunk_for_client(pending, self.chosen, self.client_kind, self.request_id, self.model)
 
 
 def convert_stream_chunk_for_client(chunk: bytes, chosen: dict[str, Any], client_kind: str, request_id: str, model: str | None) -> bytes:
@@ -1441,30 +1512,38 @@ async def probe_codex_responses_shape(
     headers = provider_headers(provider, codex_shape_diagnostic_headers(), "responses")
     headers["Accept"] = "text/event-stream"
     body = apply_responses_provider_defaults(codex_shape_diagnostic_body(actual_model), provider)
-    async with client.stream("POST", url, headers=headers, json=body) as response:
-        latency_ms = int((now() - start) * 1000)
-        if response.status_code < 200 or response.status_code >= 300:
-            raw = await response.aread()
-            text = raw.decode("utf-8", "ignore")[:2000]
-            reason = classify_error(response.status_code, text)
-            if reason == "invalid_request":
-                reason = "responses_request_shape_unverified"
-            return {
-                "healthy": False,
-                "reason": reason,
-                "shape_status": "probe_unverified" if reason == "responses_request_shape_unverified" else "",
-                "shape_invalid_required": RESPONSES_INVALID_REQUEST_CONFIRMATIONS if reason == "responses_request_shape_unverified" else None,
-                "status_code": response.status_code,
-                "latency_ms": latency_ms,
-                "sample": text[:300],
-                "endpoint_url": url,
-            }
-        first = b""
-        async for chunk in response.aiter_raw():
-            if chunk:
-                first = chunk
-                break
-        text = first.decode("utf-8", "ignore")[:2000] if first else ""
+    response = None
+    first = b""
+    for _ in range(2):
+        async with client.stream("POST", url, headers=headers, json=body) as response:
+            latency_ms = int((now() - start) * 1000)
+            if response.status_code < 200 or response.status_code >= 300:
+                raw = await response.aread()
+                text = raw.decode("utf-8", "ignore")[:2000]
+                if can_retry_with_partial("responses", response.status_code, text, body):
+                    learn_responses_partial_default(provider)
+                    body = apply_responses_provider_defaults(body, provider)
+                    continue
+                reason = classify_error(response.status_code, text)
+                if reason == "invalid_request":
+                    reason = "responses_request_shape_unverified"
+                return {
+                    "healthy": False,
+                    "reason": reason,
+                    "shape_status": "probe_unverified" if reason == "responses_request_shape_unverified" else "",
+                    "shape_invalid_required": RESPONSES_INVALID_REQUEST_CONFIRMATIONS if reason == "responses_request_shape_unverified" else None,
+                    "status_code": response.status_code,
+                    "latency_ms": latency_ms,
+                    "sample": text[:300],
+                    "endpoint_url": url,
+                }
+            first = b""
+            async for chunk in response.aiter_raw():
+                if chunk:
+                    first = chunk
+                    break
+            text = first.decode("utf-8", "ignore")[:2000] if first else ""
+            break
     if not text:
         return {
             "healthy": False,
@@ -1520,11 +1599,11 @@ async def probe_one(provider: dict[str, Any], local_model: str, actual_model: st
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(PROBE_TIMEOUT_SECONDS), follow_redirects=True) as client:
             for url in upstream_urls(provider, probe_cfg.get("path") or f"/{kind}"):
-                response = await client.post(
-                    url,
-                    headers=provider_headers(provider, kind=kind),
-                    json=body,
-                )
+                response = await client.post(url, headers=provider_headers(provider, kind=kind), json=body)
+                if can_retry_with_partial(kind, response.status_code, response.text[:1000], body):
+                    learn_responses_partial_default(provider)
+                    body = apply_responses_provider_defaults(body, provider)
+                    response = await client.post(url, headers=provider_headers(provider, kind=kind), json=body)
                 latency_ms = int((now() - start) * 1000)
                 text = response.text[:2000]
                 if response.status_code < 200 or response.status_code >= 300:
@@ -2294,6 +2373,17 @@ def annotate_route_item(item: dict[str, Any], client_kind: str, upstream_kind: s
     return item
 
 
+def route_item_format_adapter_allowed(item: dict[str, Any], client_kind: str, upstream_kind: str) -> bool:
+    if client_kind == upstream_kind:
+        return True
+    if client_kind == "chat" and upstream_kind == "responses":
+        shape_status = str(item.get("shape_status") or "")
+        shape_source = str(item.get("shape_verification_source") or "")
+        if shape_status == "codex_shape_verified" or shape_source == "diagnostic_codex_shape":
+            return False
+    return True
+
+
 def adaptive_candidate_buckets(
     model: str,
     client_kind: str,
@@ -2307,7 +2397,11 @@ def adaptive_candidate_buckets(
             continue
         for bucket in healthy_candidate_buckets(model, upstream_kind, controls):
             target = combined.setdefault(bucket["name"], [])
-            target.extend(annotate_route_item(item, client_kind, upstream_kind) for item in bucket["items"])
+            target.extend(
+                annotate_route_item(item, client_kind, upstream_kind)
+                for item in bucket["items"]
+                if route_item_format_adapter_allowed(item, client_kind, upstream_kind)
+            )
     buckets = []
     for name in ROUTE_BUCKET_ORDER:
         items = combined.get(name) or []
@@ -2532,6 +2626,10 @@ async def relay_non_stream(
                 for candidate_url in upstream_urls(provider, upstream_path):
                     endpoint_url = candidate_url
                     response = await client.post(candidate_url, headers=provider_headers(provider, incoming_headers, upstream_kind), json=req_body)
+                    if can_retry_with_partial(upstream_kind, response.status_code, response.text[:1000], req_body):
+                        learn_responses_partial_default(chosen)
+                        req_body = apply_responses_provider_defaults(req_body, chosen)
+                        response = await client.post(candidate_url, headers=provider_headers(provider, incoming_headers, upstream_kind), json=req_body)
                     if 200 <= response.status_code < 300:
                         break
                     endpoint_reasons.append(classify_error(response.status_code, response.text[:1000]))
@@ -2711,40 +2809,72 @@ async def relay_stream(
                 follow_redirects=True,
             ) as client:
                 for endpoint_url in upstream_urls(provider, upstream_path):
-                    async with client.stream("POST", endpoint_url, headers=provider_headers(provider, incoming_headers, upstream_kind), json=req_body) as response:
-                        if response.status_code < 200 or response.status_code >= 300:
-                            raw = await response.aread()
-                            reason = classify_error(response.status_code, raw.decode("utf-8", "ignore")[:1000])
-                            endpoint_reasons.append(reason)
-                            await append_request_log(
-                                {
-                                    "request_id": request_id,
-                                    "kind": kind,
-                                    "stream": True,
-                                    "requested_model": model,
-                                    "actual_model": chosen["actual_model"],
-                                    "provider_id": chosen["provider_id"],
-                                    "path": upstream_path,
-                                    "endpoint_url": endpoint_url,
-                                    "status_code": response.status_code,
-                                    "latency_ms": int((now() - start) * 1000),
-                                    "success": False,
-                                    "error_type": reason,
-                                    "error_sample": redact_text(raw.decode("utf-8", "ignore"), 500),
-                                    "route_controls": controls,
-                                    "request_shape": request_shape(body, incoming_headers),
-                                    **route_fields,
-                                }
-                            )
-                            continue
-
-                        first = None
-                        raw_chunks = response.aiter_raw()
-                        async for chunk in raw_chunks:
-                            if chunk:
-                                first = chunk
+                    partial_retry_used = False
+                    while True:
+                        async with client.stream("POST", endpoint_url, headers=provider_headers(provider, incoming_headers, upstream_kind), json=req_body) as response:
+                            if response.status_code < 200 or response.status_code >= 300:
+                                raw = await response.aread()
+                                raw_text = raw.decode("utf-8", "ignore")
+                                if not partial_retry_used and can_retry_with_partial(upstream_kind, response.status_code, raw_text[:1000], req_body):
+                                    partial_retry_used = True
+                                    learn_responses_partial_default(chosen)
+                                    req_body = apply_responses_provider_defaults(req_body, chosen)
+                                    continue
+                                reason = classify_error(response.status_code, raw_text[:1000])
+                                endpoint_reasons.append(reason)
+                                await append_request_log(
+                                    {
+                                        "request_id": request_id,
+                                        "kind": kind,
+                                        "stream": True,
+                                        "requested_model": model,
+                                        "actual_model": chosen["actual_model"],
+                                        "provider_id": chosen["provider_id"],
+                                        "path": upstream_path,
+                                        "endpoint_url": endpoint_url,
+                                        "status_code": response.status_code,
+                                        "latency_ms": int((now() - start) * 1000),
+                                        "success": False,
+                                        "error_type": reason,
+                                        "error_sample": redact_text(raw_text, 500),
+                                        "route_controls": controls,
+                                        "request_shape": request_shape(body, incoming_headers),
+                                        **route_fields,
+                                    }
+                                )
                                 break
-                        if not first:
+
+                            stream_adapter = StreamFormatAdapter(chosen, kind, request_id, model)
+                            first = None
+                            raw_chunks = response.aiter_raw()
+                            async for chunk in raw_chunks:
+                                if chunk:
+                                    first = chunk
+                                    break
+                            if not first:
+                                await append_request_log(
+                                    {
+                                        "request_id": request_id,
+                                        "kind": kind,
+                                        "stream": True,
+                                        "requested_model": model,
+                                        "actual_model": chosen["actual_model"],
+                                        "provider_id": chosen["provider_id"],
+                                        "path": upstream_path,
+                                        "endpoint_url": endpoint_url,
+                                        "status_code": response.status_code,
+                                        "latency_ms": int((now() - start) * 1000),
+                                        "success": False,
+                                        "error_type": "empty_stream",
+                                        "route_controls": controls,
+                                        **route_fields,
+                                    }
+                                )
+                                endpoint_reasons.append("empty_stream")
+                                break
+
+                            latency_ms = int((now() - start) * 1000)
+                            await mark_runtime_success(upstream_kind, model, chosen["provider_id"], latency_ms)
                             await append_request_log(
                                 {
                                     "request_id": request_id,
@@ -2756,63 +2886,45 @@ async def relay_stream(
                                     "path": upstream_path,
                                     "endpoint_url": endpoint_url,
                                     "status_code": response.status_code,
-                                    "latency_ms": int((now() - start) * 1000),
-                                    "success": False,
-                                    "error_type": "empty_stream",
+                                    "latency_ms": latency_ms,
+                                    "success": True,
                                     "route_controls": controls,
                                     **route_fields,
                                 }
                             )
-                            endpoint_reasons.append("empty_stream")
-                            continue
-
-                        latency_ms = int((now() - start) * 1000)
-                        await mark_runtime_success(upstream_kind, model, chosen["provider_id"], latency_ms)
-                        await append_request_log(
-                            {
-                                "request_id": request_id,
-                                "kind": kind,
-                                "stream": True,
-                                "requested_model": model,
-                                "actual_model": chosen["actual_model"],
-                                "provider_id": chosen["provider_id"],
-                                "path": upstream_path,
-                                "endpoint_url": endpoint_url,
-                                "status_code": response.status_code,
-                                "latency_ms": latency_ms,
-                                "success": True,
-                                "route_controls": controls,
-                                **route_fields,
-                            }
-                        )
-                        stream_started = True
-                        if upstream_kind == kind:
-                            done_sent = b"[DONE]" in first
-                            response_completed = b"response.completed" in first
-                            yield first
-                        else:
-                            converted = convert_stream_chunk_for_client(first, chosen, kind, request_id, model)
+                            stream_started = True
+                            converted = stream_adapter.feed(first)
                             if converted:
                                 if b"[DONE]" in converted:
                                     done_sent = True
                                 if b"response.completed" in converted:
                                     response_completed = True
                                 yield converted
-                        async for chunk in raw_chunks:
-                            if chunk:
-                                converted = chunk if upstream_kind == kind else convert_stream_chunk_for_client(chunk, chosen, kind, request_id, model)
-                                if not converted:
-                                    continue
+                            async for chunk in raw_chunks:
+                                if chunk:
+                                    converted = stream_adapter.feed(chunk)
+                                    if not converted:
+                                        continue
+                                    if b"[DONE]" in converted:
+                                        done_sent = True
+                                    if b"response.completed" in converted:
+                                        response_completed = True
+                                    yield converted
+                            converted = stream_adapter.flush()
+                            if converted:
                                 if b"[DONE]" in converted:
                                     done_sent = True
                                 if b"response.completed" in converted:
                                     response_completed = True
                                 yield converted
-                        if kind == "responses" and not response_completed:
-                            yield response_completed_event(request_id, model)
-                        if not done_sent:
-                            yield b"data: [DONE]\n\n"
+                            if kind == "responses" and not response_completed:
+                                yield response_completed_event(request_id, model)
+                            if not done_sent:
+                                yield b"data: [DONE]\n\n"
+                            return
+                    if stream_started:
                         return
+                    continue
 
                 runtime_failure_reason = runtime_failure_reason_for_endpoint_failures(upstream_kind, endpoint_reasons)
                 if should_verify_responses_request_shape(upstream_kind, endpoint_reasons):

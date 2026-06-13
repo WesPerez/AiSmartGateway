@@ -256,11 +256,11 @@ def test_normalize_responses_upstream_body_adds_codex_required_defaults(gateway)
     assert "store" not in body
 
 
-def test_normalize_responses_upstream_body_adds_volces_partial(gateway):
+def test_normalize_responses_upstream_body_adds_configured_partial_default(gateway):
     body = {"model": "deepseek-v4-pro", "input": "ping", "stream": True}
     chosen = {
         "actual_model": "deepseek-v4-pro",
-        "base_url": "https://ark.cn-beijing.volces.com/api/coding/v3",
+        "responses_defaults": {"partial": "stream_bool"},
     }
 
     req_body = gateway.normalize_responses_upstream_body(body, chosen)
@@ -269,10 +269,14 @@ def test_normalize_responses_upstream_body_adds_volces_partial(gateway):
     assert "partial" not in body
 
 
-def test_responses_probe_body_adds_volces_partial(gateway):
+def test_responses_defaults_can_be_learned_from_missing_partial(gateway):
     body = {"model": "deepseek-v4-pro", "input": "ping", "stream": False}
-    provider = {"base_url": "https://ark.cn-beijing.volces.com/api/coding/v3"}
+    provider = {"id": "provider-needs-partial"}
 
+    gateway.RESPONSES_COMPAT_DEFAULTS.clear()
+    gateway.apply_responses_provider_defaults(body, provider)
+    assert "partial" not in body
+    gateway.learn_responses_partial_default(provider)
     gateway.apply_responses_provider_defaults(body, provider)
 
     assert body["partial"] is False
@@ -420,6 +424,82 @@ async def test_chat_request_can_use_responses_upstream_with_safe_adapter(gateway
     assert logs[0]["format_adapter"] == "responses_to_chat"
 
 
+def test_chat_adapter_skips_codex_shape_only_responses_health(gateway):
+    gateway.HEALTH = {
+        "chat": {},
+        "responses": {
+            "good-model": {
+                "p1": {
+                    "provider_id": "p1",
+                    "actual_model": "good-model",
+                    "healthy": True,
+                    "priority": 100,
+                    "weight": 1,
+                    "shape_status": "codex_shape_verified",
+                    "shape_verification_source": "diagnostic_codex_shape",
+                },
+            }
+        },
+    }
+
+    buckets = gateway.adaptive_candidate_buckets(
+        "good-model",
+        "chat",
+        {"model": "good-model", "messages": [{"role": "user", "content": "ping"}]},
+    )
+
+    assert buckets == []
+
+
+@pytest.mark.asyncio()
+async def test_responses_non_stream_retries_missing_partial_generically(gateway, monkeypatch):
+    gateway.RESPONSES_COMPAT_DEFAULTS.clear()
+    gateway.PROVIDERS = [
+        {"id": "partial-provider", "base_url": "https://partial.example/v1", "api_key": "sk-partial", "timeout_seconds": 3, "headers": {}},
+    ]
+    gateway.HEALTH = {
+        "responses": {
+            "good-model": {
+                "partial-provider": {
+                    "provider_id": "partial-provider",
+                    "base_url": "https://partial.example/v1",
+                    "actual_model": "good-model",
+                    "healthy": True,
+                    "priority": 100,
+                    "weight": 1,
+                },
+            }
+        },
+        "chat": {},
+    }
+    monkeypatch.setattr(gateway, "pick_weighted", lambda candidates: candidates[0])
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode())
+        seen.append(body)
+        if "partial" not in body:
+            return httpx.Response(
+                400,
+                json={"error": {"code": "MissingParameter", "message": "missing `partial` parameter", "param": "partial"}},
+            )
+        return httpx.Response(200, json={"id": "ok", "output_text": "pong"})
+
+    with respx.mock:
+        route = respx.post("https://partial.example/v1/responses").mock(side_effect=handler)
+        response = await gateway.relay_non_stream(
+            "/responses",
+            {"model": "good-model", "input": "ping", "stream": False},
+            "responses",
+        )
+
+    assert response.status_code == 200
+    assert json.loads(response.body.decode())["id"] == "ok"
+    assert route.call_count == 2
+    assert "partial" not in seen[0]
+    assert seen[1]["partial"] is False
+
+
 @pytest.mark.asyncio()
 async def test_complex_responses_request_does_not_fallback_to_chat_adapter(gateway):
     gateway.PROVIDERS = [
@@ -513,6 +593,34 @@ async def test_probe_respects_cooldown_and_force_rechecks(gateway):
     assert models_route.call_count == 2
     assert chat_route.call_count == 2
     assert responses_route.call_count == 2
+
+
+@pytest.mark.asyncio()
+@respx.mock
+async def test_responses_probe_retries_missing_partial_generically(gateway):
+    gateway.RESPONSES_COMPAT_DEFAULTS.clear()
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode())
+        seen.append(body)
+        if "partial" not in body:
+            return httpx.Response(
+                400,
+                json={"error": {"code": "MissingParameter", "message": "missing `partial` parameter", "param": "partial"}},
+            )
+        return httpx.Response(200, json={"id": "ok"})
+
+    route = respx.post("https://partial.example/v1/responses").mock(side_effect=handler)
+    provider = {"id": "partial-provider", "base_url": "https://partial.example/v1", "api_key": "sk", "headers": {}}
+
+    result = await gateway.probe_one(provider, "good-model", "good-model", "responses")
+
+    assert result["healthy"] is True
+    assert route.call_count == 2
+    assert "partial" not in seen[0]
+    assert seen[1]["partial"] is False
+    assert gateway.RESPONSES_COMPAT_DEFAULTS["partial-provider"]["partial"] == "stream_bool"
 
 
 @pytest.mark.asyncio()
@@ -1696,6 +1804,127 @@ async def test_responses_stream_adds_completed_event_when_upstream_omits_it(gate
 
 
 @pytest.mark.asyncio()
+async def test_chat_client_stream_from_responses_upstream_handles_split_sse_event(gateway, monkeypatch):
+    gateway.PROVIDERS = [
+        {"id": "p1", "base_url": "https://p1.example/v1", "api_key": "sk-p1", "timeout_seconds": 3, "headers": {}},
+    ]
+    gateway.HEALTH = {
+        "chat": {},
+        "responses": {
+            "good-model": {
+                "p1": {"provider_id": "p1", "actual_model": "good-model", "healthy": True, "priority": 100, "weight": 1},
+            }
+        },
+    }
+    monkeypatch.setattr(gateway, "pick_weighted", lambda candidates: candidates[0])
+
+    class SplitResponsesStream:
+        status_code = 200
+
+        async def aiter_raw(self):
+            yield b'event: response.created\ndata: {"type":"response.created"}\n\n'
+            yield b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"hel'
+            yield b'lo"}\n\n'
+            yield b'event: response.completed\ndata: {"type":"response.completed"}\n\n'
+            yield b"data: [DONE]\n\n"
+
+    class SplitResponsesContext:
+        async def __aenter__(self):
+            return SplitResponsesStream()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class SplitResponsesClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def stream(self, *args, **kwargs):
+            return SplitResponsesContext()
+
+    monkeypatch.setattr(gateway.httpx, "AsyncClient", SplitResponsesClient)
+
+    chunks = [
+        chunk
+        async for chunk in gateway.relay_stream(
+            "/chat/completions",
+            {"model": "good-model", "messages": [{"role": "user", "content": "ping"}], "stream": True},
+            "chat",
+        )
+    ]
+    joined = b"".join(chunks)
+    assert b'"object":"chat.completion.chunk"' in joined
+    assert b'"content":"hello"' in joined
+    assert joined.endswith(b"data: [DONE]\n\n")
+
+
+@pytest.mark.asyncio()
+async def test_responses_client_stream_from_chat_upstream_handles_split_sse_event(gateway, monkeypatch):
+    gateway.PROVIDERS = [
+        {"id": "p1", "base_url": "https://p1.example/v1", "api_key": "sk-p1", "timeout_seconds": 3, "headers": {}},
+    ]
+    gateway.HEALTH = {
+        "chat": {
+            "good-model": {
+                "p1": {"provider_id": "p1", "actual_model": "good-model", "healthy": True, "priority": 100, "weight": 1},
+            }
+        },
+        "responses": {},
+    }
+    monkeypatch.setattr(gateway, "pick_weighted", lambda candidates: candidates[0])
+
+    class SplitChatStream:
+        status_code = 200
+
+        async def aiter_raw(self):
+            yield b'data: {"id":"chatcmpl_test","choices":[{"delta":{"content":"hel'
+            yield b'lo"}}]}\n\n'
+            yield b"data: [DONE]\n\n"
+
+    class SplitChatContext:
+        async def __aenter__(self):
+            return SplitChatStream()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class SplitChatClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def stream(self, *args, **kwargs):
+            return SplitChatContext()
+
+    monkeypatch.setattr(gateway.httpx, "AsyncClient", SplitChatClient)
+
+    chunks = [
+        chunk
+        async for chunk in gateway.relay_stream(
+            "/responses",
+            {"model": "good-model", "input": "ping", "stream": True},
+            "responses",
+        )
+    ]
+    joined = b"".join(chunks)
+    assert b"response.output_text.delta" in joined
+    assert b'"delta":"hello"' in joined
+    assert b"event: response.completed" in joined
+    assert joined.endswith(b"data: [DONE]\n\n")
+
+
+@pytest.mark.asyncio()
 async def test_responses_stream_error_uses_response_failed_event(gateway):
     gateway.HEALTH = {"responses": {}, "chat": {}}
 
@@ -1840,12 +2069,13 @@ async def test_responses_stream_uses_paid_fallback_after_invalid_request(gateway
 
 
 @pytest.mark.asyncio()
-async def test_responses_stream_adds_volces_partial_to_upstream_body(gateway, monkeypatch):
+async def test_responses_stream_retries_missing_partial_and_learns_default(gateway, monkeypatch):
+    gateway.RESPONSES_COMPAT_DEFAULTS.clear()
     gateway.PROVIDERS = [
         {
-            "id": "volces",
-            "base_url": "https://ark.cn-beijing.volces.com/api/coding/v3",
-            "api_key": "sk-volces",
+            "id": "partial-provider",
+            "base_url": "https://partial.example/v1",
+            "api_key": "sk-partial",
             "timeout_seconds": 3,
             "headers": {},
         },
@@ -1853,9 +2083,9 @@ async def test_responses_stream_adds_volces_partial_to_upstream_body(gateway, mo
     gateway.HEALTH = {
         "responses": {
             "deepseek-v4-pro": {
-                "volces": {
-                    "provider_id": "volces",
-                    "base_url": "https://ark.cn-beijing.volces.com/api/coding/v3",
+                "partial-provider": {
+                    "provider_id": "partial-provider",
+                    "base_url": "https://partial.example/v1",
                     "actual_model": "deepseek-v4-pro",
                     "healthy": True,
                     "priority": 100,
@@ -1868,9 +2098,19 @@ async def test_responses_stream_adds_volces_partial_to_upstream_body(gateway, mo
     monkeypatch.setattr(gateway, "pick_weighted", lambda candidates: candidates[0])
 
     with respx.mock:
-        route = respx.post("https://ark.cn-beijing.volces.com/api/coding/v3/responses").mock(
-            return_value=httpx.Response(200, text="event: response.completed\ndata: {}\n\ndata: [DONE]\n\n")
-        )
+        seen = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content.decode())
+            seen.append(body)
+            if "partial" not in body:
+                return httpx.Response(
+                    400,
+                    json={"error": {"code": "MissingParameter", "message": "missing `partial` parameter", "param": "partial"}},
+                )
+            return httpx.Response(200, text="event: response.completed\ndata: {}\n\ndata: [DONE]\n\n")
+
+        route = respx.post("https://partial.example/v1/responses").mock(side_effect=handler)
         chunks = [
             chunk
             async for chunk in gateway.relay_stream(
@@ -1881,8 +2121,10 @@ async def test_responses_stream_adds_volces_partial_to_upstream_body(gateway, mo
         ]
 
     assert b"response.completed" in b"".join(chunks)
-    sent = json.loads(route.calls.last.request.content.decode())
-    assert sent["partial"] is True
+    assert route.call_count == 2
+    assert "partial" not in seen[0]
+    assert seen[1]["partial"] is True
+    assert gateway.RESPONSES_COMPAT_DEFAULTS["partial-provider"]["partial"] == "stream_bool"
 
 
 def make_request(host: str = "example.test") -> Request:
