@@ -182,6 +182,7 @@ Default health-loop and cooldown values:
 - `PROBE_MAX_PER_CYCLE=12`
 - `MODELS_REFRESH_SECONDS=3600`
 - `HEALTH_FRESH_TTL_SECONDS=300`
+- `ADAPTER_SYNTHESIZE_USAGE=true`
 - success cache: 21600 seconds
 - unsupported/not found: 86400 seconds
 - auth/forbidden and quota: 3600 seconds
@@ -414,6 +415,16 @@ event split across multiple upstream network chunks is not dropped. This applies
 to both Chat stream -> Responses stream and Responses stream -> Chat stream.
 Responses `function_call` stream events are converted to Chat `tool_calls`
 deltas instead of being emitted as plain text.
+
+For Chat upstream -> Responses client conversion, Smart Gateway also preserves
+and normalizes usage information. Chat-style `prompt_tokens` /
+`completion_tokens` are mapped to Responses-style `input_tokens` /
+`output_tokens`, while the original keys are kept for OpenAI-compatible
+gateways that still parse chat usage fields. If an upstream stream completes
+without usage, `ADAPTER_SYNTHESIZE_USAGE=true` makes the adapter emit a
+conservative estimated usage on `response.completed` with `estimated: true`.
+This prevents New API from recording successful Responses requests as
+zero-token failures such as `total tokens is 0, cannot consume quota`.
 
 Real validation on 2026-06-13 covered:
 

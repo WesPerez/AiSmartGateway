@@ -891,6 +891,7 @@ upstream_kind: 网关实际选择的上游接口格式
 18. 2026-06-14 继续修复图片/多模态 Chat 请求：Codex 客户端发图时 `messages[].content` 会包含 `image_url`，旧逻辑只接受文本，导致本地候选筛选拒绝 Anyrouter Responses，随后只尝试不可用的 Chat shadow 上游并出现 `stream disconnected before completion: No healthy upstream`。现在 Codex-compatible adapter 会把 Chat `image_url` 转成 Responses `input_image` 并保留 `detail`；普通小 JSON adapter 仍保持文本安全边界。
 19. 路由日志增强：`request_shape` 新增 `message_roles`、`message_content_types`、`has_image_content`，且本地 `no_healthy_upstream` / 流式最终 `all_upstreams_failed` 也会写入 request shape，方便直接判断是否为图片、工具或其它请求形态导致候选被过滤。
 20. 上游对图片输入返回 `400 / param=input / code=invalid_value` 时归类为 `client_invalid_input`，不再作为 provider runtime failure 或 Responses shape invalid 证据，避免坏图或不被接受的 data URL 污染上游健康。
+21. 2026-06-14 排查 Claude Desktop 请求 `mimo-v2.5-pro` 的“一堆 422/报错”时，Gateway 请求日志中该模型最近大量请求是 `200`，且集中为客户端 `/v1/responses` 经 `chat_to_responses` 转到上游 `/chat/completions`。New API 日志/数据库里的异常主因不是 Gateway 返回 HTTP 422，而是 `total tokens is 0, cannot consume quota`：Responses 请求成功完成，但下游计费拿不到 usage，或者拿到的是 Chat 风格 usage 字段导致解析失败。修复改为通用适配层处理：Chat -> Responses 非流式和流式都把 `prompt_tokens` / `completion_tokens` 规范成 `input_tokens` / `output_tokens` / `total_tokens`，同时保留原字段；流式会把 usage 放进 `response.completed.response.usage`。如果上游没有给 usage，默认 `ADAPTER_SYNTHESIZE_USAGE=true` 会按转换后的上游请求体和实际输出文本/tool 参数生成带 `estimated:true` 的估算 usage，避免 New API 把成功请求落成 0 token 计费错误。
 
 ### 当前健康含义
 
@@ -918,6 +919,7 @@ upstream_kind: 网关实际选择的上游接口格式
 - 本地无候选时也会记录 `message_content_types` 和 `has_image_content`。
 - 图片输入的 `client_invalid_input` 不会把 provider 打入冷却。
 - 缺 `partial` 的 Responses provider 在探活、非流式运行时、流式运行时都会通用重试。
+- Chat -> Responses 适配会保留/规范化 usage；上游缺 usage 时会合成带 `estimated:true` 的 Responses usage，覆盖非流式和流式。
 
 真实请求回归：
 
@@ -927,7 +929,7 @@ upstream_kind: 网关实际选择的上游接口格式
 - Anyrouter `gpt-5.5`：普通 Responses 小 JSON 仍返回 `invalid codex request`；Codex-compatible Chat -> Responses 转换已通过。自动路由不是按 Anyrouter 或模型强制，而是根据该 Responses health item 的 `responses_compat_mode=codex` / Codex shape 验证证据选择 `chat -> responses / codex_responses_to_chat`，成功后 health 保留 `responses_compat_mode=codex`。2026-06-14 真实回归中，带 tools 的 Chat stream 返回文本成功；强制 `tool_choice` 调用 `noop` 时，Anyrouter `/responses` 返回的 function_call 流事件已转成 Chat `tool_calls` delta。
 - 管理 API 暴露健康新鲜度字段。
 
-完整验证结果：`87 passed`。
+完整验证结果更新：`105 passed`。
 
 ## 2026-06-14 AI Key Vault 借鉴判断
 

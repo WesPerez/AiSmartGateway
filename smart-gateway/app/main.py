@@ -60,6 +60,7 @@ RESPONSES_INVALID_REQUEST_RETRY_SECONDS = int(os.getenv("RESPONSES_INVALID_REQUE
 RESPONSES_INVALID_REQUEST_COOLDOWN_SECONDS = int(os.getenv("RESPONSES_INVALID_REQUEST_COOLDOWN_SECONDS", "1800"))
 ADAPTIVE_FORMAT_ROUTING = os.getenv("ADAPTIVE_FORMAT_ROUTING", "true").lower() == "true"
 ADAPTER_LATENCY_PENALTY_MS = int(os.getenv("ADAPTER_LATENCY_PENALTY_MS", "250"))
+ADAPTER_SYNTHESIZE_USAGE = os.getenv("ADAPTER_SYNTHESIZE_USAGE", "true").lower() == "true"
 ROUTE_EXPLORATION_RATE = max(0.0, min(1.0, float(os.getenv("ROUTE_EXPLORATION_RATE", "0.15"))))
 ROUTE_EXPLORATION_MAX_CANDIDATES = max(0, int(os.getenv("ROUTE_EXPLORATION_MAX_CANDIDATES", "1")))
 ALLOW_GATEWAY_PROVIDER_WRITE = os.getenv("ALLOW_GATEWAY_PROVIDER_WRITE", "false").lower() == "true"
@@ -115,6 +116,84 @@ def extract_usage(data: Any) -> dict[str, Any]:
             "total_tokens": usage.get("total_tokens"),
         }
     return {}
+
+
+def token_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return max(0, int(value))
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.isdigit():
+            return max(0, int(stripped))
+    return None
+
+
+def normalize_usage_for_responses(usage: Any) -> dict[str, Any] | None:
+    if not isinstance(usage, dict):
+        return None
+    input_tokens = token_int(usage.get("input_tokens"))
+    if input_tokens is None:
+        input_tokens = token_int(usage.get("prompt_tokens")) or 0
+    output_tokens = token_int(usage.get("output_tokens"))
+    if output_tokens is None:
+        output_tokens = token_int(usage.get("completion_tokens")) or 0
+    total_tokens = token_int(usage.get("total_tokens"))
+    if total_tokens is None or total_tokens < input_tokens + output_tokens:
+        total_tokens = input_tokens + output_tokens
+    if total_tokens <= 0:
+        return None
+    normalized = dict(usage)
+    normalized["input_tokens"] = input_tokens
+    normalized["output_tokens"] = output_tokens
+    normalized["total_tokens"] = total_tokens
+    # Some OpenAI-compatible gateways still parse chat-style keys even on
+    # Responses payloads; keeping both prevents downstream zero-token logs.
+    normalized.setdefault("prompt_tokens", input_tokens)
+    normalized.setdefault("completion_tokens", output_tokens)
+    return normalized
+
+
+_DATA_URL_RE = re.compile(r"data:[^,\s]+;base64,[A-Za-z0-9+/=\s]+")
+
+
+def usage_estimate_text(value: Any) -> str:
+    if value is None:
+        return ""
+    try:
+        text = json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+    except Exception:
+        text = str(value)
+    return _DATA_URL_RE.sub("data:attachment;base64,[omitted]", text)
+
+
+def approximate_token_count(value: Any) -> int:
+    text = usage_estimate_text(value)
+    if not text:
+        return 0
+    cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
+    non_cjk = max(0, len(text) - cjk)
+    return max(1, cjk + ((non_cjk + 3) // 4))
+
+
+def synthesize_responses_usage(request_body: Any, output_value: Any) -> dict[str, Any] | None:
+    if not ADAPTER_SYNTHESIZE_USAGE:
+        return None
+    input_tokens = approximate_token_count(request_body)
+    output_tokens = approximate_token_count(output_value)
+    if input_tokens <= 0 and output_tokens <= 0:
+        return None
+    output_tokens = max(1, output_tokens)
+    total_tokens = input_tokens + output_tokens
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+        "prompt_tokens": input_tokens,
+        "completion_tokens": output_tokens,
+        "estimated": True,
+    }
 
 
 async def append_request_log(entry: dict[str, Any]) -> None:
@@ -305,6 +384,7 @@ def response_stream_event(
     status: str,
     error_type: str | None = None,
     message: str | None = None,
+    usage: dict[str, Any] | None = None,
 ) -> bytes:
     response: dict[str, Any] = {
         "id": request_id,
@@ -313,6 +393,8 @@ def response_stream_event(
         "status": status,
         "model": model or "",
     }
+    if usage:
+        response["usage"] = usage
     payload: dict[str, Any] = {"type": event_type, "response": response}
     if error_type or message:
         payload["error"] = {"type": error_type or "api_error", "message": message or error_type or "stream failed"}
@@ -321,8 +403,8 @@ def response_stream_event(
     return f"event: {event_type}\ndata: {data}\n\n".encode("utf-8")
 
 
-def response_completed_event(request_id: str, model: str | None) -> bytes:
-    return response_stream_event("response.completed", request_id, model, "completed")
+def response_completed_event(request_id: str, model: str | None, usage: dict[str, Any] | None = None) -> bytes:
+    return response_stream_event("response.completed", request_id, model, "completed", usage=usage)
 
 
 def response_failed_event(request_id: str, model: str | None, error_type: str, message: str) -> bytes:
@@ -2236,11 +2318,17 @@ def extract_responses_output_text(data: Any) -> str:
     return "".join(parts)
 
 
-def convert_chat_response_to_responses(data: Any, request_id: str, model: str | None) -> dict[str, Any]:
+def convert_chat_response_to_responses(
+    data: Any,
+    request_id: str,
+    model: str | None,
+    request_body: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     text = extract_chat_response_text(data)
     response_id = data.get("id") if isinstance(data, dict) and data.get("id") else request_id
-    usage = data.get("usage") if isinstance(data, dict) and isinstance(data.get("usage"), dict) else None
+    usage = normalize_usage_for_responses(data.get("usage")) if isinstance(data, dict) else None
     output: list[dict[str, Any]] = []
+    tool_usage_parts: list[Any] = []
     if text:
         output.append(
             {
@@ -2265,6 +2353,7 @@ def convert_chat_response_to_responses(data: Any, request_id: str, model: str | 
             arguments = function.get("arguments")
             if not isinstance(arguments, str):
                 arguments = json.dumps(arguments or {}, ensure_ascii=False, separators=(",", ":"))
+            tool_usage_parts.append({"name": name, "arguments": arguments})
             call_id = str(call.get("id") or f"call_{uuid.uuid4().hex[:16]}")
             output.append(
                 {
@@ -2294,6 +2383,8 @@ def convert_chat_response_to_responses(data: Any, request_id: str, model: str | 
         "output": output,
         "output_text": text,
     }
+    if not usage and request_body is not None:
+        usage = synthesize_responses_usage(request_body, {"text": text, "tool_calls": tool_usage_parts})
     if usage:
         response["usage"] = usage
     return response
@@ -2352,12 +2443,19 @@ def convert_responses_response_to_chat(data: Any, request_id: str, model: str | 
     return response
 
 
-def convert_upstream_response_for_client(data: Any, chosen: dict[str, Any], client_kind: str, request_id: str, model: str | None) -> Any:
+def convert_upstream_response_for_client(
+    data: Any,
+    chosen: dict[str, Any],
+    client_kind: str,
+    request_id: str,
+    model: str | None,
+    request_body: dict[str, Any] | None = None,
+) -> Any:
     upstream_kind = chosen.get("_upstream_kind") or client_kind
     if upstream_kind == client_kind:
         return data
     if client_kind == "responses" and upstream_kind == "chat":
-        return convert_chat_response_to_responses(data, request_id, model)
+        return convert_chat_response_to_responses(data, request_id, model, request_body)
     if client_kind == "chat" and upstream_kind == "responses":
         return convert_responses_response_to_chat(data, request_id, model)
     return data
@@ -2395,6 +2493,27 @@ def raw_response_sse_event(event_type: str, data: dict[str, Any]) -> bytes:
     return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False, separators=(',', ':'))}\n\n".encode()
 
 
+def chat_to_responses_usage(state: dict[str, Any]) -> dict[str, Any] | None:
+    usage = normalize_usage_for_responses(state.get("responses_usage"))
+    if usage:
+        return usage
+    output_value = {
+        "text": "".join(state.get("response_output_parts") or []),
+        "tool_arguments": "".join(state.get("response_tool_argument_parts") or []),
+    }
+    usage = synthesize_responses_usage(state.get("request_body"), output_value)
+    if usage:
+        state["responses_usage"] = usage
+    return usage
+
+
+def chat_to_responses_completed_event(request_id: str, model: str | None, state: dict[str, Any]) -> bytes:
+    if state.get("response_completed_sent"):
+        return b""
+    state["response_completed_sent"] = True
+    return response_completed_event(request_id, model, chat_to_responses_usage(state))
+
+
 def chat_stream_chunk_to_responses(
     chunk: bytes,
     request_id: str,
@@ -2405,17 +2524,22 @@ def chat_stream_chunk_to_responses(
     out = bytearray()
     for payload in iter_sse_data_payloads(chunk.decode("utf-8", "ignore")):
         if payload == "[DONE]":
+            out.extend(chat_to_responses_completed_event(request_id, model, state))
             continue
         try:
             data = json.loads(payload)
         except Exception:
             continue
+        usage = normalize_usage_for_responses(data.get("usage"))
+        if usage:
+            state["responses_usage"] = usage
         for choice in data.get("choices") or []:
             if not isinstance(choice, dict):
                 continue
             delta_obj = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
             delta = delta_obj.get("content")
             if delta:
+                state.setdefault("response_output_parts", []).append(str(delta))
                 event_data = {"type": "response.output_text.delta", "delta": delta}
                 out.extend(raw_response_sse_event("response.output_text.delta", event_data))
             for call in delta_obj.get("tool_calls") or []:
@@ -2438,6 +2562,7 @@ def chat_stream_chunk_to_responses(
                         )
                     )
                 if arguments:
+                    state.setdefault("response_tool_argument_parts", []).append(arguments)
                     out.extend(
                         raw_response_sse_event(
                             "response.function_call_arguments.delta",
@@ -2603,13 +2728,20 @@ def responses_stream_chunk_to_chat(
 
 
 class StreamFormatAdapter:
-    def __init__(self, chosen: dict[str, Any], client_kind: str, request_id: str, model: str | None):
+    def __init__(
+        self,
+        chosen: dict[str, Any],
+        client_kind: str,
+        request_id: str,
+        model: str | None,
+        request_body: dict[str, Any] | None = None,
+    ):
         self.chosen = chosen
         self.client_kind = client_kind
         self.request_id = request_id
         self.model = model
         self.buffer = b""
-        self.state: dict[str, Any] = {}
+        self.state: dict[str, Any] = {"request_body": request_body}
 
     def feed(self, chunk: bytes) -> bytes:
         upstream_kind = self.chosen.get("_upstream_kind") or self.client_kind
@@ -2631,6 +2763,12 @@ class StreamFormatAdapter:
         if not pending.endswith((b"\n\n", b"\r\n\r\n")):
             pending += b"\n\n"
         return convert_stream_chunk_for_client(pending, self.chosen, self.client_kind, self.request_id, self.model, self.state)
+
+    def completion_event(self) -> bytes:
+        upstream_kind = self.chosen.get("_upstream_kind") or self.client_kind
+        if self.client_kind == "responses" and upstream_kind == "chat":
+            return chat_to_responses_completed_event(self.request_id, self.model, self.state)
+        return response_completed_event(self.request_id, self.model)
 
 
 def convert_stream_chunk_for_client(
@@ -3900,7 +4038,7 @@ async def relay_non_stream(
                 data = None
             if 200 <= response.status_code < 300 and not response_has_error_json(data):
                 await mark_runtime_success(upstream_kind, model, chosen["provider_id"], latency_ms, bool(chosen.get("_codex_compat_adapter")))
-                client_data = convert_upstream_response_for_client(data, chosen, kind, request_id, model)
+                client_data = convert_upstream_response_for_client(data, chosen, kind, request_id, model, req_body)
                 await append_request_log(
                     {
                         "request_id": request_id,
@@ -4111,7 +4249,7 @@ async def relay_stream(
                                 )
                                 break
 
-                            stream_adapter = StreamFormatAdapter(chosen, kind, request_id, model)
+                            stream_adapter = StreamFormatAdapter(chosen, kind, request_id, model, req_body)
                             first = None
                             raw_chunks = response.aiter_raw()
                             async for chunk in raw_chunks:
@@ -4186,7 +4324,9 @@ async def relay_stream(
                                     response_completed = True
                                 yield converted
                             if kind == "responses" and not response_completed:
-                                yield response_completed_event(request_id, model)
+                                completion = stream_adapter.completion_event()
+                                if completion:
+                                    yield completion
                             if not done_sent:
                                 yield b"data: [DONE]\n\n"
                             return

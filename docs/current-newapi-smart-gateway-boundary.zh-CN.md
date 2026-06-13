@@ -142,6 +142,7 @@ Smart Gateway 后台是路由运维视图，不是第二套用户/令牌/订阅�
 6. 转换路径带 `ADAPTER_LATENCY_PENALTY_MS`，默认 250ms；路由日志会记录 `upstream_kind`、`format_adapter`、`message_content_types`、`tool_types` 和 `tool_key_sets`，便于判断是否发生了跨格式转换以及工具协议来源。
 7. Chat stream + tools 的路由判断按单个 health item 执行：同一请求可同时拥有规范化 Chat 候选、普通 Responses 候选和 Codex-compatible Responses 候选；最终按路由组、优先级、权重、延迟和 adapter penalty 选择，并在失败时继续尝试下一个候选。
 8. 图片输入被上游判为 `param=input / invalid_value`，或工具 schema 被上游判为 `missing tools.function` 这类请求形态错误时，按客户端输入/形态不兼容处理，不写坏 provider 健康，也不进入运行时冷却。
+9. Chat 上游转 Responses 客户端时，返回文本、工具调用和 usage 都要转换。Chat usage 会规范成 Responses 的 `input_tokens` / `output_tokens` / `total_tokens`，并保留 `prompt_tokens` / `completion_tokens` 兼容 New API；如果上游没有返回 usage，默认 `ADAPTER_SYNTHESIZE_USAGE=true` 会在 `response.completed` 里带一个 `estimated:true` 的估算 usage，避免 New API 把成功请求记录成 `total tokens is 0, cannot consume quota`。
 
 ## 应急写入
 

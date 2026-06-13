@@ -532,6 +532,9 @@ async def test_responses_request_with_image_and_tools_can_use_chat_upstream(gate
     payload = json.loads(response.body.decode())
     assert payload["object"] == "response"
     assert payload["output_text"] == "image ok"
+    assert payload["usage"]["estimated"] is True
+    assert payload["usage"]["input_tokens"] > 0
+    assert payload["usage"]["output_tokens"] > 0
     logs = gateway.read_recent_request_logs()
     assert logs[0]["kind"] == "responses"
     assert logs[0]["upstream_kind"] == "chat"
@@ -573,6 +576,24 @@ def test_chat_tool_calls_convert_to_responses_function_calls(gateway):
         }
     ]
     assert converted["output_text"] == ""
+
+
+def test_chat_usage_converts_to_responses_usage_shape(gateway):
+    converted = gateway.convert_chat_response_to_responses(
+        {
+            "id": "chat-ok",
+            "choices": [{"message": {"role": "assistant", "content": "pong"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 3, "total_tokens": 11},
+        },
+        "gw_test",
+        "good-model",
+    )
+
+    assert converted["usage"]["input_tokens"] == 8
+    assert converted["usage"]["output_tokens"] == 3
+    assert converted["usage"]["total_tokens"] == 11
+    assert converted["usage"]["prompt_tokens"] == 8
+    assert converted["usage"]["completion_tokens"] == 3
 
 
 @pytest.mark.asyncio()
@@ -2981,6 +3002,141 @@ async def test_responses_client_stream_from_chat_upstream_handles_split_sse_even
     assert b'"delta":"hello"' in joined
     assert b"event: response.completed" in joined
     assert joined.endswith(b"data: [DONE]\n\n")
+
+
+@pytest.mark.asyncio()
+async def test_responses_client_stream_from_chat_upstream_preserves_usage(gateway, monkeypatch):
+    gateway.PROVIDERS = [
+        {"id": "p1", "base_url": "https://p1.example/v1", "api_key": "sk-p1", "timeout_seconds": 3, "headers": {}},
+    ]
+    gateway.HEALTH = {
+        "chat": {
+            "good-model": {
+                "p1": {"provider_id": "p1", "actual_model": "good-model", "healthy": True, "priority": 100, "weight": 1},
+            }
+        },
+        "responses": {},
+    }
+    monkeypatch.setattr(gateway, "pick_weighted", lambda candidates: candidates[0])
+
+    class UsageChatStream:
+        status_code = 200
+
+        async def aiter_raw(self):
+            yield b'data: {"id":"chatcmpl_test","choices":[{"delta":{"content":"hello"}}]}\n\n'
+            yield (
+                b'data: {"id":"chatcmpl_test","choices":[],"usage":'
+                b'{"prompt_tokens":11,"completion_tokens":2,"total_tokens":13}}\n\n'
+            )
+            yield b"data: [DONE]\n\n"
+
+    class UsageChatContext:
+        async def __aenter__(self):
+            return UsageChatStream()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class UsageChatClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def stream(self, *args, **kwargs):
+            return UsageChatContext()
+
+    monkeypatch.setattr(gateway.httpx, "AsyncClient", UsageChatClient)
+
+    chunks = [
+        chunk
+        async for chunk in gateway.relay_stream(
+            "/responses",
+            {"model": "good-model", "input": "ping", "stream": True},
+            "responses",
+        )
+    ]
+    payloads = [
+        json.loads(payload)
+        for payload in gateway.iter_sse_data_payloads(b"".join(chunks).decode())
+        if payload != "[DONE]"
+    ]
+    completed = next(item for item in payloads if item.get("type") == "response.completed")
+    usage = completed["response"]["usage"]
+    assert usage["input_tokens"] == 11
+    assert usage["output_tokens"] == 2
+    assert usage["total_tokens"] == 13
+    assert usage["prompt_tokens"] == 11
+    assert usage["completion_tokens"] == 2
+
+
+@pytest.mark.asyncio()
+async def test_responses_client_stream_from_chat_upstream_synthesizes_missing_usage(gateway, monkeypatch):
+    gateway.PROVIDERS = [
+        {"id": "p1", "base_url": "https://p1.example/v1", "api_key": "sk-p1", "timeout_seconds": 3, "headers": {}},
+    ]
+    gateway.HEALTH = {
+        "chat": {
+            "good-model": {
+                "p1": {"provider_id": "p1", "actual_model": "good-model", "healthy": True, "priority": 100, "weight": 1},
+            }
+        },
+        "responses": {},
+    }
+    monkeypatch.setattr(gateway, "pick_weighted", lambda candidates: candidates[0])
+
+    class NoUsageChatStream:
+        status_code = 200
+
+        async def aiter_raw(self):
+            yield b'data: {"id":"chatcmpl_test","choices":[{"delta":{"content":"hello"}}]}\n\n'
+            yield b"data: [DONE]\n\n"
+
+    class NoUsageChatContext:
+        async def __aenter__(self):
+            return NoUsageChatStream()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class NoUsageChatClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def stream(self, *args, **kwargs):
+            return NoUsageChatContext()
+
+    monkeypatch.setattr(gateway.httpx, "AsyncClient", NoUsageChatClient)
+
+    chunks = [
+        chunk
+        async for chunk in gateway.relay_stream(
+            "/responses",
+            {"model": "good-model", "input": "ping", "stream": True},
+            "responses",
+        )
+    ]
+    payloads = [
+        json.loads(payload)
+        for payload in gateway.iter_sse_data_payloads(b"".join(chunks).decode())
+        if payload != "[DONE]"
+    ]
+    completed = next(item for item in payloads if item.get("type") == "response.completed")
+    usage = completed["response"]["usage"]
+    assert usage["estimated"] is True
+    assert usage["input_tokens"] > 0
+    assert usage["output_tokens"] > 0
+    assert usage["total_tokens"] == usage["input_tokens"] + usage["output_tokens"]
 
 
 @pytest.mark.asyncio()
