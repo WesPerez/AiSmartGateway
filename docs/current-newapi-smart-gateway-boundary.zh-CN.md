@@ -79,9 +79,15 @@ Smart Gateway 后台是路由运维视图，不是第二套用户/令牌/订阅�
 当前 Smart Gateway 后台顶级页签中，模型相关视图为：
 
 - `模型可用性`：包含 `按模型` 和 `按上游` 两个视角。两者读取同一健康矩阵，只是面向日常确认和排障的不同展示，不再拆成两个顶级页签。
-- `探测矩阵`：展示原始探测记录，并带健康策略说明。说明区展示探测间隔、单轮预算、超时、Responses 二段验证、真实请求三次确认和各类冷却时间。
+- `探测矩阵`：展示原始探测记录，并带健康策略说明。说明区展示探测间隔、单轮预算、超时、健康新鲜窗口、Responses 二段验证、真实请求三次确认、跨格式路由和各类冷却时间。
 
 `模型可用性` 默认只显示至少一个接口健康的模型或上游模型；勾选“显示异常”后展示异常项。表格使用固定列宽，避免异常详情过长时列宽跳动。
+
+健康项现在额外展示新鲜度：
+
+- `实时`：最近 `HEALTH_FRESH_TTL_SECONDS` 内有探测或真实请求成功，默认 300 秒。
+- `缓存`：仍在成功 TTL 内，但已经超过实时新鲜窗口；可路由，但排障时应关注下次探测时间。
+- `冷却` / `待探测` / `未知`：分别表示失败冷却、等待探测预算或尚无可靠检测记录。
 
 ## 多 Base URL
 
@@ -115,6 +121,20 @@ Smart Gateway 后台是路由运维视图，不是第二套用户/令牌/订阅�
 - Responses 真实形态确认不兼容：1800 秒。
 
 如果某上游只支持 Claude Code / Anthropic Messages / Chat 形态，但 `/responses` 返回 `not implemented`，不能因为加了客户端 header 就把 Responses 标健康。该上游应按实际可用接口展示。
+
+## 自适应格式路由
+
+健康矩阵仍按 `chat` 和 `responses` 独立记录上游原生能力，但运行时路由不再把客户端入口和上游入口硬绑定。
+
+当前规则：
+
+1. 客户端请求格式保持不变；返回格式也保持客户端请求的格式。
+2. 原生健康路径优先，例如 `/v1/responses` 优先选择 Responses 健康上游。
+3. 如果请求是安全文本形态，网关可以选择另一个接口类型的健康上游：
+   - Responses 客户端请求可转成 Chat 上游请求，再把 Chat 响应转回 Responses。
+   - Chat 客户端请求可转成 Responses 上游请求，再把 Responses 响应转回 Chat Completions。
+4. 带工具调用、function calling、`reasoning`、`include`、`prompt_cache_key`、`previous_response_id`、Codex encrypted reasoning 等复杂字段时，不做降级转换，必须走原生 Responses。
+5. 转换路径带 `ADAPTER_LATENCY_PENALTY_MS`，默认 250ms；路由日志会记录 `upstream_kind` 和 `format_adapter`，便于判断是否发生了跨格式转换。
 
 ## 应急写入
 

@@ -866,6 +866,7 @@ ADMIN_HTML = """
                 <th>格式</th>
                 <th>探测路径</th>
                 <th>状态</th>
+                <th>新鲜度</th>
                 <th>延迟</th>
                 <th>最近检测</th>
                 <th>下次探测</th>
@@ -1578,11 +1579,15 @@ ADMIN_HTML = """
       const maxPerCycle = Number(policy.probe_max_per_cycle || 0);
       const confirmations = Number(policy.responses_invalid_request_confirmations || 3);
       const responsesProbe = policy.enable_responses_probe === false ? "Responses 探测关闭" : "Responses 开启二段形态验证";
+      const freshTtl = formatDuration(policy.health_fresh_ttl_seconds);
+      const adaptiveRouting = policy.adaptive_format_routing === false ? "跨格式路由关闭" : `跨格式自适应开启，转换延迟惩罚 ${Number(policy.adapter_latency_penalty_ms || 0)}ms`;
       const cooldown = (key) => formatDuration(cooldowns[key]);
       const visible = [
         `每 ${interval || "-"} 增量探测，最多 ${maxPerCycle || "-"} 项`,
+        `实时新鲜窗口 ${freshTtl || "-"}`,
         "健康 = 2xx 且响应无 error",
         `${responsesProbe}`,
+        adaptiveRouting,
         `真实请求成功会立即刷新健康；Responses 同形态 ${confirmations} 次失败才确认不兼容`
       ];
       el.innerHTML = `
@@ -1598,6 +1603,8 @@ ADMIN_HTML = """
                 <li><span class="policy-key">Chat 判定</span><span>按配置请求 ${escapeHtml((data.health_policy || {}).chat_path || "/chat/completions")}；HTTP 2xx 且响应 JSON 没有 error 就是健康。</span></li>
                 <li><span class="policy-key">Responses 判定</span><span>先用轻量探测请求 ${escapeHtml((data.health_policy || {}).responses_path || "/responses")}；如果上游返回 invalid codex request，会追加一次 Codex 真实诊断形态探测，诊断成功就标健康。</span></li>
                 <li><span class="policy-key">运行时反馈</span><span>真实业务请求成功会把对应上游立即标为 ok；运行时失败会写入 runtime_failure 并进入对应冷却。</span></li>
+                <li><span class="policy-key">健康新鲜度</span><span>最近 ${escapeHtml(freshTtl || "-")} 内成功验证显示为实时健康；超过该窗口但仍在成功 TTL 内显示为缓存健康，表示可路由但需要关注复查时间。</span></li>
+                <li><span class="policy-key">跨格式路由</span><span>${escapeHtml(adaptiveRouting)}。客户端请求格式保持不变，网关可在安全文本形态下选择另一个接口类型的健康上游，并把响应转回客户端格式；工具、reasoning、Codex 高级字段不会降级转换。</span></li>
                 <li><span class="policy-key">形态确认</span><span>Responses 的真实请求同一形态连续 ${escapeHtml(confirmations)} 次 invalid_request 后，才确认为 real_shape_invalid；确认前仍会在付费兜底前做验证。</span></li>
                 <li><span class="policy-key">路由使用</span><span>常规路由优先使用健康项；pending/probe_budget_exhausted 或待验证 Responses 可进入影子/探测重试桶；real_shape_invalid 冷却期内不自动抢在付费兜底前。</span></li>
               </ul>
@@ -1644,6 +1651,21 @@ ADMIN_HTML = """
       if (filters.status === "unhealthy" && item.healthy) return false;
       if (!matrixTextMatches(filters.modelKeyword, [entry.model, item.actual_model])) return false;
       return matrixTextMatches(filters.upstreamKeyword, [item.provider_name, item.provider_id]);
+    }
+
+    function freshnessChip(data) {
+      const status = data?.health_freshness || "";
+      const age = data?.health_age_seconds == null ? "" : ` ${formatDuration(data.health_age_seconds)}`;
+      const labels = {
+        fresh_ok: ["ok", "实时"],
+        stale_ok: ["warn", "缓存"],
+        cooldown: ["warn", "冷却"],
+        probing: ["dark", "待探测"],
+        stale_fail: ["bad", "过期异常"],
+        unknown: ["dark", "未知"]
+      };
+      const [cls, text] = labels[status] || labels.unknown;
+      return `<span class="chip ${cls}" title="距离最近检测${escapeHtml(age || '未知')}">${text}${escapeHtml(age)}</span>`;
     }
 
     function renderMatrixFilterState(total, filtered) {
@@ -1694,6 +1716,7 @@ ADMIN_HTML = """
                 <td class="mono">${item.request_format || ""}</td>
                 <td class="mono">${item.probe_path || ""}</td>
                 <td>${statusPill(!!item.healthy)}</td>
+                <td>${freshnessChip(item)}</td>
                 <td>${item.latency_ms == null ? "" : item.latency_ms + " ms"}</td>
                 <td>${formatTs(item.checked_at, "未检测")}</td>
                 <td>${formatTs(item.next_probe_at)}</td>
@@ -1701,7 +1724,7 @@ ADMIN_HTML = """
               </tr>
             `);
       }
-      $("matrixBody").innerHTML = rows.length ? rows.join("") : '<tr><td colspan="12" class="muted">无匹配探测记录</td></tr>';
+      $("matrixBody").innerHTML = rows.length ? rows.join("") : '<tr><td colspan="13" class="muted">无匹配探测记录</td></tr>';
       renderPager("matrix", page.total, page.totalPages);
     }
 
@@ -1746,7 +1769,10 @@ ADMIN_HTML = """
               shape_invalid_count: Number(item.shape_invalid_count || 0),
               shape_invalid_required: Number(item.shape_invalid_required || 3),
               shape_invalid_last_at: item.shape_invalid_last_at,
-              shape_verification_source: item.shape_verification_source || ""
+              shape_verification_source: item.shape_verification_source || "",
+              health_freshness: item.health_freshness || "",
+              health_age_seconds: item.health_age_seconds,
+              health_fresh: item.health_fresh === true
             };
             row.total_count += 1;
             if (item.healthy) row.healthy_count += 1;
@@ -1784,7 +1810,8 @@ ADMIN_HTML = """
       const realShapeInvalid = kind === "responses" && ["real_shape_invalid", "runtime_failure:real_shape_invalid"].includes(data.reason || "");
       const cls = data.healthy ? "ok" : (requestShapeUnverified ? "dark" : "warn");
       const text = data.healthy ? "健康" : (realShapeInvalid ? "形态不兼容" : (requestShapeUnverified ? "待真实请求验证" : "异常"));
-      return `<span class="chip ${cls}">${kind} ${text}${data.latency_ms == null ? "" : " " + data.latency_ms + "ms"}</span>`;
+      const freshness = data.health_freshness === "fresh_ok" ? "实时" : data.health_freshness === "stale_ok" ? "缓存" : data.health_freshness === "cooldown" ? "冷却" : "";
+      return `<span class="chip ${cls}">${kind} ${text}${freshness ? " " + freshness : ""}${data.latency_ms == null ? "" : " " + data.latency_ms + "ms"}</span>`;
     }
 
     function cooldownSeconds(data) {

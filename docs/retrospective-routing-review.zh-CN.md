@@ -849,3 +849,54 @@ model_exclude:
 - 仍需要把 request-shape verification 从 route bucket 抽象成健康子状态。
 - 仍需要把真实 Codex shape 诊断做成后台可操作功能，并脱敏保存模板。
 - 仍需要用字段级 diff 验证完整链路是否改变了 Codex body/header。
+
+## 2026-06-13 自适应格式路由与健康新鲜度
+
+### 新问题
+
+用户进一步指出：上游可能随时不可用，也可能随时恢复。运营上真正需要看到的是健康状态的实时变化，而不是只看长 TTL 缓存。同时，客户端不应该因为某个上游只支持 Chat 或 Responses 就频繁改请求方式；网关应该尽量自行选择可用且低延迟的上游格式，并把响应转回客户端期望的格式。
+
+### 重新梳理后的判断
+
+健康矩阵仍然必须保留 `chat` 和 `responses` 两个维度，因为它们代表上游原生能力，不能简单合并。一个上游 Chat 健康不等于 Responses 健康，尤其是 Codex/Responses 的真实请求形态可能包含 `reasoning`、`include`、工具和 Codex metadata。
+
+但运行时路由不应该继续把“客户端入口格式”和“上游入口格式”硬绑定。更合理的模型是：
+
+```text
+client_kind: 客户端发来的格式，也是网关最终返回的格式
+upstream_kind: 网关实际选择的上游接口格式
+```
+
+### 已执行优化
+
+1. 新增自适应格式路由，默认开启。
+2. 原生格式仍优先；跨格式候选会增加 `ADAPTER_LATENCY_PENALTY_MS`，默认 250ms。
+3. `/v1/responses` 可以在安全文本形态下选择健康 Chat 上游，再把 Chat 响应转回 Responses。
+4. `/v1/chat/completions` 可以在安全文本形态下选择健康 Responses 上游，再把 Responses 响应转回 Chat Completions。
+5. 带工具调用、function calling、`reasoning`、`include`、`prompt_cache_key`、`previous_response_id`、Codex encrypted reasoning 等复杂字段时，不做降级转换，必须走原生 Responses。
+6. 路由日志新增 `upstream_kind`、`format_adapter`、`adapter_latency_penalty_ms`，用于判断是否发生了转换。
+7. 成功和失败反写健康时，写入实际 `upstream_kind`，避免 Chat 失败污染 Responses 健康，或反过来。
+8. 管理 API 对 health item 动态补充 `health_age_seconds`、`health_fresh`、`health_freshness`、`health_fresh_ttl_seconds`，不污染持久化 health state。
+9. 探测矩阵新增“新鲜度”列；模型可用性按上游视角的接口 chip 会显示实时、缓存或冷却。
+10. 健康策略说明新增实时新鲜窗口和跨格式路由说明。
+
+### 当前健康含义
+
+健康状态现在应按两层理解：
+
+- `healthy=true`：该 provider/model/kind 最近一次有效证据认为可用，路由可以使用。
+- `health_freshness=fresh_ok`：最近 `HEALTH_FRESH_TTL_SECONDS` 内验证过，默认 300 秒，更接近实时。
+- `health_freshness=stale_ok`：仍在成功 TTL 内，但已经超过实时新鲜窗口，是缓存健康。
+- `cooldown` / `probing` / `unknown`：分别表示失败冷却、等待探测预算、尚无可靠检测记录。
+
+### 验证
+
+新增测试覆盖：
+
+- 基础 Chat/Responses body 安全转换。
+- 复杂 Responses body 不降级到 Chat。
+- Responses 客户端请求使用 Chat 上游并转回 Responses。
+- Chat 客户端请求使用 Responses 上游并转回 Chat。
+- 管理 API 暴露健康新鲜度字段。
+
+完整验证结果：`68 passed`。

@@ -51,9 +51,12 @@ PROBE_RATE_LIMIT_TTL_SECONDS = int(os.getenv("PROBE_RATE_LIMIT_TTL_SECONDS", "18
 PROBE_SERVER_ERROR_TTL_SECONDS = int(os.getenv("PROBE_SERVER_ERROR_TTL_SECONDS", "900"))
 PROBE_EXCEPTION_TTL_SECONDS = int(os.getenv("PROBE_EXCEPTION_TTL_SECONDS", "900"))
 PROBE_UNKNOWN_ERROR_TTL_SECONDS = int(os.getenv("PROBE_UNKNOWN_ERROR_TTL_SECONDS", "1800"))
+HEALTH_FRESH_TTL_SECONDS = int(os.getenv("HEALTH_FRESH_TTL_SECONDS", "300"))
 RESPONSES_INVALID_REQUEST_CONFIRMATIONS = max(1, int(os.getenv("RESPONSES_INVALID_REQUEST_CONFIRMATIONS", "3")))
 RESPONSES_INVALID_REQUEST_RETRY_SECONDS = int(os.getenv("RESPONSES_INVALID_REQUEST_RETRY_SECONDS", "60"))
 RESPONSES_INVALID_REQUEST_COOLDOWN_SECONDS = int(os.getenv("RESPONSES_INVALID_REQUEST_COOLDOWN_SECONDS", "1800"))
+ADAPTIVE_FORMAT_ROUTING = os.getenv("ADAPTIVE_FORMAT_ROUTING", "true").lower() == "true"
+ADAPTER_LATENCY_PENALTY_MS = int(os.getenv("ADAPTER_LATENCY_PENALTY_MS", "250"))
 ROUTE_EXPLORATION_RATE = max(0.0, min(1.0, float(os.getenv("ROUTE_EXPLORATION_RATE", "0.15"))))
 ROUTE_EXPLORATION_MAX_CANDIDATES = max(0, int(os.getenv("ROUTE_EXPLORATION_MAX_CANDIDATES", "1")))
 ALLOW_GATEWAY_PROVIDER_WRITE = os.getenv("ALLOW_GATEWAY_PROVIDER_WRITE", "false").lower() == "true"
@@ -672,6 +675,9 @@ def health_policy_summary() -> dict[str, Any]:
         "models_refresh_seconds": MODELS_REFRESH_SECONDS,
         "enable_responses_probe": ENABLE_RESPONSES_PROBE,
         "min_healthy_providers": MIN_HEALTHY_PROVIDERS,
+        "health_fresh_ttl_seconds": HEALTH_FRESH_TTL_SECONDS,
+        "adaptive_format_routing": ADAPTIVE_FORMAT_ROUTING,
+        "adapter_latency_penalty_ms": ADAPTER_LATENCY_PENALTY_MS,
         "chat_path": chat_probe.get("path") or "/chat/completions",
         "responses_path": responses_probe.get("path") or "/responses",
         "responses_invalid_request_confirmations": RESPONSES_INVALID_REQUEST_CONFIRMATIONS,
@@ -688,6 +694,45 @@ def health_policy_summary() -> dict[str, Any]:
             "unknown": PROBE_UNKNOWN_ERROR_TTL_SECONDS,
         },
     }
+
+
+def health_freshness_fields(item: dict[str, Any], current_time: float | None = None) -> dict[str, Any]:
+    current_time = now() if current_time is None else current_time
+    checked_at = item.get("checked_at")
+    next_probe_at = item.get("next_probe_at")
+    checked = float(checked_at or 0)
+    age = int(max(0, current_time - checked)) if checked else None
+    reason = str(item.get("reason") or item.get("skip_reason") or "")
+    healthy = bool(item.get("healthy"))
+    if not checked:
+        status = "unknown"
+    elif healthy and age is not None and age <= HEALTH_FRESH_TTL_SECONDS:
+        status = "fresh_ok"
+    elif healthy:
+        status = "stale_ok"
+    elif reason in {"pending_probe", "probe_budget_exhausted"}:
+        status = "probing"
+    elif next_probe_at and float(next_probe_at or 0) > current_time:
+        status = "cooldown"
+    else:
+        status = "stale_fail"
+    return {
+        "health_age_seconds": age,
+        "health_fresh": status == "fresh_ok",
+        "health_freshness": status,
+        "health_fresh_ttl_seconds": HEALTH_FRESH_TTL_SECONDS,
+    }
+
+
+def health_with_freshness() -> dict[str, Any]:
+    current_time = now()
+    data = deepcopy(HEALTH)
+    for kind_group in data.values():
+        for model_group in (kind_group or {}).values():
+            for item in (model_group or {}).values():
+                if isinstance(item, dict):
+                    item.update(health_freshness_fields(item, current_time))
+    return data
 
 
 def model_sort_rank(model: str) -> tuple[int, tuple[int, ...], str]:
@@ -977,6 +1022,346 @@ def classify_error(status_code: int, text: str) -> str:
 
 def response_has_error_json(data: Any) -> bool:
     return isinstance(data, dict) and bool(data.get("error"))
+
+
+def upstream_path_for_kind(kind: str) -> str:
+    return "/responses" if kind == "responses" else "/chat/completions"
+
+
+def safe_text_from_content(content: Any) -> str | None:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+                continue
+            if not isinstance(part, dict):
+                return None
+            part_type = str(part.get("type") or "")
+            if part_type in {"text", "input_text", "output_text"}:
+                parts.append(str(part.get("text") or ""))
+            else:
+                return None
+        return "\n".join(text for text in parts if text)
+    return None
+
+
+def chat_messages_from_responses_input(input_value: Any) -> list[dict[str, Any]] | None:
+    if isinstance(input_value, str):
+        return [{"role": "user", "content": input_value}]
+    if not isinstance(input_value, list):
+        return None
+    messages: list[dict[str, Any]] = []
+    for item in input_value:
+        if isinstance(item, str):
+            messages.append({"role": "user", "content": item})
+            continue
+        if not isinstance(item, dict):
+            return None
+        role = str(item.get("role") or "user")
+        if role == "developer":
+            role = "system"
+        if role not in {"system", "user", "assistant"}:
+            return None
+        content = safe_text_from_content(item.get("content"))
+        if content is None:
+            return None
+        messages.append({"role": role, "content": content})
+    return messages
+
+
+def responses_input_from_chat_messages(messages: Any) -> tuple[str, list[dict[str, Any]]] | None:
+    if not isinstance(messages, list) or not messages:
+        return None
+    instructions: list[str] = []
+    inputs: list[dict[str, Any]] = []
+    for item in messages:
+        if not isinstance(item, dict):
+            return None
+        role = str(item.get("role") or "user")
+        content = safe_text_from_content(item.get("content"))
+        if content is None:
+            return None
+        if role in {"system", "developer"}:
+            if content:
+                instructions.append(content)
+            continue
+        if role not in {"user", "assistant"}:
+            return None
+        inputs.append(
+            {
+                "type": "message",
+                "role": role,
+                "content": [{"type": "input_text" if role == "user" else "output_text", "text": content}],
+            }
+        )
+    if not inputs:
+        return None
+    return "\n\n".join(instructions), inputs
+
+
+RESPONSES_TO_CHAT_UNSAFE_FIELDS = {
+    "tools",
+    "tool_choice",
+    "parallel_tool_calls",
+    "reasoning",
+    "include",
+    "prompt_cache_key",
+    "previous_response_id",
+    "text",
+    "truncation",
+    "client_metadata",
+}
+CHAT_TO_RESPONSES_UNSAFE_FIELDS = {
+    "tools",
+    "tool_choice",
+    "functions",
+    "function_call",
+    "response_format",
+    "parallel_tool_calls",
+}
+
+
+def responses_body_can_use_chat_adapter(body: dict[str, Any]) -> bool:
+    if any(field in body for field in RESPONSES_TO_CHAT_UNSAFE_FIELDS):
+        return False
+    return chat_messages_from_responses_input(body.get("input")) is not None
+
+
+def chat_body_can_use_responses_adapter(body: dict[str, Any]) -> bool:
+    if any(field in body for field in CHAT_TO_RESPONSES_UNSAFE_FIELDS):
+        return False
+    return responses_input_from_chat_messages(body.get("messages")) is not None
+
+
+def format_adapter_allowed(client_kind: str, upstream_kind: str, body: dict[str, Any]) -> bool:
+    if client_kind == upstream_kind:
+        return True
+    if not ADAPTIVE_FORMAT_ROUTING:
+        return False
+    if client_kind == "responses" and upstream_kind == "chat":
+        return responses_body_can_use_chat_adapter(body)
+    if client_kind == "chat" and upstream_kind == "responses":
+        return chat_body_can_use_responses_adapter(body)
+    return False
+
+
+def adapter_name(client_kind: str, upstream_kind: str) -> str:
+    return "native" if client_kind == upstream_kind else f"{upstream_kind}_to_{client_kind}"
+
+
+def responses_body_to_chat_body(body: dict[str, Any], chosen: dict[str, Any]) -> dict[str, Any]:
+    messages = chat_messages_from_responses_input(body.get("input"))
+    if messages is None:
+        raise ValueError("responses body cannot be safely adapted to chat")
+    instructions = body.get("instructions")
+    if instructions:
+        messages = [{"role": "system", "content": str(instructions)}, *messages]
+    req_body: dict[str, Any] = {"model": chosen["actual_model"], "messages": messages}
+    if "max_output_tokens" in body:
+        req_body["max_tokens"] = body.get("max_output_tokens")
+    for key in ("temperature", "top_p", "stream", "stop", "user", "metadata"):
+        if key in body:
+            req_body[key] = body[key]
+    return req_body
+
+
+def chat_body_to_responses_body(body: dict[str, Any], chosen: dict[str, Any]) -> dict[str, Any]:
+    converted = responses_input_from_chat_messages(body.get("messages"))
+    if converted is None:
+        raise ValueError("chat body cannot be safely adapted to responses")
+    instructions, input_value = converted
+    req_body: dict[str, Any] = {
+        "model": chosen["actual_model"],
+        "input": input_value,
+        "instructions": instructions,
+        "store": False,
+    }
+    if "max_tokens" in body:
+        req_body["max_output_tokens"] = body.get("max_tokens")
+    for key in ("temperature", "top_p", "stream", "stop", "user", "metadata"):
+        if key in body:
+            req_body[key] = body[key]
+    return req_body
+
+
+def prepare_upstream_body(body: dict[str, Any], chosen: dict[str, Any], client_kind: str) -> dict[str, Any]:
+    upstream_kind = chosen.get("_upstream_kind") or client_kind
+    if upstream_kind == client_kind:
+        req_body = normalize_responses_upstream_body(body, chosen) if upstream_kind == "responses" else deepcopy(body)
+        req_body["model"] = chosen["actual_model"]
+        return req_body
+    if client_kind == "responses" and upstream_kind == "chat":
+        return responses_body_to_chat_body(body, chosen)
+    if client_kind == "chat" and upstream_kind == "responses":
+        return normalize_responses_upstream_body(chat_body_to_responses_body(body, chosen), chosen)
+    raise ValueError(f"unsupported format adapter: {upstream_kind} -> {client_kind}")
+
+
+def extract_chat_response_text(data: Any) -> str:
+    if not isinstance(data, dict):
+        return ""
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return ""
+    first = choices[0] if isinstance(choices[0], dict) else {}
+    message = first.get("message") if isinstance(first, dict) else {}
+    if isinstance(message, dict):
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            text = safe_text_from_content(content)
+            return text or ""
+    text = safe_text_from_content(first.get("text")) if isinstance(first, dict) else ""
+    return text or ""
+
+
+def extract_responses_output_text(data: Any) -> str:
+    if not isinstance(data, dict):
+        return ""
+    if isinstance(data.get("output_text"), str):
+        return data["output_text"]
+    parts: list[str] = []
+    output = data.get("output")
+    if isinstance(output, list):
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content")
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") in {"output_text", "text"}:
+                        parts.append(str(part.get("text") or ""))
+            elif isinstance(content, str):
+                parts.append(content)
+    return "".join(parts)
+
+
+def convert_chat_response_to_responses(data: Any, request_id: str, model: str | None) -> dict[str, Any]:
+    text = extract_chat_response_text(data)
+    response_id = data.get("id") if isinstance(data, dict) and data.get("id") else request_id
+    usage = data.get("usage") if isinstance(data, dict) and isinstance(data.get("usage"), dict) else None
+    response: dict[str, Any] = {
+        "id": response_id,
+        "object": "response",
+        "created_at": int(now()),
+        "status": "completed",
+        "model": model or "",
+        "output": [
+            {
+                "type": "message",
+                "id": f"msg_{uuid.uuid4().hex[:16]}",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": text, "annotations": []}],
+            }
+        ],
+        "output_text": text,
+    }
+    if usage:
+        response["usage"] = usage
+    return response
+
+
+def convert_responses_response_to_chat(data: Any, request_id: str, model: str | None) -> dict[str, Any]:
+    text = extract_responses_output_text(data)
+    usage = data.get("usage") if isinstance(data, dict) and isinstance(data.get("usage"), dict) else None
+    response: dict[str, Any] = {
+        "id": data.get("id") if isinstance(data, dict) and data.get("id") else request_id,
+        "object": "chat.completion",
+        "created": int(now()),
+        "model": model or "",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": "stop",
+            }
+        ],
+    }
+    if usage:
+        response["usage"] = usage
+    return response
+
+
+def convert_upstream_response_for_client(data: Any, chosen: dict[str, Any], client_kind: str, request_id: str, model: str | None) -> Any:
+    upstream_kind = chosen.get("_upstream_kind") or client_kind
+    if upstream_kind == client_kind:
+        return data
+    if client_kind == "responses" and upstream_kind == "chat":
+        return convert_chat_response_to_responses(data, request_id, model)
+    if client_kind == "chat" and upstream_kind == "responses":
+        return convert_responses_response_to_chat(data, request_id, model)
+    return data
+
+
+def iter_sse_data_payloads(text: str) -> list[str]:
+    payloads: list[str] = []
+    for event in re.split(r"\r?\n\r?\n", text):
+        lines = []
+        for line in event.splitlines():
+            if line.startswith("data:"):
+                lines.append(line[5:].strip())
+        if lines:
+            payloads.append("\n".join(lines))
+    return payloads
+
+
+def chat_stream_chunk_to_responses(chunk: bytes, request_id: str, model: str | None) -> bytes:
+    out = bytearray()
+    for payload in iter_sse_data_payloads(chunk.decode("utf-8", "ignore")):
+        if payload == "[DONE]":
+            continue
+        try:
+            data = json.loads(payload)
+        except Exception:
+            continue
+        for choice in data.get("choices") or []:
+            delta = (choice.get("delta") or {}).get("content") if isinstance(choice, dict) else None
+            if delta:
+                event_data = {"type": "response.output_text.delta", "delta": delta}
+                out.extend(f"event: response.output_text.delta\ndata: {json.dumps(event_data, ensure_ascii=False, separators=(',', ':'))}\n\n".encode())
+    return bytes(out)
+
+
+def responses_stream_chunk_to_chat(chunk: bytes, request_id: str, model: str | None) -> bytes:
+    out = bytearray()
+    for payload in iter_sse_data_payloads(chunk.decode("utf-8", "ignore")):
+        if payload == "[DONE]":
+            continue
+        try:
+            data = json.loads(payload)
+        except Exception:
+            continue
+        delta = data.get("delta")
+        if not delta and data.get("type") in {"response.output_text.delta", "response.output_text.annotation.added"}:
+            delta = data.get("text") or data.get("content")
+        if delta:
+            chat_chunk = {
+                "id": request_id,
+                "object": "chat.completion.chunk",
+                "created": int(now()),
+                "model": model or "",
+                "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
+            }
+            out.extend(f"data: {json.dumps(chat_chunk, ensure_ascii=False, separators=(',', ':'))}\n\n".encode())
+    return bytes(out)
+
+
+def convert_stream_chunk_for_client(chunk: bytes, chosen: dict[str, Any], client_kind: str, request_id: str, model: str | None) -> bytes:
+    upstream_kind = chosen.get("_upstream_kind") or client_kind
+    if upstream_kind == client_kind:
+        return chunk
+    if client_kind == "responses" and upstream_kind == "chat":
+        return chat_stream_chunk_to_responses(chunk, request_id, model)
+    if client_kind == "chat" and upstream_kind == "responses":
+        return responses_stream_chunk_to_chat(chunk, request_id, model)
+    return chunk
 
 
 async def fetch_models(provider: dict[str, Any]) -> list[str]:
@@ -1396,7 +1781,7 @@ async def admin_overview(
             "chat_healthy": chat_healthy,
             "responses_healthy": responses_healthy,
             "models": models,
-            "health": HEALTH,
+            "health": health_with_freshness(),
             "health_policy": health_policy_summary(),
         }
 
@@ -1614,7 +1999,7 @@ async def admin_matrix(
                 }
                 for provider in PROVIDERS
             ],
-            "health": HEALTH,
+            "health": health_with_freshness(),
         }
 
 
@@ -1684,8 +2069,20 @@ def request_route_controls(request: Request) -> dict[str, Any]:
 
 def sorted_route_bucket(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for item in items:
-        item["_score"] = max(1, int(item.get("weight") or 1)) * (1000 / max(1, int(item.get("latency_ms") or 1000)))
-    items.sort(key=lambda item: (-int(item.get("priority", 0)), -item.get("_score", 0), item.get("latency_ms") or 999999))
+        adjusted_latency = max(
+            1,
+            int(item.get("latency_ms") or 1000) + int(item.get("_adapter_latency_penalty_ms") or 0),
+        )
+        item["_adjusted_latency_ms"] = adjusted_latency
+        item["_score"] = max(1, int(item.get("weight") or 1)) * (1000 / adjusted_latency)
+    items.sort(
+        key=lambda item: (
+            -int(item.get("priority", 0)),
+            -item.get("_score", 0),
+            item.get("_adjusted_latency_ms") or 999999,
+            int(item.get("_adapter_latency_penalty_ms") or 0),
+        )
+    )
     return items
 
 
@@ -1849,6 +2246,42 @@ def healthy_candidate_buckets(model: str, kind: str, controls: dict[str, Any] | 
     return [bucket for bucket in buckets if bucket["items"]]
 
 
+ROUTE_BUCKET_ORDER = ["primary", "backup", "other", "probe_retry", "explore", "shadow", "paid_fallback"]
+
+
+def annotate_route_item(item: dict[str, Any], client_kind: str, upstream_kind: str) -> dict[str, Any]:
+    item["_client_kind"] = client_kind
+    item["_upstream_kind"] = upstream_kind
+    item["_format_adapter"] = adapter_name(client_kind, upstream_kind)
+    if client_kind != upstream_kind:
+        item["_adapter_latency_penalty_ms"] = ADAPTER_LATENCY_PENALTY_MS
+    else:
+        item["_adapter_latency_penalty_ms"] = 0
+    return item
+
+
+def adaptive_candidate_buckets(
+    model: str,
+    client_kind: str,
+    body: dict[str, Any],
+    controls: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    combined: dict[str, list[dict[str, Any]]] = {name: [] for name in ROUTE_BUCKET_ORDER}
+    upstream_kinds = [client_kind, "responses" if client_kind == "chat" else "chat"]
+    for upstream_kind in upstream_kinds:
+        if not format_adapter_allowed(client_kind, upstream_kind, body):
+            continue
+        for bucket in healthy_candidate_buckets(model, upstream_kind, controls):
+            target = combined.setdefault(bucket["name"], [])
+            target.extend(annotate_route_item(item, client_kind, upstream_kind) for item in bucket["items"])
+    buckets = []
+    for name in ROUTE_BUCKET_ORDER:
+        items = combined.get(name) or []
+        if items:
+            buckets.append({"name": name, "items": sorted_route_bucket(items)})
+    return buckets
+
+
 def healthy_candidates(model: str, kind: str, controls: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     for bucket in healthy_candidate_buckets(model, kind, controls):
@@ -1866,11 +2299,23 @@ def select_route_candidate(buckets: list[dict[str, Any]]) -> tuple[dict[str, Any
     return None
 
 
+def candidate_attempt_key(item: dict[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(item.get("provider_id") or ""),
+        str(item.get("actual_model") or ""),
+        str(item.get("_upstream_kind") or item.get("kind") or ""),
+    )
+
+
 def pick_priority_weighted(candidates: list[dict[str, Any]]) -> dict[str, Any]:
     if not candidates:
         raise ValueError("candidates must not be empty")
     highest_priority = max(int(item.get("priority") or 0) for item in candidates)
     highest = [item for item in candidates if int(item.get("priority") or 0) == highest_priority]
+    if any("_score" in item for item in highest):
+        highest.sort(key=lambda item: (-float(item.get("_score") or 0), item.get("_adjusted_latency_ms") or 999999))
+        best_score = float(highest[0].get("_score") or 0)
+        highest = [item for item in highest if float(item.get("_score") or 0) == best_score]
     return pick_weighted(highest)
 
 
@@ -1977,6 +2422,9 @@ def log_route_fields(chosen: dict[str, Any], route_bucket: str | None = None) ->
         "cost_tier": chosen.get("cost_tier", "free"),
         "fallback_only": bool(chosen.get("fallback_only", False)),
         "shadow": bool(chosen.get("_shadow", False)),
+        "upstream_kind": chosen.get("_upstream_kind") or chosen.get("kind") or "",
+        "format_adapter": chosen.get("_format_adapter") or "native",
+        "adapter_latency_penalty_ms": int(chosen.get("_adapter_latency_penalty_ms") or 0),
     }
 
 
@@ -2001,7 +2449,7 @@ async def relay_non_stream(
     model = body.get("model")
     if not model:
         return JSONResponse({"error": {"message": "Missing model", "type": "invalid_request_error"}}, status_code=400)
-    buckets = healthy_candidate_buckets(model, kind, controls)
+    buckets = adaptive_candidate_buckets(model, kind, body, controls)
     total_candidates = sum(len(bucket["items"]) for bucket in buckets)
     if not total_candidates:
         await append_request_log(
@@ -2027,13 +2475,15 @@ async def relay_non_stream(
         if not selected:
             break
         chosen, route_bucket = selected
+        attempt_key = candidate_attempt_key(chosen)
         for bucket in buckets:
-            bucket["items"] = [item for item in bucket["items"] if item["provider_id"] != chosen["provider_id"]]
+            bucket["items"] = [item for item in bucket["items"] if candidate_attempt_key(item) != attempt_key]
         provider = get_provider_by_id(chosen["provider_id"])
         if not provider:
             continue
-        req_body = normalize_responses_upstream_body(body, chosen) if kind == "responses" else deepcopy(body)
-        req_body["model"] = chosen["actual_model"]
+        upstream_kind = chosen.get("_upstream_kind") or kind
+        upstream_path = path if upstream_kind == kind else upstream_path_for_kind(upstream_kind)
+        req_body = prepare_upstream_body(body, chosen, kind)
         route_fields = log_route_fields(chosen, route_bucket)
         tried.append({"provider_id": chosen["provider_id"], "actual_model": chosen["actual_model"], **route_fields})
         start = now()
@@ -2045,9 +2495,9 @@ async def relay_non_stream(
             ) as client:
                 response = None
                 endpoint_url = ""
-                for candidate_url in upstream_urls(provider, path):
+                for candidate_url in upstream_urls(provider, upstream_path):
                     endpoint_url = candidate_url
-                    response = await client.post(candidate_url, headers=provider_headers(provider, incoming_headers, kind), json=req_body)
+                    response = await client.post(candidate_url, headers=provider_headers(provider, incoming_headers, upstream_kind), json=req_body)
                     if 200 <= response.status_code < 300:
                         break
                     endpoint_reasons.append(classify_error(response.status_code, response.text[:1000]))
@@ -2060,7 +2510,8 @@ async def relay_non_stream(
             except Exception:
                 data = None
             if 200 <= response.status_code < 300 and not response_has_error_json(data):
-                await mark_runtime_success(kind, model, chosen["provider_id"], latency_ms)
+                await mark_runtime_success(upstream_kind, model, chosen["provider_id"], latency_ms)
+                client_data = convert_upstream_response_for_client(data, chosen, kind, request_id, model)
                 await append_request_log(
                     {
                         "request_id": request_id,
@@ -2069,7 +2520,7 @@ async def relay_non_stream(
                         "requested_model": model,
                         "actual_model": chosen["actual_model"],
                         "provider_id": chosen["provider_id"],
-                        "path": path,
+                        "path": upstream_path,
                         "endpoint_url": endpoint_url,
                         "status_code": response.status_code,
                         "latency_ms": latency_ms,
@@ -2079,20 +2530,20 @@ async def relay_non_stream(
                         **route_fields,
                     }
                 )
-                if data is not None:
-                    return JSONResponse(data, status_code=response.status_code)
+                if client_data is not None:
+                    return JSONResponse(client_data, status_code=response.status_code)
                 return JSONResponse({"raw": text}, status_code=response.status_code)
             reason = classify_error(response.status_code, text[:1000])
             if not endpoint_reasons or endpoint_reasons[-1] != reason:
                 endpoint_reasons.append(reason)
-            if should_verify_responses_request_shape(kind, endpoint_reasons):
-                await mark_responses_shape_invalid_attempt(kind, model, chosen["provider_id"], body, incoming_headers, latency_ms)
+            if should_verify_responses_request_shape(upstream_kind, endpoint_reasons):
+                await mark_responses_shape_invalid_attempt(upstream_kind, model, chosen["provider_id"], req_body, incoming_headers, latency_ms)
             else:
-                runtime_failure_reason = runtime_failure_reason_for_endpoint_failures(kind, endpoint_reasons)
+                runtime_failure_reason = runtime_failure_reason_for_endpoint_failures(upstream_kind, endpoint_reasons)
                 if runtime_failure_reason:
-                    await mark_runtime_failure(kind, model, chosen["provider_id"], runtime_failure_reason)
-                elif should_mark_runtime_failure(reason, kind):
-                    await mark_runtime_failure(kind, model, chosen["provider_id"], reason)
+                    await mark_runtime_failure(upstream_kind, model, chosen["provider_id"], runtime_failure_reason)
+                elif should_mark_runtime_failure(reason, upstream_kind):
+                    await mark_runtime_failure(upstream_kind, model, chosen["provider_id"], reason)
             await append_request_log(
                 {
                     "request_id": request_id,
@@ -2101,7 +2552,7 @@ async def relay_non_stream(
                     "requested_model": model,
                     "actual_model": chosen["actual_model"],
                     "provider_id": chosen["provider_id"],
-                    "path": path,
+                    "path": upstream_path,
                     "endpoint_url": endpoint_url,
                     "status_code": response.status_code,
                     "latency_ms": latency_ms,
@@ -2117,7 +2568,8 @@ async def relay_non_stream(
             last_error = {"status_code": response.status_code, "reason": reason, "body": text[:500], "tried": tried}
         except Exception as exc:
             reason = f"exception:{type(exc).__name__}"
-            await mark_runtime_failure(kind, model, chosen["provider_id"], reason)
+            upstream_kind = chosen.get("_upstream_kind") or kind
+            await mark_runtime_failure(upstream_kind, model, chosen["provider_id"], reason)
             await append_request_log(
                 {
                     "request_id": request_id,
@@ -2126,7 +2578,7 @@ async def relay_non_stream(
                     "requested_model": model,
                     "actual_model": chosen["actual_model"],
                     "provider_id": chosen["provider_id"],
-                    "path": path,
+                    "path": upstream_path if "upstream_path" in locals() else path,
                     "success": False,
                     "error_type": reason,
                     "error_sample": redact_text(str(exc), 500),
@@ -2175,7 +2627,7 @@ async def relay_stream(
         yield b"data: [DONE]\n\n"
         return
 
-    buckets = healthy_candidate_buckets(model, kind, controls)
+    buckets = adaptive_candidate_buckets(model, kind, body, controls)
     total_candidates = sum(len(bucket["items"]) for bucket in buckets)
     if not total_candidates:
         await append_request_log(
@@ -2202,14 +2654,16 @@ async def relay_stream(
         if not selected:
             break
         chosen, route_bucket = selected
+        attempt_key = candidate_attempt_key(chosen)
         for bucket in buckets:
-            bucket["items"] = [item for item in bucket["items"] if item["provider_id"] != chosen["provider_id"]]
+            bucket["items"] = [item for item in bucket["items"] if candidate_attempt_key(item) != attempt_key]
         provider = get_provider_by_id(chosen["provider_id"])
         if not provider:
             continue
 
-        req_body = normalize_responses_upstream_body(body, chosen) if kind == "responses" else deepcopy(body)
-        req_body["model"] = chosen["actual_model"]
+        upstream_kind = chosen.get("_upstream_kind") or kind
+        upstream_path = path if upstream_kind == kind else upstream_path_for_kind(upstream_kind)
+        req_body = prepare_upstream_body(body, chosen, kind)
         route_fields = log_route_fields(chosen, route_bucket)
         start = now()
         stream_started = False
@@ -2222,8 +2676,8 @@ async def relay_stream(
                 timeout=httpx.Timeout(provider.get("timeout_seconds") or REQUEST_TIMEOUT_SECONDS),
                 follow_redirects=True,
             ) as client:
-                for endpoint_url in upstream_urls(provider, path):
-                    async with client.stream("POST", endpoint_url, headers=provider_headers(provider, incoming_headers, kind), json=req_body) as response:
+                for endpoint_url in upstream_urls(provider, upstream_path):
+                    async with client.stream("POST", endpoint_url, headers=provider_headers(provider, incoming_headers, upstream_kind), json=req_body) as response:
                         if response.status_code < 200 or response.status_code >= 300:
                             raw = await response.aread()
                             reason = classify_error(response.status_code, raw.decode("utf-8", "ignore")[:1000])
@@ -2236,7 +2690,7 @@ async def relay_stream(
                                     "requested_model": model,
                                     "actual_model": chosen["actual_model"],
                                     "provider_id": chosen["provider_id"],
-                                    "path": path,
+                                    "path": upstream_path,
                                     "endpoint_url": endpoint_url,
                                     "status_code": response.status_code,
                                     "latency_ms": int((now() - start) * 1000),
@@ -2265,7 +2719,7 @@ async def relay_stream(
                                     "requested_model": model,
                                     "actual_model": chosen["actual_model"],
                                     "provider_id": chosen["provider_id"],
-                                    "path": path,
+                                    "path": upstream_path,
                                     "endpoint_url": endpoint_url,
                                     "status_code": response.status_code,
                                     "latency_ms": int((now() - start) * 1000),
@@ -2279,7 +2733,7 @@ async def relay_stream(
                             continue
 
                         latency_ms = int((now() - start) * 1000)
-                        await mark_runtime_success(kind, model, chosen["provider_id"], latency_ms)
+                        await mark_runtime_success(upstream_kind, model, chosen["provider_id"], latency_ms)
                         await append_request_log(
                             {
                                 "request_id": request_id,
@@ -2288,7 +2742,7 @@ async def relay_stream(
                                 "requested_model": model,
                                 "actual_model": chosen["actual_model"],
                                 "provider_id": chosen["provider_id"],
-                                "path": path,
+                                "path": upstream_path,
                                 "endpoint_url": endpoint_url,
                                 "status_code": response.status_code,
                                 "latency_ms": latency_ms,
@@ -2298,34 +2752,46 @@ async def relay_stream(
                             }
                         )
                         stream_started = True
-                        done_sent = b"[DONE]" in first
-                        response_completed = b"response.completed" in first
-                        yield first
+                        if upstream_kind == kind:
+                            done_sent = b"[DONE]" in first
+                            response_completed = b"response.completed" in first
+                            yield first
+                        else:
+                            converted = convert_stream_chunk_for_client(first, chosen, kind, request_id, model)
+                            if converted:
+                                if b"[DONE]" in converted:
+                                    done_sent = True
+                                if b"response.completed" in converted:
+                                    response_completed = True
+                                yield converted
                         async for chunk in raw_chunks:
                             if chunk:
-                                if b"[DONE]" in chunk:
+                                converted = chunk if upstream_kind == kind else convert_stream_chunk_for_client(chunk, chosen, kind, request_id, model)
+                                if not converted:
+                                    continue
+                                if b"[DONE]" in converted:
                                     done_sent = True
-                                if b"response.completed" in chunk:
+                                if b"response.completed" in converted:
                                     response_completed = True
-                                yield chunk
+                                yield converted
                         if kind == "responses" and not response_completed:
                             yield response_completed_event(request_id, model)
                         if not done_sent:
                             yield b"data: [DONE]\n\n"
                         return
 
-                runtime_failure_reason = runtime_failure_reason_for_endpoint_failures(kind, endpoint_reasons)
-                if should_verify_responses_request_shape(kind, endpoint_reasons):
+                runtime_failure_reason = runtime_failure_reason_for_endpoint_failures(upstream_kind, endpoint_reasons)
+                if should_verify_responses_request_shape(upstream_kind, endpoint_reasons):
                     await mark_responses_shape_invalid_attempt(
-                        kind,
+                        upstream_kind,
                         model,
                         chosen["provider_id"],
-                        body,
+                        req_body,
                         incoming_headers,
                         int((now() - start) * 1000),
                     )
                 elif runtime_failure_reason:
-                    await mark_runtime_failure(kind, model, chosen["provider_id"], runtime_failure_reason)
+                    await mark_runtime_failure(upstream_kind, model, chosen["provider_id"], runtime_failure_reason)
         except Exception as exc:
             if stream_started:
                 if kind == "responses" and not response_completed:
@@ -2338,7 +2804,7 @@ async def relay_stream(
                 if not done_sent:
                     yield b"data: [DONE]\n\n"
                 return
-            await mark_runtime_failure(kind, model, chosen["provider_id"], f"exception:{type(exc).__name__}")
+            await mark_runtime_failure(upstream_kind, model, chosen["provider_id"], f"exception:{type(exc).__name__}")
             await append_request_log(
                 {
                     "request_id": request_id,
@@ -2347,7 +2813,7 @@ async def relay_stream(
                     "requested_model": model,
                     "actual_model": chosen["actual_model"],
                     "provider_id": chosen["provider_id"],
-                    "path": path,
+                    "path": upstream_path,
                     "success": False,
                     "error_type": f"exception:{type(exc).__name__}",
                     "error_sample": redact_text(str(exc), 500),

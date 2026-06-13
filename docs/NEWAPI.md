@@ -178,6 +178,7 @@ Default health-loop and cooldown values:
 - `PROBE_TIMEOUT_SECONDS=12`
 - `PROBE_MAX_PER_CYCLE=12`
 - `MODELS_REFRESH_SECONDS=3600`
+- `HEALTH_FRESH_TTL_SECONDS=300`
 - success cache: 21600 seconds
 - unsupported/not found: 86400 seconds
 - auth/forbidden and quota: 3600 seconds
@@ -190,6 +191,12 @@ Default health-loop and cooldown values:
 The admin overview API exposes these values as `health_policy`; the operations
 UI renders them in the `探测矩阵` help panel so operators can see the live
 policy instead of reading code.
+
+`HEALTH_FRESH_TTL_SECONDS` is an operations-facing freshness window. A healthy
+item checked inside this window is shown as fresh; a healthy item older than
+this window but still inside the success cache is shown as cached/stale health.
+Routing can still use cached health, but operators should treat it as less
+real-time than a recent runtime success or probe.
 
 ## Responses and Codex Compatibility
 
@@ -325,6 +332,31 @@ to treat request-shape-unverified primary providers as a primary sub-state with
 a bounded verification budget, not as a generic bucket between backup and
 fallback. The verification budget should prefer real runtime requests and use
 captured Codex-shape templates only for explicit admin-triggered diagnostics.
+
+## Adaptive Format Routing
+
+The client-facing API kind and the upstream API kind are now separate routing
+concepts:
+
+```text
+client kind: what the caller sent and expects back
+upstream kind: the provider endpoint Smart Gateway chooses
+```
+
+Native routes are still preferred. When the request body is a safe text-only
+shape, Smart Gateway may adapt:
+
+- `/v1/responses` client request -> healthy `/chat/completions` upstream ->
+  converted back to a Responses response.
+- `/v1/chat/completions` client request -> healthy `/responses` upstream ->
+  converted back to a Chat Completions response.
+
+The adapter intentionally refuses complex or lossy shapes such as tools,
+function calling, `reasoning`, `include`, `prompt_cache_key`,
+`previous_response_id`, and Codex-specific encrypted reasoning payloads. Those
+requests require native Responses compatibility. Adapted routes carry an
+`adapter_latency_penalty_ms` score penalty and logs include `upstream_kind` and
+`format_adapter` so operators can see when conversion was used.
 
 ## Operations UI
 

@@ -229,6 +229,178 @@ def test_normalize_responses_upstream_body_adds_codex_required_defaults(gateway)
     assert "store" not in body
 
 
+def test_safe_format_adapters_convert_basic_text_bodies(gateway):
+    responses_body = {"model": "good-model", "instructions": "Be brief", "input": "ping", "max_output_tokens": 12}
+    chat_body = gateway.responses_body_to_chat_body(responses_body, {"actual_model": "actual-chat"})
+
+    assert chat_body["model"] == "actual-chat"
+    assert chat_body["messages"] == [
+        {"role": "system", "content": "Be brief"},
+        {"role": "user", "content": "ping"},
+    ]
+    assert chat_body["max_tokens"] == 12
+
+    converted = gateway.chat_body_to_responses_body(
+        {"model": "good-model", "messages": [{"role": "system", "content": "Be brief"}, {"role": "user", "content": "ping"}]},
+        {"actual_model": "actual-responses"},
+    )
+    assert converted["model"] == "actual-responses"
+    assert converted["instructions"] == "Be brief"
+    assert converted["input"][0]["role"] == "user"
+    assert converted["store"] is False
+
+
+def test_complex_responses_body_is_not_downgraded_to_chat(gateway):
+    assert gateway.responses_body_can_use_chat_adapter({"model": "good-model", "input": "ping"}) is True
+    assert (
+        gateway.responses_body_can_use_chat_adapter(
+            {"model": "good-model", "input": "ping", "reasoning": {"effort": "high"}, "include": ["reasoning.encrypted_content"]}
+        )
+        is False
+    )
+
+
+@pytest.mark.asyncio()
+async def test_responses_request_can_use_chat_upstream_with_safe_adapter(gateway, monkeypatch):
+    gateway.PROVIDERS = [
+        {"id": "p1", "base_url": "https://p1.example/v1", "api_key": "sk-p1", "timeout_seconds": 3, "headers": {}},
+    ]
+    gateway.HEALTH = {
+        "chat": {
+            "good-model": {
+                "p1": {
+                    "provider_id": "p1",
+                    "actual_model": "actual-chat",
+                    "healthy": True,
+                    "priority": 100,
+                    "weight": 1,
+                    "latency_ms": 20,
+                },
+            }
+        },
+        "responses": {},
+    }
+    monkeypatch.setattr(gateway, "pick_weighted", lambda candidates: candidates[0])
+
+    with respx.mock:
+        chat_route = respx.post("https://p1.example/v1/chat/completions").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "id": "chat-ok",
+                    "choices": [{"message": {"role": "assistant", "content": "pong"}, "finish_reason": "stop"}],
+                },
+            )
+        )
+        response = await gateway.relay_non_stream(
+            "/responses",
+            {"model": "good-model", "input": "ping", "stream": False},
+            "responses",
+        )
+
+    assert response.status_code == 200
+    payload = json.loads(response.body.decode())
+    assert payload["object"] == "response"
+    assert payload["output_text"] == "pong"
+    assert chat_route.call_count == 1
+    sent = json.loads(chat_route.calls.last.request.content.decode())
+    assert sent["model"] == "actual-chat"
+    assert sent["messages"] == [{"role": "user", "content": "ping"}]
+    assert gateway.HEALTH["chat"]["good-model"]["p1"]["healthy"] is True
+    logs = gateway.read_recent_request_logs()
+    assert logs[0]["kind"] == "responses"
+    assert logs[0]["upstream_kind"] == "chat"
+    assert logs[0]["format_adapter"] == "chat_to_responses"
+
+
+@pytest.mark.asyncio()
+async def test_chat_request_can_use_responses_upstream_with_safe_adapter(gateway, monkeypatch):
+    gateway.PROVIDERS = [
+        {"id": "p1", "base_url": "https://p1.example/v1", "api_key": "sk-p1", "timeout_seconds": 3, "headers": {}},
+    ]
+    gateway.HEALTH = {
+        "responses": {
+            "good-model": {
+                "p1": {
+                    "provider_id": "p1",
+                    "actual_model": "actual-responses",
+                    "healthy": True,
+                    "priority": 100,
+                    "weight": 1,
+                    "latency_ms": 20,
+                },
+            }
+        },
+        "chat": {},
+    }
+    monkeypatch.setattr(gateway, "pick_weighted", lambda candidates: candidates[0])
+
+    with respx.mock:
+        responses_route = respx.post("https://p1.example/v1/responses").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "id": "resp-ok",
+                    "output": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "pong"}],
+                        }
+                    ],
+                },
+            )
+        )
+        response = await gateway.relay_non_stream(
+            "/chat/completions",
+            {"model": "good-model", "messages": [{"role": "system", "content": "Be brief"}, {"role": "user", "content": "ping"}]},
+            "chat",
+        )
+
+    assert response.status_code == 200
+    payload = json.loads(response.body.decode())
+    assert payload["object"] == "chat.completion"
+    assert payload["choices"][0]["message"]["content"] == "pong"
+    sent = json.loads(responses_route.calls.last.request.content.decode())
+    assert sent["model"] == "actual-responses"
+    assert sent["instructions"] == "Be brief"
+    assert sent["input"][0]["role"] == "user"
+    logs = gateway.read_recent_request_logs()
+    assert logs[0]["kind"] == "chat"
+    assert logs[0]["upstream_kind"] == "responses"
+    assert logs[0]["format_adapter"] == "responses_to_chat"
+
+
+@pytest.mark.asyncio()
+async def test_complex_responses_request_does_not_fallback_to_chat_adapter(gateway):
+    gateway.PROVIDERS = [
+        {"id": "p1", "base_url": "https://p1.example/v1", "api_key": "sk-p1", "timeout_seconds": 3, "headers": {}},
+    ]
+    gateway.HEALTH = {
+        "chat": {
+            "good-model": {
+                "p1": {"provider_id": "p1", "actual_model": "good-model", "healthy": True, "priority": 100, "weight": 1},
+            }
+        },
+        "responses": {},
+    }
+
+    response = await gateway.relay_non_stream(
+        "/responses",
+        {
+            "model": "good-model",
+            "input": "ping",
+            "reasoning": {"effort": "high"},
+            "include": ["reasoning.encrypted_content"],
+            "stream": False,
+        },
+        "responses",
+    )
+
+    assert response.status_code == 503
+    assert json.loads(response.body.decode())["error"]["type"] == "no_healthy_upstream"
+
+
 @pytest.mark.asyncio()
 @respx.mock
 async def test_probe_lists_only_really_healthy_models(gateway):
@@ -1657,6 +1829,36 @@ async def test_admin_overview_requires_token_and_exposes_gateway_config(gateway)
     assert overview["router_groups"] == "default,vip"
     assert "master_api_key" not in overview
     assert overview["models"] == [{"id": "good-model", "chat_ok": 1, "responses_ok": 0}]
+
+
+@pytest.mark.asyncio()
+async def test_admin_overview_exposes_health_freshness(gateway):
+    checked_at = int(gateway.now()) - gateway.HEALTH_FRESH_TTL_SECONDS - 5
+    gateway.PROVIDERS = [{"id": "p1", "base_url": "https://p1.example/v1", "api_key": "sk-p1", "priority": 1, "weight": 1}]
+    gateway.HEALTH = {
+        "chat": {
+            "good-model": {
+                "p1": {
+                    "provider_id": "p1",
+                    "actual_model": "good-model",
+                    "healthy": True,
+                    "priority": 1,
+                    "weight": 1,
+                    "checked_at": checked_at,
+                    "next_probe_at": checked_at + gateway.PROBE_SUCCESS_TTL_SECONDS,
+                }
+            }
+        },
+        "responses": {},
+    }
+
+    overview = await gateway.admin_overview(make_request("api.example.com"), "Bearer admin", None)
+    item = overview["health"]["chat"]["good-model"]["p1"]
+
+    assert overview["health_policy"]["health_fresh_ttl_seconds"] == gateway.HEALTH_FRESH_TTL_SECONDS
+    assert item["health_fresh"] is False
+    assert item["health_freshness"] == "stale_ok"
+    assert item["health_age_seconds"] >= gateway.HEALTH_FRESH_TTL_SECONDS
 
 
 @pytest.mark.asyncio()

@@ -50,7 +50,9 @@ Core behavior:
 - Pull provider model lists, then verify models with real minimal requests.
 - Cache provider model lists and cooldown probe failures to avoid wasting token quota on repeated checks.
 - Maintain health by API kind, canonical model, provider, and actual model.
+- Show whether health is fresh or cached so operators can separate recent evidence from long TTL state.
 - Treat Responses `invalid_request` from weak probes as request-shape-unverified; verify Codex providers with real Codex-shaped requests before marking them unavailable.
+- Adapt safe text-only Chat and Responses requests across upstream formats while preserving the client-facing response format.
 - Return only currently healthy models to New API through the router channel.
 - Apply `model_include` and `model_exclude` before exposing models; current operations can hide `gpt-5.4*` and long date-suffixed models such as `*-20??????`.
 - Fail over current `/v1/chat/completions` and `/v1/responses` requests to another healthy upstream for the same model.
