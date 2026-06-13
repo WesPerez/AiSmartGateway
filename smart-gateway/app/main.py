@@ -51,6 +51,9 @@ PROBE_RATE_LIMIT_TTL_SECONDS = int(os.getenv("PROBE_RATE_LIMIT_TTL_SECONDS", "18
 PROBE_SERVER_ERROR_TTL_SECONDS = int(os.getenv("PROBE_SERVER_ERROR_TTL_SECONDS", "900"))
 PROBE_EXCEPTION_TTL_SECONDS = int(os.getenv("PROBE_EXCEPTION_TTL_SECONDS", "900"))
 PROBE_UNKNOWN_ERROR_TTL_SECONDS = int(os.getenv("PROBE_UNKNOWN_ERROR_TTL_SECONDS", "1800"))
+PROBE_LOW_SIGNAL_TTL_SECONDS = int(os.getenv("PROBE_LOW_SIGNAL_TTL_SECONDS", "900"))
+PROBE_CONTENT_QUALITY_CHECK = os.getenv("PROBE_CONTENT_QUALITY_CHECK", "true").lower() == "true"
+PROBE_MIN_QUALITY_SCORE = int(os.getenv("PROBE_MIN_QUALITY_SCORE", "80"))
 HEALTH_FRESH_TTL_SECONDS = int(os.getenv("HEALTH_FRESH_TTL_SECONDS", "300"))
 RESPONSES_INVALID_REQUEST_CONFIRMATIONS = max(1, int(os.getenv("RESPONSES_INVALID_REQUEST_CONFIRMATIONS", "3")))
 RESPONSES_INVALID_REQUEST_RETRY_SECONDS = int(os.getenv("RESPONSES_INVALID_REQUEST_RETRY_SECONDS", "60"))
@@ -344,6 +347,8 @@ def probe_cooldown_seconds(reason: str | None, healthy: bool) -> int:
         return PROBE_RATE_LIMIT_TTL_SECONDS
     if reason in {"server_unavailable", "empty_stream"}:
         return PROBE_SERVER_ERROR_TTL_SECONDS
+    if reason in {"empty_response", "low_signal_response"}:
+        return PROBE_LOW_SIGNAL_TTL_SECONDS
     if reason.startswith("exception:"):
         return PROBE_EXCEPTION_TTL_SECONDS
     return PROBE_UNKNOWN_ERROR_TTL_SECONDS
@@ -679,6 +684,8 @@ def health_policy_summary() -> dict[str, Any]:
         "enable_responses_probe": ENABLE_RESPONSES_PROBE,
         "min_healthy_providers": MIN_HEALTHY_PROVIDERS,
         "health_fresh_ttl_seconds": HEALTH_FRESH_TTL_SECONDS,
+        "probe_content_quality_check": PROBE_CONTENT_QUALITY_CHECK,
+        "probe_min_quality_score": PROBE_MIN_QUALITY_SCORE,
         "adaptive_format_routing": ADAPTIVE_FORMAT_ROUTING,
         "adapter_latency_penalty_ms": ADAPTER_LATENCY_PENALTY_MS,
         "chat_path": chat_probe.get("path") or "/chat/completions",
@@ -691,6 +698,7 @@ def health_policy_summary() -> dict[str, Any]:
             "quota": PROBE_QUOTA_TTL_SECONDS,
             "rate_limited": PROBE_RATE_LIMIT_TTL_SECONDS,
             "server_unavailable": PROBE_SERVER_ERROR_TTL_SECONDS,
+            "low_signal_response": PROBE_LOW_SIGNAL_TTL_SECONDS,
             "exception": PROBE_EXCEPTION_TTL_SECONDS,
             "responses_shape_retry": RESPONSES_INVALID_REQUEST_RETRY_SECONDS,
             "responses_real_shape_invalid": RESPONSES_INVALID_REQUEST_COOLDOWN_SECONDS,
@@ -1112,6 +1120,93 @@ def classify_error(status_code: int, text: str) -> str:
 
 def response_has_error_json(data: Any) -> bool:
     return isinstance(data, dict) and bool(data.get("error"))
+
+
+LOW_SIGNAL_RESPONSE_TEXTS = {
+    "1",
+    "done",
+    "hello",
+    "hi",
+    "no",
+    "ok",
+    "okay",
+    "ping",
+    "pong",
+    "success",
+    "true",
+    "yes",
+    "不",
+    "可以",
+    "否",
+    "嗯",
+    "好",
+    "好的",
+    "是",
+    "收到",
+    "明白",
+}
+
+
+def normalize_signal_text(text: str) -> str:
+    lowered = text.strip().lower()
+    return re.sub(r"[\s`*_#>\"'“”‘’.,!?;:，。！？；：、（）()\[\]{}<>-]+", "", lowered)
+
+
+def is_low_signal_response_text(text: str) -> bool:
+    normalized = normalize_signal_text(text)
+    if not normalized:
+        return True
+    if normalized in LOW_SIGNAL_RESPONSE_TEXTS:
+        return True
+    return len(normalized) <= 2
+
+
+def score_response_text(text: str) -> int:
+    cleaned = re.sub(r"\s+", " ", text or "").strip()
+    if not cleaned:
+        return 0
+    score = min(len(cleaned), 240)
+    normalized = normalize_signal_text(cleaned)
+    if len(normalized) >= 8 or len(cleaned.split()) >= 3:
+        score += 20
+    if re.search(r"[\u4e00-\u9fff]", cleaned):
+        score += 20
+    if re.search(r"[，。！？,.!?;:]", cleaned):
+        score += 10
+    if not is_low_signal_response_text(cleaned):
+        score += 120
+    return score
+
+
+def probe_response_text(data: Any, kind: str) -> str:
+    if kind == "chat":
+        return extract_chat_response_text(data)
+    if kind == "responses":
+        return extract_responses_output_text(data)
+    return ""
+
+
+def probe_content_quality_result(data: Any, kind: str) -> dict[str, Any]:
+    if not PROBE_CONTENT_QUALITY_CHECK:
+        return {"healthy": True, "quality_checked": False}
+    text = probe_response_text(data, kind)
+    score = score_response_text(text)
+    sample = redact_text(text, 300)
+    if score < PROBE_MIN_QUALITY_SCORE:
+        reason = "empty_response" if not str(text or "").strip() else "low_signal_response"
+        return {
+            "healthy": False,
+            "reason": reason,
+            "quality_checked": True,
+            "quality_score": score,
+            "sample": sample,
+        }
+    return {
+        "healthy": True,
+        "quality_checked": True,
+        "quality_score": score,
+        "sample": sample,
+    }
 
 
 def upstream_path_for_kind(kind: str) -> str:
@@ -2750,12 +2845,27 @@ async def probe_one(provider: dict[str, Any], local_model: str, actual_model: st
                         "endpoint_url": url,
                     }
                     continue
+                quality = probe_content_quality_result(data, kind)
+                if not quality.get("healthy"):
+                    return {
+                        "healthy": False,
+                        "reason": quality.get("reason"),
+                        "status_code": response.status_code,
+                        "latency_ms": latency_ms,
+                        "sample": quality.get("sample", ""),
+                        "endpoint_url": url,
+                        "quality_checked": quality.get("quality_checked"),
+                        "quality_score": quality.get("quality_score"),
+                    }
                 return {
                     "healthy": True,
                     "reason": "ok",
                     "status_code": response.status_code,
                     "latency_ms": latency_ms,
                     "endpoint_url": url,
+                    "sample": quality.get("sample", ""),
+                    "quality_checked": quality.get("quality_checked"),
+                    "quality_score": quality.get("quality_score"),
                 }
             if last_result:
                 return last_result
@@ -2872,6 +2982,8 @@ async def probe_all(force: bool = False) -> None:
                     "checked_at": int(now()),
                     "next_probe_at": int(now()) + probe_cooldown_seconds(result.get("reason"), bool(result.get("healthy"))),
                     "sample": result.get("sample", ""),
+                    "quality_checked": result.get("quality_checked"),
+                    "quality_score": result.get("quality_score"),
                     "shape_status": result.get("shape_status") or "",
                     "shape_invalid_required": result.get("shape_invalid_required"),
                     "shape_verification_source": result.get("shape_verification_source") or "",

@@ -47,7 +47,7 @@ Upstream source management:
 
 Core behavior:
 
-- Pull provider model lists, then verify models with real minimal requests.
+- Pull provider model lists, then verify models with real minimal requests whose replies must be non-empty and not just low-signal text such as `ok`/`pong`.
 - Cache provider model lists and cooldown probe failures to avoid wasting token quota on repeated checks.
 - Maintain health by API kind, canonical model, provider, and actual model.
 - Show whether health is fresh or cached so operators can separate recent evidence from long TTL state.

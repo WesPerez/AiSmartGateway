@@ -39,7 +39,7 @@ Smart Gateway 的 `/v1/models` 不是所有上游 `/models` 的并集。当前�
 
 1. 通过 `model_include`。
 2. 未命中 `model_exclude`。
-3. 至少一个 `chat` 或 `responses` 健康上游达到 `MIN_HEALTHY_PROVIDERS`。
+3. 至少一个 `chat` 或 `responses` 健康上游达到 `MIN_HEALTHY_PROVIDERS`，且探测返回内容不是空回复或 `ok` / `pong` 这类低信号文本。
 4. 同步到 New API Router channel 后未被 New API 模型管理手动禁用。
 
 当前运营屏蔽包含：
@@ -117,8 +117,11 @@ Smart Gateway 后台是路由运维视图，不是第二套用户/令牌/订阅�
 - 鉴权/权限、额度：3600 秒。
 - 限流：1800 秒。
 - 服务异常、网络异常：900 秒。
+- 探测内容为空或低信号：900 秒。
 - Responses 探活形态待确认：60 秒。
 - Responses 真实形态确认不兼容：1800 秒。
+
+当前默认探测不再使用 `ping`，而是要求上游回复一句短句。普通 Chat/Responses 探测即使 HTTP 2xx 且没有 error，也会提取模型输出文本并打质量分；低于 `PROBE_MIN_QUALITY_SCORE` 时标记为 `low_signal_response` 或 `empty_response`，不进入健康候选。这个判断只应用于合成探测，不会因为真实用户请求要求“只回答 ok”而污染健康状态。
 
 如果某上游只支持 Claude Code / Anthropic Messages / Chat 形态，但 `/responses` 返回 `not implemented`，不能因为加了客户端 header 就把 Responses 标健康。该上游应按实际可用接口展示。
 

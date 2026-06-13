@@ -1000,6 +1000,7 @@ ADMIN_HTML = """
                 <th>探测路径</th>
                 <th>状态</th>
                 <th>新鲜度</th>
+                <th>质量</th>
                 <th>延迟</th>
                 <th>最近检测</th>
                 <th>下次探测</th>
@@ -1573,6 +1574,8 @@ ADMIN_HTML = """
         "quota",
         "rate_limited",
         "server_unavailable",
+        "empty_response",
+        "low_signal_response",
         "exception:ReadTimeout",
         "model_unsupported",
         "not_found",
@@ -1695,11 +1698,14 @@ ADMIN_HTML = """
       const responsesProbe = policy.enable_responses_probe === false ? "Responses 探测关闭" : "Responses 开启二段形态验证";
       const freshTtl = formatDuration(policy.health_fresh_ttl_seconds);
       const adaptiveRouting = policy.adaptive_format_routing === false ? "跨格式路由关闭" : `跨格式自适应开启，转换延迟惩罚 ${Number(policy.adapter_latency_penalty_ms || 0)}ms`;
+      const qualityEnabled = policy.probe_content_quality_check !== false;
+      const qualityRule = qualityEnabled ? `内容质量检查开启，低于 ${Number(policy.probe_min_quality_score || 0)} 分判异常` : "内容质量检查关闭";
       const cooldown = (key) => formatDuration(cooldowns[key]);
       const visible = [
         `每 ${interval || "-"} 增量探测，最多 ${maxPerCycle || "-"} 项`,
         `实时新鲜窗口 ${freshTtl || "-"}`,
-        "健康 = 2xx 且响应无 error",
+        qualityEnabled ? "健康 = 2xx + 无 error + 内容非低信号" : "健康 = 2xx 且响应无 error",
+        qualityRule,
         `${responsesProbe}`,
         adaptiveRouting,
         `真实请求成功会立即刷新健康；Responses 同形态 ${confirmations} 次失败才确认不兼容`
@@ -1714,8 +1720,9 @@ ADMIN_HTML = """
               <ul class="policy-list">
                 <li><span class="policy-key">记录粒度</span><span>每一行是接口类型、网关模型、上游、实际模型的组合。Chat 和 Responses 独立判定。</span></li>
                 <li><span class="policy-key">探测节奏</span><span>后台每 ${escapeHtml(interval || "-")} 跑增量探测；每轮最多 ${escapeHtml(maxPerCycle || "-")} 项。新记录、到期记录、配置签名变化优先探测，未到期记录保留上次结果。</span></li>
-                <li><span class="policy-key">Chat 判定</span><span>按配置请求 ${escapeHtml((data.health_policy || {}).chat_path || "/chat/completions")}；HTTP 2xx 且响应 JSON 没有 error 就是健康。</span></li>
-                <li><span class="policy-key">Responses 判定</span><span>先用轻量探测请求 ${escapeHtml((data.health_policy || {}).responses_path || "/responses")}；如果上游返回 invalid codex request，会追加一次 Codex 真实诊断形态探测，诊断成功就标健康。</span></li>
+                <li><span class="policy-key">Chat 判定</span><span>按配置请求 ${escapeHtml((data.health_policy || {}).chat_path || "/chat/completions")}；HTTP 2xx、JSON 没有 error，并且普通探测回复不是空内容或 ok/pong 这类低信号文本才标健康。</span></li>
+                <li><span class="policy-key">Responses 判定</span><span>先用轻量探测请求 ${escapeHtml((data.health_policy || {}).responses_path || "/responses")}；普通 JSON 探测同样检查输出质量。如果上游返回 invalid codex request，会追加一次 Codex 真实诊断形态探测，诊断成功就标健康。</span></li>
+                <li><span class="policy-key">内容质量</span><span>${escapeHtml(qualityRule)}。这是探测阶段的防虚标机制，只判断合成探测回复，不会因为用户真实业务请求要求“只回答 ok”而污染健康。</span></li>
                 <li><span class="policy-key">运行时反馈</span><span>真实业务请求成功会把对应上游立即标为 ok；运行时失败会写入 runtime_failure 并进入对应冷却。</span></li>
                 <li><span class="policy-key">健康新鲜度</span><span>最近 ${escapeHtml(freshTtl || "-")} 内成功验证显示为实时健康；超过该窗口但仍在成功 TTL 内显示为缓存健康，表示可路由但需要关注复查时间。</span></li>
                 <li><span class="policy-key">跨格式路由</span><span>${escapeHtml(adaptiveRouting)}。客户端请求格式保持不变，网关会把 OpenAI Chat、Responses、Codex 和 Claude 工具/图片/工具结果历史规范化后，按健康、延迟和权重选择可用上游，再把响应转回客户端格式；无法映射的 hosted tool 或高级字段才会被排除。</span></li>
@@ -1730,6 +1737,7 @@ ADMIN_HTML = """
                 <li><span class="policy-key">额度不足</span><span>${escapeHtml(cooldown("quota") || "-")}。</span></li>
                 <li><span class="policy-key">限流</span><span>${escapeHtml(cooldown("rate_limited") || "-")}。</span></li>
                 <li><span class="policy-key">服务异常</span><span>${escapeHtml(cooldown("server_unavailable") || "-")}，对应 5xx / empty_stream。</span></li>
+                <li><span class="policy-key">低信号回复</span><span>${escapeHtml(cooldown("low_signal_response") || "-")}，对应 2xx 但输出为空、只有 ok/pong/收到等无诊断价值内容。</span></li>
                 <li><span class="policy-key">网络异常</span><span>${escapeHtml(cooldown("exception") || "-")}，对应超时、连接错误等 exception。</span></li>
                 <li><span class="policy-key">形态待确认</span><span>${escapeHtml(cooldown("responses_shape_retry") || "-")} 后快速重试。</span></li>
                 <li><span class="policy-key">形态不兼容</span><span>${escapeHtml(cooldown("responses_real_shape_invalid") || "-")} 后再尝试。</span></li>
@@ -1782,6 +1790,19 @@ ADMIN_HTML = """
       return `<span class="chip ${cls}" title="距离最近检测${escapeHtml(age || '未知')}">${text}${escapeHtml(age)}</span>`;
     }
 
+    function qualityCell(item) {
+      if (item?.quality_score == null) return '<span class="muted">-</span>';
+      const score = Number(item.quality_score || 0);
+      const badQuality = ["empty_response", "low_signal_response"].includes(item.reason || "");
+      const cls = badQuality ? "warn" : "ok";
+      const sample = item.sample || "";
+      const shortSample = sample.length > 24 ? sample.slice(0, 24) + "..." : sample;
+      return `
+        <div class="chiprow"><span class="chip ${cls}" title="${escapeHtml(sample)}">Q ${score}</span></div>
+        ${shortSample ? `<div class="cell-sub mono" title="${escapeHtml(sample)}">${escapeHtml(shortSample)}</div>` : ""}
+      `;
+    }
+
     function renderMatrixFilterState(total, filtered) {
       document.querySelectorAll("[data-matrix-kind]").forEach((btn) => {
         btn.classList.toggle("active", btn.dataset.matrixKind === matrixKindFilter);
@@ -1831,6 +1852,7 @@ ADMIN_HTML = """
                 <td class="mono">${item.probe_path || ""}</td>
                 <td>${statusPill(!!item.healthy)}</td>
                 <td>${freshnessChip(item)}</td>
+                <td>${qualityCell(item)}</td>
                 <td>${item.latency_ms == null ? "" : item.latency_ms + " ms"}</td>
                 <td>${formatTs(item.checked_at, "未检测")}</td>
                 <td>${formatTs(item.next_probe_at)}</td>
@@ -1838,7 +1860,7 @@ ADMIN_HTML = """
               </tr>
             `);
       }
-      $("matrixBody").innerHTML = rows.length ? rows.join("") : '<tr><td colspan="13" class="muted">无匹配探测记录</td></tr>';
+      $("matrixBody").innerHTML = rows.length ? rows.join("") : '<tr><td colspan="14" class="muted">无匹配探测记录</td></tr>';
       renderPager("matrix", page.total, page.totalPages);
     }
 
@@ -1953,6 +1975,7 @@ ADMIN_HTML = """
       if (row.healthy_count > 0) return `健康缓存${ttl ? " " + ttl : ""}；到期后增量探测`;
       if (!data) return "暂无检测记录；等待增量探测";
       const reason = data.reason || "";
+      if (["empty_response", "low_signal_response"].includes(reason)) return `探测回复低信号冷却${ttl ? " " + ttl : ""}；到期后复查`;
       if (["not_found", "model_unsupported"].includes(reason)) return `模型不支持长冷却${ttl ? " " + ttl : ""}`;
       if (["auth_or_forbidden", "quota", "rate_limited", "server_unavailable", "empty_stream"].includes(reason)) return `异常冷却${ttl ? " " + ttl : ""}；到期后重试`;
       if (reason.startsWith("runtime_failure:")) return `运行时失败冷却${ttl ? " " + ttl : ""}`;
@@ -1966,6 +1989,9 @@ ADMIN_HTML = """
       }
       if (reasons.some((reason) => ["invalid_request", "responses_request_shape_unverified", "runtime_failure:invalid_request", "runtime_failure:responses_request_shape_unverified"].includes(reason))) {
         return "Responses 探活或真实请求形态被拒，按三次真实请求确认后再判不可用";
+      }
+      if (reasons.some((reason) => ["empty_response", "low_signal_response"].includes(reason))) {
+        return "探测返回 2xx 但内容为空或只有 ok/pong 等低信号文本，暂不作为健康候选";
       }
       if (row.healthy_count <= 0 && reasons.length) return reasons.join(", ");
       const mapped = Array.from(row.actual_models).filter((actual) => actual && actual !== row.model).sort(compareModelId);

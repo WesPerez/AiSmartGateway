@@ -32,15 +32,15 @@ probe:
     body:
       messages:
         - role: user
-          content: ping
-      max_tokens: 8
+          content: "Reply in one short sentence: gateway probe is working."
+      max_tokens: 16
       stream: false
   responses:
     enabled: true
     path: /responses
     body:
-      input: ping
-      max_output_tokens: 8
+      input: "Reply in one short sentence: gateway probe is working."
+      max_output_tokens: 16
       stream: false
 """,
         encoding="utf-8",
@@ -87,6 +87,25 @@ providers:
 
     module = importlib.reload(main)
     return module
+
+
+def chat_probe_response(text: str = "Gateway probe is working.") -> dict:
+    return {"id": "ok", "choices": [{"message": {"role": "assistant", "content": text}, "finish_reason": "stop"}]}
+
+
+def responses_probe_response(text: str = "Gateway probe is working.") -> dict:
+    return {
+        "id": "ok",
+        "object": "response",
+        "output_text": text,
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": text}],
+            }
+        ],
+    }
 
 
 @pytest.mark.asyncio()
@@ -1538,7 +1557,7 @@ async def test_probe_lists_only_really_healthy_models(gateway):
         return_value=httpx.Response(200, json={"data": [{"id": "good-model"}, {"id": "fake-model"}]})
     )
     respx.get("https://p2.example/v1/models").mock(return_value=httpx.Response(200, json={"data": []}))
-    respx.post("https://p1.example/v1/chat/completions").mock(return_value=httpx.Response(200, json={"id": "ok"}))
+    respx.post("https://p1.example/v1/chat/completions").mock(return_value=httpx.Response(200, json=chat_probe_response()))
     respx.post("https://p1.example/v1/responses").mock(return_value=httpx.Response(404, json={"error": "missing"}))
     respx.post("https://p2.example/v1/chat/completions").mock(return_value=httpx.Response(403, json={"error": "bad"}))
     respx.post("https://p2.example/v1/responses").mock(return_value=httpx.Response(403, json={"error": "bad"}))
@@ -1571,10 +1590,10 @@ async def test_probe_respects_cooldown_and_force_rechecks(gateway):
     )
     respx.get("https://p2.example/v1/models").mock(return_value=httpx.Response(200, json={"data": []}))
     chat_route = respx.post("https://p1.example/v1/chat/completions").mock(
-        return_value=httpx.Response(200, json={"id": "ok"})
+        return_value=httpx.Response(200, json=chat_probe_response())
     )
     responses_route = respx.post("https://p1.example/v1/responses").mock(
-        return_value=httpx.Response(200, json={"id": "ok"})
+        return_value=httpx.Response(200, json=responses_probe_response())
     )
     respx.post("https://p2.example/v1/chat/completions").mock(return_value=httpx.Response(403, json={"error": "bad"}))
     respx.post("https://p2.example/v1/responses").mock(return_value=httpx.Response(403, json={"error": "bad"}))
@@ -1610,7 +1629,7 @@ async def test_responses_probe_retries_missing_partial_generically(gateway):
                 400,
                 json={"error": {"code": "MissingParameter", "message": "missing `partial` parameter", "param": "partial"}},
             )
-        return httpx.Response(200, json={"id": "ok"})
+        return httpx.Response(200, json=responses_probe_response())
 
     route = respx.post("https://partial.example/v1/responses").mock(side_effect=handler)
     provider = {"id": "partial-provider", "base_url": "https://partial.example/v1", "api_key": "sk", "headers": {}}
@@ -1624,13 +1643,50 @@ async def test_responses_probe_retries_missing_partial_generically(gateway):
     assert gateway.RESPONSES_COMPAT_DEFAULTS["partial-provider"]["partial"] == "stream_bool"
 
 
+def test_probe_response_quality_scores_low_signal_and_informative_text(gateway):
+    assert gateway.score_response_text("ok") < gateway.PROBE_MIN_QUALITY_SCORE
+    assert gateway.score_response_text("Gateway probe is working.") >= gateway.PROBE_MIN_QUALITY_SCORE
+
+
+@pytest.mark.asyncio()
+@respx.mock
+async def test_probe_rejects_low_signal_chat_response(gateway):
+    await gateway.reload_config()
+    provider = {"id": "p1", "base_url": "https://p1.example/v1", "api_key": "sk-p1", "headers": {}}
+    respx.post("https://p1.example/v1/chat/completions").mock(return_value=httpx.Response(200, json=chat_probe_response("ok")))
+
+    result = await gateway.probe_one(provider, "good-model", "good-model", "chat")
+
+    assert result["healthy"] is False
+    assert result["reason"] == "low_signal_response"
+    assert result["quality_checked"] is True
+    assert result["quality_score"] < gateway.PROBE_MIN_QUALITY_SCORE
+    assert result["sample"] == "ok"
+    assert gateway.probe_cooldown_seconds(result["reason"], False) == gateway.PROBE_LOW_SIGNAL_TTL_SECONDS
+
+
+@pytest.mark.asyncio()
+@respx.mock
+async def test_probe_rejects_empty_responses_output(gateway):
+    await gateway.reload_config()
+    provider = {"id": "p1", "base_url": "https://p1.example/v1", "api_key": "sk-p1", "headers": {}}
+    respx.post("https://p1.example/v1/responses").mock(return_value=httpx.Response(200, json=responses_probe_response("")))
+
+    result = await gateway.probe_one(provider, "good-model", "good-model", "responses")
+
+    assert result["healthy"] is False
+    assert result["reason"] == "empty_response"
+    assert result["quality_checked"] is True
+    assert result["quality_score"] == 0
+
+
 @pytest.mark.asyncio()
 @respx.mock
 async def test_probe_success_overrides_responses_request_shape_runtime_failure(gateway):
     respx.get("https://p1.example/v1/models").mock(return_value=httpx.Response(200, json={"data": [{"id": "good-model"}]}))
     respx.get("https://p2.example/v1/models").mock(return_value=httpx.Response(200, json={"data": []}))
-    respx.post("https://p1.example/v1/chat/completions").mock(return_value=httpx.Response(200, json={"id": "ok"}))
-    respx.post("https://p1.example/v1/responses").mock(return_value=httpx.Response(200, json={"id": "ok"}))
+    respx.post("https://p1.example/v1/chat/completions").mock(return_value=httpx.Response(200, json=chat_probe_response()))
+    respx.post("https://p1.example/v1/responses").mock(return_value=httpx.Response(200, json=responses_probe_response()))
     respx.post("https://p2.example/v1/chat/completions").mock(return_value=httpx.Response(403, json={"error": "bad"}))
     respx.post("https://p2.example/v1/responses").mock(return_value=httpx.Response(403, json={"error": "bad"}))
     next_probe_at = int(gateway.now()) + 1800
@@ -1690,7 +1746,7 @@ async def test_responses_probe_verifies_codex_shape_after_simple_probe_rejection
 
     respx.get("https://p1.example/v1/models").mock(return_value=httpx.Response(200, json={"data": [{"id": "good-model"}]}))
     respx.get("https://p2.example/v1/models").mock(return_value=httpx.Response(200, json={"data": []}))
-    respx.post("https://p1.example/v1/chat/completions").mock(return_value=httpx.Response(200, json={"id": "ok"}))
+    respx.post("https://p1.example/v1/chat/completions").mock(return_value=httpx.Response(200, json=chat_probe_response()))
     responses_route = respx.post("https://p1.example/v1/responses").mock(side_effect=responses_handler)
     respx.post("https://p2.example/v1/chat/completions").mock(return_value=httpx.Response(403, json={"error": "bad"}))
     respx.post("https://p2.example/v1/responses").mock(return_value=httpx.Response(403, json={"error": "bad"}))
@@ -1703,7 +1759,7 @@ async def test_responses_probe_verifies_codex_shape_after_simple_probe_rejection
     assert item["shape_status"] == "codex_shape_verified"
     assert item["shape_verification_source"] == "diagnostic_codex_shape"
     assert responses_route.call_count == 2
-    assert seen_requests[0]["body"]["input"] == "ping"
+    assert seen_requests[0]["body"]["input"] == "Reply in one short sentence: gateway probe is working."
     assert seen_requests[0]["headers"]["openai-beta"] == "responses=v1"
     assert seen_requests[1]["body"]["stream"] is True
     assert "prompt_cache_key" in seen_requests[1]["body"]
@@ -1772,7 +1828,7 @@ async def test_probe_keeps_declared_models_when_probe_budget_is_exhausted(gatewa
     gateway.PROBE_MAX_PER_CYCLE = 1
     respx.get("https://p1.example/v1/models").mock(return_value=httpx.Response(200, json={"data": []}))
     respx.get("https://p2.example/v1/models").mock(return_value=httpx.Response(200, json={"data": []}))
-    respx.post("https://p1.example/v1/chat/completions").mock(return_value=httpx.Response(200, json={"id": "ok"}))
+    respx.post("https://p1.example/v1/chat/completions").mock(return_value=httpx.Response(200, json=chat_probe_response()))
 
     await gateway.probe_all()
 

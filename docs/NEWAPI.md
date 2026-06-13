@@ -163,6 +163,9 @@ The system distinguishes:
 - `rate_limited`: temporary limit.
 - `server_unavailable`: 5xx or upstream gateway failure.
 - `auth_or_forbidden`: credential or permission problem.
+- `empty_response` / `low_signal_response`: HTTP 2xx with no useful model
+  text. This prevents a provider that only returns `ok`, `pong`, an empty
+  completion, or another low-signal response from being treated as healthy.
 - `responses_request_shape_unverified`: the fixed probe or current request
   shape was rejected, but that does not prove the model is unavailable for a
   real Codex-shaped request.
@@ -184,6 +187,7 @@ Default health-loop and cooldown values:
 - auth/forbidden and quota: 3600 seconds
 - rate limited: 1800 seconds
 - server unavailable and exceptions: 900 seconds
+- empty or low-signal probe output: 900 seconds
 - unknown: 1800 seconds
 - Responses request-shape retry: 60 seconds
 - Responses confirmed real-shape invalid: 1800 seconds
@@ -191,6 +195,13 @@ Default health-loop and cooldown values:
 The admin overview API exposes these values as `health_policy`; the operations
 UI renders them in the `探测矩阵` help panel so operators can see the live
 policy instead of reading code.
+
+Probe content quality is enabled by default. The bundled probe asks for a short
+sentence instead of `ping`, then scores the returned text. A successful 2xx
+response still fails health if the extracted Chat/Responses text is empty or
+below `PROBE_MIN_QUALITY_SCORE`. This check is only for synthetic health
+probes; real user requests can still legitimately ask for terse output without
+poisoning provider health.
 
 `HEALTH_FRESH_TTL_SECONDS` is an operations-facing freshness window. A healthy
 item checked inside this window is shown as fresh; a healthy item older than

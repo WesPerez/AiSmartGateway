@@ -928,3 +928,31 @@ upstream_kind: 网关实际选择的上游接口格式
 - 管理 API 暴露健康新鲜度字段。
 
 完整验证结果：`87 passed`。
+
+## 2026-06-14 AI Key Vault 借鉴判断
+
+### 重新判断
+
+对比 AI Key Vault 后，结论不是“照搬”。Smart Gateway 的路由层、健康矩阵、冷却、运行时反写、跨格式适配和运维观测仍然是更完整的生产网关能力。Key Vault 更像个人诊断工具，它的 benchmark、Best-of-N 和回复质量评分都服务于“这个 key 手工测起来好不好用”。
+
+但 Key Vault 有一个点值得立即借鉴：`结构健康 != 内容健康`。旧的 Gateway 普通探测只要求 HTTP 2xx 且 JSON 没有 error，这会把空输出、`ok`、`pong`、`收到` 这类低信号回复误当成健康上游。实际路由时，这类上游可能稳定返回无意义内容，运营上看却是健康。
+
+### 已执行优化
+
+1. 默认探测 prompt 从 `ping` 改成要求一句短句：`Reply in one short sentence: gateway probe is working.`
+2. 普通 Chat/Responses 探测成功后提取模型输出文本并计算 `quality_score`。
+3. 空输出标记为 `empty_response`。
+4. `ok`、`pong`、`hi`、`收到`、`好的` 等低信号输出标记为 `low_signal_response`。
+5. `empty_response` / `low_signal_response` 不进入健康候选，默认冷却 `PROBE_LOW_SIGNAL_TTL_SECONDS=900` 秒。
+6. 新增可调参数：
+   - `PROBE_CONTENT_QUALITY_CHECK=true`
+   - `PROBE_MIN_QUALITY_SCORE=80`
+   - `PROBE_LOW_SIGNAL_TTL_SECONDS=900`
+7. 探测矩阵新增“质量”列，展示 `Q score` 和探测回复样本。
+8. 健康策略说明更新为：健康 = 2xx + 无 error + 普通探测内容非空且非低信号。
+9. 该质量检查只作用于合成探测，不检查真实用户业务回复；用户真实请求如果要求“只回答 ok”，不会污染上游健康。
+
+### 未立即采用的点
+
+- Benchmark / TTFT：有价值，但不应直接进入默认自动健康循环。真实测速成本高、会放大额度消耗，也容易让路由被短期波动牵引。更适合作为管理员手动诊断或后续独立页签。
+- Best-of-N 探测：对个人工具有意义，但 Gateway 已经按 Chat/Responses 分维度维护健康，并有运行时反写。自动同时打多种形态会增加探测成本。更适合后续做“手动诊断某个 provider/model”的功能，而不是默认后台循环。
