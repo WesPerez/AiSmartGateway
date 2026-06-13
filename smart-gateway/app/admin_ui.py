@@ -174,6 +174,28 @@ ADMIN_HTML = """
     .availability-filters input {
       width: 190px;
     }
+    .matrix-toolbar {
+      display: grid;
+      grid-template-columns: auto auto minmax(0, 1fr);
+      gap: 10px;
+      align-items: center;
+      margin-bottom: 12px;
+    }
+    .matrix-filters {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .matrix-filters input {
+      width: 190px;
+    }
+    .filter-count {
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }
     .availability-summary {
       color: var(--muted);
       font-size: 13px;
@@ -628,6 +650,8 @@ ADMIN_HTML = """
       .matrix-helpbar { grid-template-columns: 1fr; }
       .availability-toolbar { grid-template-columns: 1fr; }
       .availability-filters { justify-content: flex-start; }
+      .matrix-toolbar { grid-template-columns: 1fr; }
+      .matrix-filters { justify-content: flex-start; }
       .help-popover-panel { left: auto; right: 0; }
     }
     @media (max-width: 560px) {
@@ -812,6 +836,24 @@ ADMIN_HTML = """
 
       <section id="tab-matrix" class="tabpane hidden">
         <div id="matrixPolicyHelp" class="matrix-helpbar"></div>
+        <div class="matrix-toolbar">
+          <div class="segmented" role="group" aria-label="接口类型筛选">
+            <button type="button" class="active" data-matrix-kind="all">全部接口</button>
+            <button type="button" data-matrix-kind="chat">Chat</button>
+            <button type="button" data-matrix-kind="responses">Responses</button>
+          </div>
+          <div class="segmented" role="group" aria-label="健康状态筛选">
+            <button type="button" class="active" data-matrix-status="all">全部状态</button>
+            <button type="button" data-matrix-status="healthy">健康</button>
+            <button type="button" data-matrix-status="unhealthy">不健康</button>
+          </div>
+          <div class="matrix-filters">
+            <input id="matrixModelFilter" list="upstreamModelOptions" placeholder="筛选模型">
+            <input id="matrixUpstreamFilter" list="upstreamOptions" placeholder="筛选上游">
+            <span id="matrixFilterCount" class="filter-count">-</span>
+            <button id="matrixClearFilters" type="button">清空</button>
+          </div>
+        </div>
         <div class="tablewrap">
           <table>
             <thead>
@@ -917,6 +959,8 @@ ADMIN_HTML = """
     let logsData = { logs: [] };
     let providerDrafts = {};
     let availabilityView = "model";
+    let matrixKindFilter = "all";
+    let matrixStatusFilter = "all";
     const pageSizeOptions = [10, 25, 50, 100, 200];
     const pageSizes = { models: 10, matrix: 10, upstreams: 10, logs: 10, providers: 10 };
     const pages = { models: 1, matrix: 1, upstreams: 1, logs: 1, providers: 1 };
@@ -1579,18 +1623,55 @@ ADMIN_HTML = """
       `;
     }
 
+    function matrixFilters() {
+      return {
+        kind: matrixKindFilter,
+        status: matrixStatusFilter,
+        modelKeyword: ($("matrixModelFilter")?.value || "").trim().toLowerCase(),
+        upstreamKeyword: ($("matrixUpstreamFilter")?.value || "").trim().toLowerCase()
+      };
+    }
+
+    function matrixTextMatches(keyword, values) {
+      if (!keyword) return true;
+      return values.some((value) => String(value || "").toLowerCase().includes(keyword));
+    }
+
+    function matrixItemMatchesFilters(entry, filters) {
+      const item = entry.item || {};
+      if (filters.kind !== "all" && entry.kind !== filters.kind) return false;
+      if (filters.status === "healthy" && !item.healthy) return false;
+      if (filters.status === "unhealthy" && item.healthy) return false;
+      if (!matrixTextMatches(filters.modelKeyword, [entry.model, item.actual_model])) return false;
+      return matrixTextMatches(filters.upstreamKeyword, [item.provider_name, item.provider_id]);
+    }
+
+    function renderMatrixFilterState(total, filtered) {
+      document.querySelectorAll("[data-matrix-kind]").forEach((btn) => {
+        btn.classList.toggle("active", btn.dataset.matrixKind === matrixKindFilter);
+      });
+      document.querySelectorAll("[data-matrix-status]").forEach((btn) => {
+        btn.classList.toggle("active", btn.dataset.matrixStatus === matrixStatusFilter);
+      });
+      const count = $("matrixFilterCount");
+      if (count) count.textContent = `显示 ${filtered} / ${total}`;
+    }
+
     function renderMatrix(data) {
       renderMatrixPolicy(data);
       const rows = [];
-      const items = [];
+      const allItems = [];
       for (const kind of ["chat", "responses"]) {
         const group = data.health[kind] || {};
         for (const model of Object.keys(group).sort(compareModelId)) {
           for (const item of Object.values(group[model])) {
-            items.push({ kind, model, item });
+            allItems.push({ kind, model, item });
           }
         }
       }
+      const filters = matrixFilters();
+      const items = allItems.filter((entry) => matrixItemMatchesFilters(entry, filters));
+      renderMatrixFilterState(allItems.length, items.length);
       items.sort((a, b) =>
         Number(b.item.checked_at || 0) - Number(a.item.checked_at || 0) ||
         Number(a.item.next_probe_at || 0) - Number(b.item.next_probe_at || 0) ||
@@ -1620,7 +1701,7 @@ ADMIN_HTML = """
               </tr>
             `);
       }
-      $("matrixBody").innerHTML = rows.join("");
+      $("matrixBody").innerHTML = rows.length ? rows.join("") : '<tr><td colspan="12" class="muted">无匹配探测记录</td></tr>';
       renderPager("matrix", page.total, page.totalPages);
     }
 
@@ -2146,6 +2227,32 @@ ADMIN_HTML = """
     $("availabilityModelFilter").addEventListener("input", handleAvailabilityFilterInput);
     $("availabilityUpstreamFilter").addEventListener("input", handleAvailabilityFilterInput);
     $("showUnhealthyAvailability").addEventListener("change", handleAvailabilityFilterInput);
+
+    function handleMatrixFilterInput() {
+      pages.matrix = 1;
+      renderMatrix(state);
+    }
+    document.querySelectorAll("[data-matrix-kind]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        matrixKindFilter = btn.dataset.matrixKind || "all";
+        handleMatrixFilterInput();
+      });
+    });
+    document.querySelectorAll("[data-matrix-status]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        matrixStatusFilter = btn.dataset.matrixStatus || "all";
+        handleMatrixFilterInput();
+      });
+    });
+    $("matrixModelFilter").addEventListener("input", handleMatrixFilterInput);
+    $("matrixUpstreamFilter").addEventListener("input", handleMatrixFilterInput);
+    $("matrixClearFilters").addEventListener("click", () => {
+      matrixKindFilter = "all";
+      matrixStatusFilter = "all";
+      $("matrixModelFilter").value = "";
+      $("matrixUpstreamFilter").value = "";
+      handleMatrixFilterInput();
+    });
 
     document.addEventListener("input", (event) => {
       if (!event.target.closest("#tab-providers")) return;
