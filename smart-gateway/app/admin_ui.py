@@ -191,6 +191,27 @@ ADMIN_HTML = """
     .matrix-filters input {
       width: 190px;
     }
+    .logs-toolbar {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      gap: 10px;
+      align-items: center;
+      margin-bottom: 12px;
+    }
+    .logs-filters {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .logs-filters input,
+    .logs-filters select {
+      width: 170px;
+    }
+    .logs-filters .wide-filter {
+      width: 230px;
+    }
     .filter-count {
       color: var(--muted);
       font-size: 12px;
@@ -226,6 +247,22 @@ ADMIN_HTML = """
     .upstream-availability-table th:nth-child(8), .upstream-availability-table td:nth-child(8) { width: 165px; }
     .upstream-availability-table th:nth-child(9), .upstream-availability-table td:nth-child(9) { width: 230px; }
     .upstream-availability-table th:nth-child(10), .upstream-availability-table td:nth-child(10) { width: 170px; }
+    .logs-table {
+      min-width: 1580px;
+      table-layout: fixed;
+    }
+    .logs-table th:nth-child(1), .logs-table td:nth-child(1) { width: 170px; }
+    .logs-table th:nth-child(2), .logs-table td:nth-child(2) { width: 190px; }
+    .logs-table th:nth-child(3), .logs-table td:nth-child(3) { width: 115px; }
+    .logs-table th:nth-child(4), .logs-table td:nth-child(4) { width: 170px; }
+    .logs-table th:nth-child(5), .logs-table td:nth-child(5) { width: 230px; }
+    .logs-table th:nth-child(6), .logs-table td:nth-child(6) { width: 170px; }
+    .logs-table th:nth-child(7), .logs-table td:nth-child(7) { width: 170px; }
+    .logs-table th:nth-child(8), .logs-table td:nth-child(8) { width: 95px; }
+    .logs-table th:nth-child(9), .logs-table td:nth-child(9) { width: 95px; }
+    .logs-table th:nth-child(10), .logs-table td:nth-child(10) { width: 95px; }
+    .logs-table th:nth-child(11), .logs-table td:nth-child(11) { width: 170px; }
+    .logs-table th:nth-child(12), .logs-table td:nth-child(12) { width: 145px; }
     .matrix-helpbar {
       display: grid;
       grid-template-columns: minmax(220px, auto) minmax(0, 1fr);
@@ -652,6 +689,8 @@ ADMIN_HTML = """
       .availability-filters { justify-content: flex-start; }
       .matrix-toolbar { grid-template-columns: 1fr; }
       .matrix-filters { justify-content: flex-start; }
+      .logs-toolbar { grid-template-columns: 1fr; }
+      .logs-filters { justify-content: flex-start; }
       .help-popover-panel { left: auto; right: 0; }
     }
     @media (max-width: 560px) {
@@ -714,14 +753,79 @@ ADMIN_HTML = """
       </div>
 
       <div class="tabs">
-        <button class="tab active" data-tab="overview">运行概览</button>
+        <button class="tab active" data-tab="logs">路由日志</button>
+        <button class="tab" data-tab="overview">运行概览</button>
         <button class="tab" data-tab="models">模型可用性</button>
         <button class="tab" data-tab="matrix">探测矩阵</button>
-        <button class="tab" data-tab="logs">路由日志</button>
         <button class="tab" data-tab="providers">源池策略</button>
       </div>
 
-      <section id="tab-overview" class="tabpane">
+      <section id="tab-logs" class="tabpane">
+        <div class="logs-toolbar">
+          <div class="segmented" role="group" aria-label="路由日志结果筛选">
+            <button type="button" class="active" data-log-success="all">全部结果</button>
+            <button type="button" data-log-success="success">成功</button>
+            <button type="button" data-log-success="failure">失败</button>
+          </div>
+          <div class="logs-filters">
+            <input id="logSearchFilter" class="wide-filter" placeholder="搜索请求ID / 模型 / 上游 / 错误">
+            <input id="logModelFilter" list="upstreamModelOptions" placeholder="筛选模型">
+            <input id="logUpstreamFilter" list="upstreamOptions" placeholder="筛选上游">
+            <select id="logKindFilter" title="客户端接口">
+              <option value="all">全部接口</option>
+              <option value="chat">Chat</option>
+              <option value="responses">Responses</option>
+            </select>
+            <select id="logStreamFilter" title="流式模式">
+              <option value="all">全部模式</option>
+              <option value="stream">流式</option>
+              <option value="nonstream">非流式</option>
+            </select>
+            <select id="logAdapterFilter" title="格式转换">
+              <option value="all">全部转换</option>
+              <option value="native">原生</option>
+              <option value="adapted">跨格式</option>
+              <option value="codex_responses_to_chat">Codex 兼容</option>
+              <option value="responses_to_chat">Responses -> Chat</option>
+              <option value="chat_to_responses">Chat -> Responses</option>
+            </select>
+            <select id="logShapeFilter" title="请求形态">
+              <option value="all">全部形态</option>
+              <option value="image">带图片</option>
+              <option value="tools">带工具</option>
+              <option value="client_invalid_input">输入无效</option>
+            </select>
+            <input id="logErrorFilter" list="logErrorOptions" placeholder="错误类型">
+            <datalist id="logErrorOptions"></datalist>
+            <span id="logsFilterCount" class="filter-count">-</span>
+            <button id="logsClearFilters" type="button">清空</button>
+          </div>
+        </div>
+        <div class="tablewrap wide-table">
+          <table class="logs-table">
+            <thead>
+              <tr>
+                <th>时间</th>
+                <th>请求ID</th>
+                <th>接口</th>
+                <th>请求模型</th>
+                <th>上游</th>
+                <th>路由</th>
+                <th>上游模型</th>
+                <th>状态</th>
+                <th>耗时</th>
+                <th>Token</th>
+                <th>形态</th>
+                <th>错误</th>
+              </tr>
+            </thead>
+            <tbody id="logsBody"></tbody>
+          </table>
+        </div>
+        <div id="logsPager" class="pager"></div>
+      </section>
+
+      <section id="tab-overview" class="tabpane hidden">
         <div class="panel">
           <h2>入口归属</h2>
           <div class="notice">公开用户、令牌、额度、订阅、渠道和模型管理都在 New API。Smart Gateway 只作为 New API 后面的智能路由通道，不再发放客户端 Key。</div>
@@ -879,30 +983,6 @@ ADMIN_HTML = """
         <div id="matrixPager" class="pager"></div>
       </section>
 
-      <section id="tab-logs" class="tabpane hidden">
-        <div class="tablewrap">
-          <table>
-            <thead>
-              <tr>
-                <th>时间</th>
-                <th>请求ID</th>
-                <th>接口</th>
-                <th>请求模型</th>
-                <th>上游</th>
-                <th>路由</th>
-                <th>上游模型</th>
-                <th>状态</th>
-                <th>耗时</th>
-                <th>Token</th>
-                <th>错误</th>
-              </tr>
-            </thead>
-            <tbody id="logsBody"></tbody>
-          </table>
-        </div>
-        <div id="logsPager" class="pager"></div>
-      </section>
-
       <section id="tab-providers" class="tabpane hidden">
         <div class="row between" style="margin-bottom: 12px;">
           <div class="sub">源池策略会回写 New API 渠道。新增/删除上游、修改 key、模型权限、用户分组和订阅仍在 New API 管理。</div>
@@ -962,6 +1042,7 @@ ADMIN_HTML = """
     let availabilityView = "model";
     let matrixKindFilter = "all";
     let matrixStatusFilter = "all";
+    let logSuccessFilter = "all";
     const pageSizeOptions = [10, 25, 50, 100, 200];
     const pageSizes = { models: 10, matrix: 10, upstreams: 10, logs: 10, providers: 10 };
     const pages = { models: 1, matrix: 1, upstreams: 1, logs: 1, providers: 1 };
@@ -1000,6 +1081,10 @@ ADMIN_HTML = """
       const cls = ok ? "ok" : warn ? "warn" : "bad";
       const text = ok ? "健康" : warn ? "部分" : "不可用";
       return `<span class="pill ${cls}">${text}</span>`;
+    }
+
+    function logStatusPill(success) {
+      return `<span class="pill ${success ? "ok" : "bad"}">${success ? "成功" : "失败"}</span>`;
     }
 
     function formatTs(ts, empty = "") {
@@ -1890,24 +1975,120 @@ ADMIN_HTML = """
       renderPager("upstreams", page.total, page.totalPages);
     }
 
+    function logsFilters() {
+      return {
+        success: logSuccessFilter,
+        search: ($("logSearchFilter")?.value || "").trim().toLowerCase(),
+        model: ($("logModelFilter")?.value || "").trim().toLowerCase(),
+        upstream: ($("logUpstreamFilter")?.value || "").trim().toLowerCase(),
+        kind: $("logKindFilter")?.value || "all",
+        stream: $("logStreamFilter")?.value || "all",
+        adapter: $("logAdapterFilter")?.value || "all",
+        shape: $("logShapeFilter")?.value || "all",
+        error: ($("logErrorFilter")?.value || "").trim().toLowerCase()
+      };
+    }
+
+    function textMatches(keyword, values) {
+      if (!keyword) return true;
+      return values.some((value) => String(value || "").toLowerCase().includes(keyword));
+    }
+
+    function logUsesAdapter(row) {
+      const adapter = row.format_adapter || "native";
+      if (adapter && adapter !== "native") return true;
+      return Boolean(row.upstream_kind && row.kind && row.upstream_kind !== row.kind);
+    }
+
+    function logMatchesFilters(row, filters) {
+      const shape = row.request_shape || {};
+      if (filters.success === "success" && !row.success) return false;
+      if (filters.success === "failure" && row.success) return false;
+      if (filters.kind !== "all" && row.kind !== filters.kind) return false;
+      if (filters.stream === "stream" && !row.stream) return false;
+      if (filters.stream === "nonstream" && row.stream) return false;
+      if (filters.adapter === "native" && logUsesAdapter(row)) return false;
+      if (filters.adapter === "adapted" && !logUsesAdapter(row)) return false;
+      if (!["all", "native", "adapted"].includes(filters.adapter) && (row.format_adapter || "native") !== filters.adapter) return false;
+      if (filters.shape === "image" && !shape.has_image_content) return false;
+      if (filters.shape === "tools" && Number(shape.tools_count || 0) <= 0) return false;
+      if (filters.shape === "client_invalid_input" && row.error_type !== "client_invalid_input") return false;
+      if (!textMatches(filters.model, [row.requested_model, row.actual_model])) return false;
+      if (!textMatches(filters.upstream, [row.provider_id, row.provider_name, row.endpoint_url])) return false;
+      if (!textMatches(filters.error, [row.error_type, row.error_sample])) return false;
+      return textMatches(filters.search, [
+        row.request_id,
+        row.kind,
+        row.requested_model,
+        row.actual_model,
+        row.provider_id,
+        row.provider_name,
+        row.path,
+        row.endpoint_url,
+        row.route_bucket,
+        row.route_group,
+        row.upstream_kind,
+        row.format_adapter,
+        row.error_type,
+        row.error_sample,
+        (shape.message_content_types || []).join(" "),
+        (shape.body_keys || []).join(" ")
+      ]);
+    }
+
+    function logShapeSummary(row) {
+      const shape = row.request_shape || {};
+      const chips = [];
+      if (row.upstream_kind && row.upstream_kind !== row.kind) chips.push(`<span class="chip warn">上游 ${escapeHtml(row.upstream_kind)}</span>`);
+      if (row.format_adapter && row.format_adapter !== "native") chips.push(`<span class="chip dark">${escapeHtml(row.format_adapter)}</span>`);
+      if (shape.has_image_content) chips.push('<span class="chip ok">图片</span>');
+      if (Number(shape.tools_count || 0) > 0) chips.push(`<span class="chip ok">tools ${Number(shape.tools_count || 0)}</span>`);
+      if (shape.message_content_types?.length) chips.push(`<span class="chip dark">${escapeHtml(shape.message_content_types.join("+"))}</span>`);
+      return chips.length ? `<div class="chiprow">${chips.join("")}</div>` : "";
+    }
+
+    function updateLogErrorOptions(rows) {
+      const el = $("logErrorOptions");
+      if (!el) return;
+      const errors = Array.from(new Set(rows.map((row) => row.error_type).filter(Boolean))).sort(compareText);
+      el.innerHTML = errors.map((error) => `<option value="${escapeHtml(error)}"></option>`).join("");
+    }
+
+    function renderLogsFilterState(total, filtered) {
+      document.querySelectorAll("[data-log-success]").forEach((btn) => {
+        btn.classList.toggle("active", btn.dataset.logSuccess === logSuccessFilter);
+      });
+      const count = $("logsFilterCount");
+      if (count) count.textContent = `显示 ${filtered} / ${total}`;
+    }
+
     function renderLogs(data) {
-      const page = paginate("logs", data.logs || []);
+      const allRows = data.logs || [];
+      updateLogErrorOptions(allRows);
+      const filters = logsFilters();
+      const rows = allRows.filter((row) => logMatchesFilters(row, filters));
+      renderLogsFilterState(allRows.length, rows.length);
+      const page = paginate("logs", rows);
       $("logsBody").innerHTML = page.items.map((row) => {
         const usage = row.usage || {};
         const tokens = usage.total_tokens == null ? "" : usage.total_tokens;
         return `
           <tr>
             <td>${formatTs(row.ts)}</td>
-            <td class="mono">${row.request_id || ""}</td>
-            <td class="mono">${row.kind || ""}${row.stream ? " stream" : ""}</td>
-            <td class="mono">${row.requested_model || ""}</td>
-            <td>${row.provider_id || ""}</td>
-            <td>${routeLabel(row.route_bucket || row.route_group)}</td>
-            <td class="mono">${row.actual_model || ""}</td>
-            <td>${statusPill(!!row.success)}</td>
+            <td class="mono">${escapeHtml(row.request_id || "")}</td>
+            <td class="mono">${escapeHtml(row.kind || "")}${row.stream ? " stream" : ""}</td>
+            <td class="mono">${escapeHtml(row.requested_model || "")}</td>
+            <td>${escapeHtml(row.provider_id || "")}</td>
+            <td>
+              <div>${escapeHtml(routeLabel(row.route_bucket || row.route_group))}</div>
+              ${row.upstream_kind ? `<div class="cell-sub mono">${escapeHtml(row.upstream_kind)} / ${escapeHtml(row.format_adapter || "native")}</div>` : ""}
+            </td>
+            <td class="mono">${escapeHtml(row.actual_model || "")}</td>
+            <td>${logStatusPill(!!row.success)}</td>
             <td>${row.latency_ms == null ? "" : row.latency_ms + " ms"}</td>
             <td>${tokens}</td>
-            <td class="mono">${row.error_type || ""}</td>
+            <td>${logShapeSummary(row)}</td>
+            <td class="mono" title="${escapeHtml(row.error_sample || "")}">${escapeHtml(row.error_type || "")}</td>
           </tr>
         `;
       }).join("");
@@ -2041,7 +2222,7 @@ ADMIN_HTML = """
         api("/gateway-admin/api/overview"),
         api("/gateway-admin/api/providers")
       ]);
-      const logs = await api("/gateway-admin/api/request-logs?limit=200");
+      const logs = await api("/gateway-admin/api/request-logs?limit=500");
       state = overview;
       providers = providerData.providers;
       providerDrafts = preserveDrafts ? previousDrafts : {};
@@ -2279,6 +2460,43 @@ ADMIN_HTML = """
       $("matrixModelFilter").value = "";
       $("matrixUpstreamFilter").value = "";
       handleMatrixFilterInput();
+    });
+
+    function handleLogFilterInput() {
+      pages.logs = 1;
+      renderLogs(logsData);
+    }
+    document.querySelectorAll("[data-log-success]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        logSuccessFilter = btn.dataset.logSuccess || "all";
+        handleLogFilterInput();
+      });
+    });
+    [
+      "logSearchFilter",
+      "logModelFilter",
+      "logUpstreamFilter",
+      "logErrorFilter"
+    ].forEach((id) => $(id).addEventListener("input", handleLogFilterInput));
+    [
+      "logKindFilter",
+      "logStreamFilter",
+      "logAdapterFilter",
+      "logShapeFilter"
+    ].forEach((id) => $(id).addEventListener("change", handleLogFilterInput));
+    $("logsClearFilters").addEventListener("click", () => {
+      logSuccessFilter = "all";
+      [
+        "logSearchFilter",
+        "logModelFilter",
+        "logUpstreamFilter",
+        "logErrorFilter"
+      ].forEach((id) => { $(id).value = ""; });
+      $("logKindFilter").value = "all";
+      $("logStreamFilter").value = "all";
+      $("logAdapterFilter").value = "all";
+      $("logShapeFilter").value = "all";
+      handleLogFilterInput();
     });
 
     document.addEventListener("input", (event) => {

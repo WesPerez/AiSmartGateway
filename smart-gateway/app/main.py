@@ -3163,6 +3163,7 @@ async def relay_non_stream(
                         "success": True,
                         "usage": extract_usage(data),
                         "route_controls": controls,
+                        "request_shape": request_shape(body, incoming_headers),
                         **route_fields,
                     }
                 )
@@ -3402,6 +3403,7 @@ async def relay_stream(
                                     "latency_ms": latency_ms,
                                     "success": True,
                                     "route_controls": controls,
+                                    "request_shape": request_shape(body, incoming_headers),
                                     **route_fields,
                                 }
                             )
