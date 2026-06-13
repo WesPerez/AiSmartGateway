@@ -409,7 +409,9 @@ def runtime_failure_cooling_down(item: dict[str, Any] | None) -> bool:
     reason = str(item.get("reason") or "")
     if responses_request_shape_reason(reason):
         return False
-    return reason.startswith("runtime_failure:") and float(item.get("next_probe_at") or 0) > now()
+    if responses_real_shape_invalid_reason(reason):
+        return float(item.get("next_probe_at") or 0) > now()
+    return False
 
 
 async def save_state() -> None:
@@ -1004,7 +1006,13 @@ def classify_error(status_code: int, text: str) -> str:
     unsupported = ("not support", "unsupported", "不支持", "model not found", "model_not_found", "模型不存在")
     if any(word in sample for word in unsupported):
         return "model_unsupported"
-    invalid_request = ("invalid codex request", "invalid_responses_request", "invalid request", "invalid_request")
+    invalid_request = (
+        "invalid codex request",
+        "invalid_responses_request",
+        "invalid request",
+        "invalid_request",
+        "missing `partial` parameter",
+    )
     if status_code == 400 and any(word in sample for word in invalid_request):
         return "invalid_request"
     if status_code in (401, 403):
@@ -1026,6 +1034,17 @@ def response_has_error_json(data: Any) -> bool:
 
 def upstream_path_for_kind(kind: str) -> str:
     return "/responses" if kind == "responses" else "/chat/completions"
+
+
+def responses_partial_required(target: dict[str, Any]) -> bool:
+    urls = [str(target.get("base_url") or ""), *[str(url) for url in (target.get("base_urls") or [])]]
+    return any("volces.com/api/coding" in url or "/api/coding/" in url for url in urls)
+
+
+def apply_responses_provider_defaults(body: dict[str, Any], target: dict[str, Any]) -> dict[str, Any]:
+    if responses_partial_required(target) and "partial" not in body:
+        body["partial"] = bool(body.get("stream", False))
+    return body
 
 
 def safe_text_from_content(content: Any) -> str | None:
@@ -1421,7 +1440,8 @@ async def probe_codex_responses_shape(
 ) -> dict[str, Any]:
     headers = provider_headers(provider, codex_shape_diagnostic_headers(), "responses")
     headers["Accept"] = "text/event-stream"
-    async with client.stream("POST", url, headers=headers, json=codex_shape_diagnostic_body(actual_model)) as response:
+    body = apply_responses_provider_defaults(codex_shape_diagnostic_body(actual_model), provider)
+    async with client.stream("POST", url, headers=headers, json=body) as response:
         latency_ms = int((now() - start) * 1000)
         if response.status_code < 200 or response.status_code >= 300:
             raw = await response.aread()
@@ -1493,6 +1513,8 @@ async def probe_one(provider: dict[str, Any], local_model: str, actual_model: st
 
     body = deepcopy(probe_cfg.get("body") or {})
     body["model"] = actual_model
+    if kind == "responses":
+        apply_responses_provider_defaults(body, provider)
     start = now()
     last_result: dict[str, Any] | None = None
     try:
@@ -1566,6 +1588,28 @@ async def probe_one(provider: dict[str, Any], local_model: str, actual_model: st
         }
 
 
+def probe_candidate_sort_key(candidate: dict[str, Any]) -> tuple[Any, ...]:
+    previous = candidate.get("previous")
+    reason = str((previous or {}).get("reason") or "")
+    if reason.startswith("runtime_failure:"):
+        state_rank = 0
+    elif previous is None or not previous.get("checked_at"):
+        state_rank = 1
+    elif candidate.get("due"):
+        state_rank = 2
+    else:
+        state_rank = 3
+    return (
+        state_rank,
+        0 if candidate.get("due") else 1,
+        -int(candidate["item"].get("priority", 0)),
+        -int(candidate["item"].get("weight", 0)),
+        candidate["item"].get("provider_name") or "",
+        candidate["local_model"],
+        candidate["kind"],
+    )
+
+
 async def probe_all(force: bool = False) -> None:
     global LAST_PROBE_AT
     await reload_config()
@@ -1624,17 +1668,7 @@ async def probe_all(force: bool = False) -> None:
                     }
                 )
 
-    candidates.sort(
-        key=lambda candidate: (
-            0 if candidate["previous"] is None or not candidate["previous"].get("checked_at") else 1,
-            0 if candidate["due"] else 1,
-            -int(candidate["item"].get("priority", 0)),
-            -int(candidate["item"].get("weight", 0)),
-            candidate["item"].get("provider_name") or "",
-            candidate["local_model"],
-            candidate["kind"],
-        )
-    )
+    candidates.sort(key=probe_candidate_sort_key)
 
     for candidate in candidates:
         provider = candidate["provider"]
@@ -2434,7 +2468,7 @@ def normalize_responses_upstream_body(body: dict[str, Any], chosen: dict[str, An
     if "instructions" not in req_body:
         req_body["instructions"] = ""
     req_body.setdefault("store", False)
-    return req_body
+    return apply_responses_provider_defaults(req_body, chosen)
 
 
 async def relay_non_stream(

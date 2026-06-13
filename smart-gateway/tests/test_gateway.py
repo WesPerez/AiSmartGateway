@@ -216,6 +216,33 @@ def test_probe_cooldown_retries_responses_shape_quickly(gateway):
     )
 
 
+def test_runtime_failure_cooldown_only_preserves_real_shape_invalid(gateway):
+    future = int(gateway.now()) + 1800
+
+    assert gateway.runtime_failure_cooling_down({"reason": "runtime_failure:all_endpoints_failed", "next_probe_at": future}) is False
+    assert gateway.runtime_failure_cooling_down({"reason": "runtime_failure:server_unavailable", "next_probe_at": future}) is False
+    assert gateway.runtime_failure_cooling_down({"reason": "runtime_failure:real_shape_invalid", "next_probe_at": future}) is True
+
+
+def test_probe_candidate_sort_prioritizes_runtime_failures(gateway):
+    runtime_failed = {
+        "previous": {"reason": "runtime_failure:all_endpoints_failed", "checked_at": 123},
+        "due": True,
+        "item": {"priority": 1, "weight": 1, "provider_name": "b"},
+        "local_model": "deepseek-v4-pro",
+        "kind": "responses",
+    }
+    unprobed = {
+        "previous": None,
+        "due": True,
+        "item": {"priority": 100, "weight": 100, "provider_name": "a"},
+        "local_model": "other-model",
+        "kind": "chat",
+    }
+
+    assert sorted([unprobed, runtime_failed], key=gateway.probe_candidate_sort_key)[0] is runtime_failed
+
+
 def test_normalize_responses_upstream_body_adds_codex_required_defaults(gateway):
     body = {"model": "gpt-5.5", "input": [{"role": "user", "content": "ping"}], "stream": True}
     chosen = {"actual_model": "gpt-5.5"}
@@ -227,6 +254,28 @@ def test_normalize_responses_upstream_body_adds_codex_required_defaults(gateway)
     assert req_body["store"] is False
     assert "instructions" not in body
     assert "store" not in body
+
+
+def test_normalize_responses_upstream_body_adds_volces_partial(gateway):
+    body = {"model": "deepseek-v4-pro", "input": "ping", "stream": True}
+    chosen = {
+        "actual_model": "deepseek-v4-pro",
+        "base_url": "https://ark.cn-beijing.volces.com/api/coding/v3",
+    }
+
+    req_body = gateway.normalize_responses_upstream_body(body, chosen)
+
+    assert req_body["partial"] is True
+    assert "partial" not in body
+
+
+def test_responses_probe_body_adds_volces_partial(gateway):
+    body = {"model": "deepseek-v4-pro", "input": "ping", "stream": False}
+    provider = {"base_url": "https://ark.cn-beijing.volces.com/api/coding/v3"}
+
+    gateway.apply_responses_provider_defaults(body, provider)
+
+    assert body["partial"] is False
 
 
 def test_safe_format_adapters_convert_basic_text_bodies(gateway):
@@ -1788,6 +1837,52 @@ async def test_responses_stream_uses_paid_fallback_after_invalid_request(gateway
     joined = b"".join(chunks)
     assert paid_route.call_count == 1
     assert b"data: ok" in joined
+
+
+@pytest.mark.asyncio()
+async def test_responses_stream_adds_volces_partial_to_upstream_body(gateway, monkeypatch):
+    gateway.PROVIDERS = [
+        {
+            "id": "volces",
+            "base_url": "https://ark.cn-beijing.volces.com/api/coding/v3",
+            "api_key": "sk-volces",
+            "timeout_seconds": 3,
+            "headers": {},
+        },
+    ]
+    gateway.HEALTH = {
+        "responses": {
+            "deepseek-v4-pro": {
+                "volces": {
+                    "provider_id": "volces",
+                    "base_url": "https://ark.cn-beijing.volces.com/api/coding/v3",
+                    "actual_model": "deepseek-v4-pro",
+                    "healthy": True,
+                    "priority": 100,
+                    "weight": 1,
+                },
+            }
+        },
+        "chat": {},
+    }
+    monkeypatch.setattr(gateway, "pick_weighted", lambda candidates: candidates[0])
+
+    with respx.mock:
+        route = respx.post("https://ark.cn-beijing.volces.com/api/coding/v3/responses").mock(
+            return_value=httpx.Response(200, text="event: response.completed\ndata: {}\n\ndata: [DONE]\n\n")
+        )
+        chunks = [
+            chunk
+            async for chunk in gateway.relay_stream(
+                "/responses",
+                {"model": "deepseek-v4-pro", "input": "ping", "stream": True},
+                "responses",
+            )
+        ]
+
+    assert b"response.completed" in b"".join(chunks)
+    sent = json.loads(route.calls.last.request.content.decode())
+    assert sent["partial"] is True
 
 
 def make_request(host: str = "example.test") -> Request:

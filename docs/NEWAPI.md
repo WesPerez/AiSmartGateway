@@ -226,6 +226,12 @@ Smart Gateway currently normalizes Responses bodies by adding safe defaults
 such as `instructions: ""` and `store: false` when absent. It does not invent
 large tool lists or hidden Codex metadata.
 
+Volcengine Coding's OpenAI-compatible `/api/coding/v3/responses` endpoint may
+reject streamed Responses requests without a `partial` parameter. For that
+provider family, Smart Gateway adds `partial: true` for stream requests and
+`partial: false` for non-stream requests when the caller did not provide it.
+This applies to runtime requests, minimal probes, and Codex-shape diagnostics.
+
 For upstreams that restrict accepted clients, provider-level headers may be
 used to force a compatible client identity. One Claude aggregation provider was
 observed returning a client-restricted error when probes looked like

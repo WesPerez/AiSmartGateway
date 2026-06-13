@@ -381,6 +381,7 @@ Smart Gateway 后台逐步增加和调整了：
 - 官方说明有两个 base URL：一个兼容 Anthropic 协议，一个兼容 OpenAI 协议。
 - 曾经出现官方有 GLM 新版本但系统只识别旧 GLM 的问题。
 - 结论：Volcengine 不能只信 `/models`，应通过官方声明模型族和过滤规则选择最新 deepseek flash、deepseek pro、GLM。
+- 2026-06-13 复查 `deepseek-v4-pro` 失败时，最近日志显示上游 `/api/coding/v3/responses` 返回 `400 MissingParameter`，缺少 `partial` 参数；修复为对 Volcengine Coding Responses 自动补 `partial`，流式请求为 `true`，非流式请求为 `false`，并应用到运行时请求、minimal probe 和 Codex-shape diagnostic。
 - 后续建议：Volcengine provider 增加版本排序测试，确保 `glm-5.1` 这类官方新模型优先于旧版本。
 
 ### `/models` 为空但可用
