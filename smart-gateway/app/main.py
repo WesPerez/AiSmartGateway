@@ -871,6 +871,8 @@ def request_shape(body: dict[str, Any], incoming_headers: dict[str, str] | None 
     input_content_types: list[str] = []
     message_roles: list[str] = []
     message_content_types: list[str] = []
+    tool_types: list[str] = []
+    tool_key_sets: list[str] = []
     if isinstance(input_value, list):
         for item in input_value[:20]:
             if isinstance(item, dict):
@@ -903,6 +905,16 @@ def request_shape(body: dict[str, Any], incoming_headers: dict[str, str] | None 
                         content_type = type(content_item).__name__
                     if content_type and content_type not in message_content_types:
                         message_content_types.append(str(content_type))
+    if isinstance(tools_value, list):
+        for tool in tools_value[:20]:
+            if not isinstance(tool, dict):
+                continue
+            tool_type = str(tool.get("type") or "")
+            if tool_type and tool_type not in tool_types:
+                tool_types.append(tool_type)
+            key_set = ",".join(sorted(str(key) for key in tool.keys()))
+            if key_set and key_set not in tool_key_sets:
+                tool_key_sets.append(key_set)
     return {
         "body_keys": sorted(str(key) for key in body.keys()),
         "input_type": type(input_value).__name__ if "input" in body else "",
@@ -914,6 +926,8 @@ def request_shape(body: dict[str, Any], incoming_headers: dict[str, str] | None 
         "message_content_types": message_content_types,
         "has_image_content": any(content_type in {"image_url", "input_image"} for content_type in message_content_types + input_content_types),
         "tools_count": len(tools_value) if isinstance(tools_value, list) else None,
+        "tool_types": tool_types,
+        "tool_key_sets": tool_key_sets[:6],
         "has_prompt_cache_key": "prompt_cache_key" in body,
         "has_reasoning": "reasoning" in body,
         "has_text": "text" in body,
@@ -1346,6 +1360,43 @@ def codex_responses_input_from_chat_messages(messages: Any) -> tuple[str, list[d
     return "\n\n".join(instructions), inputs
 
 
+def openai_chat_tools_passthrough_compatible(tools: Any) -> bool:
+    if tools is None:
+        return True
+    if not isinstance(tools, list):
+        return False
+    for tool in tools:
+        if not isinstance(tool, dict):
+            return False
+        if str(tool.get("type") or "function") != "function":
+            return False
+        function = tool.get("function")
+        if not isinstance(function, dict) or not str(function.get("name") or "").strip():
+            return False
+    return True
+
+
+def function_tool_from_schema(tool: dict[str, Any], schema: dict[str, Any]) -> dict[str, Any] | None:
+    name = str(schema.get("name") or "").strip()
+    if not name:
+        return None
+    parameters = schema.get("parameters")
+    if not isinstance(parameters, dict):
+        parameters = schema.get("input_schema")
+    item: dict[str, Any] = {
+        "type": "function",
+        "name": name,
+        "description": str(schema.get("description") or ""),
+        "parameters": parameters if isinstance(parameters, dict) else {"type": "object", "properties": {}},
+    }
+    strict = schema.get("strict")
+    if strict is None:
+        strict = tool.get("strict")
+    if strict is not None:
+        item["strict"] = bool(strict)
+    return item
+
+
 def responses_tools_from_chat_tools(tools: Any) -> list[dict[str, Any]] | None:
     if tools is None:
         return []
@@ -1353,20 +1404,19 @@ def responses_tools_from_chat_tools(tools: Any) -> list[dict[str, Any]] | None:
         return None
     converted: list[dict[str, Any]] = []
     for tool in tools:
-        if not isinstance(tool, dict) or str(tool.get("type") or "") != "function":
+        if not isinstance(tool, dict):
             return None
-        function = tool.get("function") if isinstance(tool.get("function"), dict) else {}
-        name = str(function.get("name") or "").strip()
-        if not name:
+        tool_type = str(tool.get("type") or "")
+        if isinstance(tool.get("function"), dict):
+            item = function_tool_from_schema(tool, tool["function"])
+        elif tool.get("name") and (tool_type in {"", "function"} or "parameters" in tool or "input_schema" in tool):
+            item = function_tool_from_schema(tool, tool)
+        elif tool_type and tool_type != "function" and "function" not in tool:
+            item = deepcopy(tool)
+        else:
+            item = None
+        if item is None:
             return None
-        item: dict[str, Any] = {
-            "type": "function",
-            "name": name,
-            "description": str(function.get("description") or ""),
-            "parameters": function.get("parameters") if isinstance(function.get("parameters"), dict) else {"type": "object", "properties": {}},
-        }
-        if "strict" in function:
-            item["strict"] = bool(function.get("strict"))
         converted.append(item)
     return converted
 
@@ -1376,10 +1426,15 @@ def responses_tool_choice_from_chat_tool_choice(tool_choice: Any) -> Any:
         return None
     if isinstance(tool_choice, str):
         return tool_choice
-    if isinstance(tool_choice, dict) and str(tool_choice.get("type") or "") == "function":
+    if isinstance(tool_choice, dict):
+        choice_type = str(tool_choice.get("type") or "")
+        if choice_type in {"auto", "none", "required"}:
+            return choice_type
+        if choice_type == "any":
+            return "required"
         function = tool_choice.get("function") if isinstance(tool_choice.get("function"), dict) else {}
-        name = str(function.get("name") or "").strip()
-        if name:
+        name = str(function.get("name") or tool_choice.get("name") or "").strip()
+        if name and choice_type in {"", "function", "tool"}:
             return {"type": "function", "name": name}
     return None
 
@@ -1412,6 +1467,10 @@ def responses_body_can_use_chat_adapter(body: dict[str, Any]) -> bool:
     if any(field in body for field in RESPONSES_TO_CHAT_UNSAFE_FIELDS):
         return False
     return chat_messages_from_responses_input(body.get("input")) is not None
+
+
+def chat_body_can_use_native_chat_upstream(body: dict[str, Any]) -> bool:
+    return openai_chat_tools_passthrough_compatible(body.get("tools"))
 
 
 def chat_body_can_use_responses_adapter(body: dict[str, Any]) -> bool:
@@ -2877,6 +2936,8 @@ def route_item_format_adapter_allowed(
     body: dict[str, Any],
 ) -> bool:
     if client_kind == upstream_kind:
+        if client_kind == "chat":
+            return chat_body_can_use_native_chat_upstream(body)
         return True
     if not ADAPTIVE_FORMAT_ROUTING:
         return False

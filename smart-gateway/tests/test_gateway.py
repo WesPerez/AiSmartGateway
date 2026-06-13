@@ -536,6 +536,180 @@ def test_plain_responses_chat_adapter_rejects_legacy_function_fields(gateway):
     assert gateway.chat_body_can_use_responses_adapter(body) is False
 
 
+def test_plain_responses_chat_adapter_accepts_responses_and_anthropic_tool_shapes(gateway):
+    tools = [
+        {
+            "type": "function",
+            "name": "lookup",
+            "description": "Lookup a value",
+            "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+        },
+        {
+            "name": "read_file",
+            "description": "Read a file",
+            "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}},
+        },
+    ]
+
+    converted = gateway.responses_tools_from_chat_tools(tools)
+
+    assert converted == [
+        {
+            "type": "function",
+            "name": "lookup",
+            "description": "Lookup a value",
+            "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+        },
+        {
+            "type": "function",
+            "name": "read_file",
+            "description": "Read a file",
+            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+        },
+    ]
+    assert gateway.openai_chat_tools_passthrough_compatible(tools) is False
+    assert gateway.chat_body_can_use_responses_adapter(
+        {"model": "good-model", "messages": [{"role": "user", "content": "ping"}], "tools": tools}
+    )
+    assert gateway.responses_tool_choice_from_chat_tool_choice({"type": "any"}) == "required"
+    assert gateway.responses_tool_choice_from_chat_tool_choice({"type": "tool", "name": "lookup"}) == {
+        "type": "function",
+        "name": "lookup",
+    }
+    assert gateway.responses_tools_from_chat_tools([{"type": "function"}]) is None
+
+
+def test_non_chat_native_tool_shape_skips_native_chat_candidate(gateway):
+    gateway.HEALTH = {
+        "chat": {
+            "good-model": {
+                "chat-provider": {
+                    "provider_id": "chat-provider",
+                    "actual_model": "good-model",
+                    "healthy": True,
+                    "priority": 100,
+                    "weight": 1,
+                    "latency_ms": 20,
+                },
+            }
+        },
+        "responses": {
+            "good-model": {
+                "responses-provider": {
+                    "provider_id": "responses-provider",
+                    "actual_model": "good-model",
+                    "healthy": True,
+                    "priority": 100,
+                    "weight": 1,
+                    "latency_ms": 20,
+                },
+            }
+        },
+    }
+    body = {
+        "model": "good-model",
+        "messages": [{"role": "user", "content": "ping"}],
+        "tools": [
+            {
+                "type": "function",
+                "name": "lookup",
+                "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+            }
+        ],
+    }
+
+    buckets = gateway.adaptive_candidate_buckets("good-model", "chat", body)
+    items = [item for bucket in buckets for item in bucket["items"]]
+
+    assert [item["provider_id"] for item in items] == ["responses-provider"]
+    assert items[0]["_format_adapter"] == "responses_to_chat"
+
+
+@pytest.mark.asyncio()
+async def test_chat_request_with_responses_style_tools_routes_directly_to_responses(gateway, monkeypatch):
+    gateway.PROVIDERS = [
+        {"id": "chat-provider", "base_url": "https://chat.example/v1", "api_key": "sk-chat", "timeout_seconds": 3, "headers": {}},
+        {"id": "responses-provider", "base_url": "https://responses.example/v1", "api_key": "sk-resp", "timeout_seconds": 3, "headers": {}},
+    ]
+    gateway.HEALTH = {
+        "chat": {
+            "good-model": {
+                "chat-provider": {
+                    "provider_id": "chat-provider",
+                    "actual_model": "actual-chat",
+                    "healthy": True,
+                    "priority": 100,
+                    "weight": 1,
+                    "latency_ms": 20,
+                },
+            }
+        },
+        "responses": {
+            "good-model": {
+                "responses-provider": {
+                    "provider_id": "responses-provider",
+                    "actual_model": "actual-responses",
+                    "healthy": True,
+                    "priority": 100,
+                    "weight": 1,
+                    "latency_ms": 20,
+                },
+            }
+        },
+    }
+    monkeypatch.setattr(gateway, "pick_weighted", lambda candidates: candidates[0])
+    body = {
+        "model": "good-model",
+        "messages": [{"role": "user", "content": "ping"}],
+        "tools": [
+            {
+                "type": "function",
+                "name": "lookup",
+                "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+            }
+        ],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent = json.loads(request.content.decode())
+        assert sent["tools"] == [
+            {
+                "type": "function",
+                "name": "lookup",
+                "description": "",
+                "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+            }
+        ]
+        return httpx.Response(
+            200,
+            json={
+                "id": "resp-ok",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "pong"}],
+                    }
+                ],
+            },
+        )
+
+    with respx.mock:
+        chat_route = respx.post("https://chat.example/v1/chat/completions").mock(
+            return_value=httpx.Response(400, json={"error": {"message": "should not hit native chat"}})
+        )
+        responses_route = respx.post("https://responses.example/v1/responses").mock(side_effect=handler)
+        response = await gateway.relay_non_stream("/chat/completions", body, "chat")
+
+    assert response.status_code == 200
+    assert chat_route.call_count == 0
+    assert responses_route.call_count == 1
+    logs = gateway.read_recent_request_logs()
+    assert logs[0]["upstream_kind"] == "responses"
+    assert logs[0]["format_adapter"] == "responses_to_chat"
+    assert logs[0]["request_shape"]["tool_key_sets"] == ["name,parameters,type"]
+
+
 def test_chat_adapter_uses_codex_compat_for_codex_shape_responses_health(gateway):
     gateway.HEALTH = {
         "chat": {},
