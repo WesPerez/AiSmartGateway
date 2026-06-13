@@ -645,6 +645,10 @@ ADMIN_HTML = """
         <div class="sub">New API 后置智能路由层：运行观测、模型可用性、探测矩阵、最终流向和兜底策略</div>
       </div>
       <div class="row">
+        <label class="inline-toggle" title="每 10 秒自动刷新管理页数据">
+          <input id="autoRefresh" type="checkbox">
+          <span>自动刷新 <span id="autoRefreshCountdown"></span></span>
+        </label>
         <button id="refreshBtn" title="只刷新当前管理页展示数据，不触发同步或探测">刷新</button>
         <button id="logoutBtn" title="清除当前浏览器保存的 Admin Token">退出</button>
       </div>
@@ -907,6 +911,7 @@ ADMIN_HTML = """
 
   <script>
     const tokenKey = "ai-smart-gateway-admin-token";
+    const autoRefreshKey = "ai-smart-gateway-auto-refresh";
     let state = null;
     let providers = [];
     let logsData = { logs: [] };
@@ -1952,6 +1957,47 @@ ADMIN_HTML = """
       if (tab.dataset.tab === "providers") renderRouteBoard();
     }
 
+    const AUTO_REFRESH_MS = 10000;
+    let autoRefreshTimer = null;
+    let autoRefreshCountdownTimer = null;
+    let autoRefreshRemaining = 0;
+
+    function clearAutoRefresh() {
+      if (autoRefreshTimer) { clearInterval(autoRefreshTimer); autoRefreshTimer = null; }
+      if (autoRefreshCountdownTimer) { clearInterval(autoRefreshCountdownTimer); autoRefreshCountdownTimer = null; }
+      autoRefreshRemaining = 0;
+      const el = $("autoRefreshCountdown");
+      if (el) el.textContent = "";
+    }
+
+    function startAutoRefresh() {
+      clearAutoRefresh();
+      autoRefreshRemaining = Math.round(AUTO_REFRESH_MS / 1000);
+      const countdownEl = $("autoRefreshCountdown");
+      if (countdownEl) countdownEl.textContent = `${autoRefreshRemaining}s`;
+      autoRefreshCountdownTimer = setInterval(() => {
+        autoRefreshRemaining = Math.max(0, autoRefreshRemaining - 1);
+        if (countdownEl) countdownEl.textContent = `${autoRefreshRemaining}s`;
+      }, 1000);
+      autoRefreshTimer = setInterval(async () => {
+        try { await loadAll({ preserveDrafts: true }); } catch {}
+        autoRefreshRemaining = Math.round(AUTO_REFRESH_MS / 1000);
+        if (countdownEl) countdownEl.textContent = `${autoRefreshRemaining}s`;
+      }, AUTO_REFRESH_MS);
+    }
+
+    function applyAutoRefreshSetting(enabled) {
+      const cb = $("autoRefresh");
+      if (cb) cb.checked = enabled;
+      if (enabled) startAutoRefresh(); else clearAutoRefresh();
+    }
+
+    $("autoRefresh").addEventListener("change", (event) => {
+      const enabled = event.target.checked;
+      localStorage.setItem(autoRefreshKey, enabled ? "1" : "0");
+      applyAutoRefreshSetting(enabled);
+    });
+
     let tabRefreshSeq = 0;
     async function refreshAfterTabClick(tab) {
       const seq = ++tabRefreshSeq;
@@ -2125,7 +2171,9 @@ ADMIN_HTML = """
     });
 
     if (token()) {
-      loadAll().catch((err) => showLogin(err.message));
+      loadAll().then(() => {
+        applyAutoRefreshSetting(localStorage.getItem(autoRefreshKey) === "1");
+      }).catch((err) => showLogin(err.message));
     } else {
       showLogin();
     }
