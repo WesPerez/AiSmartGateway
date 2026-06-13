@@ -425,6 +425,10 @@ without usage, `ADAPTER_SYNTHESIZE_USAGE=true` makes the adapter emit a
 conservative estimated usage on `response.completed` with `estimated: true`.
 This prevents New API from recording successful Responses requests as
 zero-token failures such as `total tokens is 0, cannot consume quota`.
+The final `response.completed.response` also carries full `output` and
+`output_text` for Chat -> Responses streams. New API's Claude/Anthropic
+conversion path may reject a stream with `422` / `NO OUTPUT IN RESPONSE` when
+only delta events were sent and the completed response object has no output.
 
 Real validation on 2026-06-13 covered:
 

@@ -3002,6 +3002,14 @@ async def test_responses_client_stream_from_chat_upstream_handles_split_sse_even
     assert b'"delta":"hello"' in joined
     assert b"event: response.completed" in joined
     assert joined.endswith(b"data: [DONE]\n\n")
+    payloads = [
+        json.loads(payload)
+        for payload in gateway.iter_sse_data_payloads(joined.decode())
+        if payload != "[DONE]"
+    ]
+    completed = next(item for item in payloads if item.get("type") == "response.completed")
+    assert completed["response"]["output_text"] == "hello"
+    assert completed["response"]["output"][0]["content"][0]["text"] == "hello"
 
 
 @pytest.mark.asyncio()
@@ -3067,6 +3075,8 @@ async def test_responses_client_stream_from_chat_upstream_preserves_usage(gatewa
     ]
     completed = next(item for item in payloads if item.get("type") == "response.completed")
     usage = completed["response"]["usage"]
+    assert completed["response"]["output_text"] == "hello"
+    assert completed["response"]["output"][0]["content"][0]["text"] == "hello"
     assert usage["input_tokens"] == 11
     assert usage["output_tokens"] == 2
     assert usage["total_tokens"] == 13
@@ -3133,10 +3143,115 @@ async def test_responses_client_stream_from_chat_upstream_synthesizes_missing_us
     ]
     completed = next(item for item in payloads if item.get("type") == "response.completed")
     usage = completed["response"]["usage"]
+    assert completed["response"]["output_text"] == "hello"
+    assert completed["response"]["output"][0]["content"][0]["text"] == "hello"
     assert usage["estimated"] is True
     assert usage["input_tokens"] > 0
     assert usage["output_tokens"] > 0
     assert usage["total_tokens"] == usage["input_tokens"] + usage["output_tokens"]
+
+
+@pytest.mark.asyncio()
+async def test_responses_client_stream_from_chat_upstream_completed_includes_tool_output(gateway, monkeypatch):
+    gateway.PROVIDERS = [
+        {"id": "p1", "base_url": "https://p1.example/v1", "api_key": "sk-p1", "timeout_seconds": 3, "headers": {}},
+    ]
+    gateway.HEALTH = {
+        "chat": {
+            "good-model": {
+                "p1": {"provider_id": "p1", "actual_model": "good-model", "healthy": True, "priority": 100, "weight": 1},
+            }
+        },
+        "responses": {},
+    }
+    monkeypatch.setattr(gateway, "pick_weighted", lambda candidates: candidates[0])
+
+    class ToolChatStream:
+        status_code = 200
+
+        async def aiter_raw(self):
+            def chat_sse(payload):
+                return f"data: {json.dumps(payload, separators=(',', ':'))}\n\n".encode()
+
+            yield chat_sse(
+                {
+                    "id": "chatcmpl_test",
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {"name": "lookup", "arguments": ""},
+                                    }
+                                ]
+                            }
+                        }
+                    ],
+                }
+            )
+            yield chat_sse(
+                {
+                    "id": "chatcmpl_test",
+                    "choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": "{\"query\""}}]}}],
+                }
+            )
+            yield chat_sse(
+                {
+                    "id": "chatcmpl_test",
+                    "choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": ":\"ping\"}"}}]}}],
+                }
+            )
+            yield chat_sse({"id": "chatcmpl_test", "choices": [{"delta": {}, "finish_reason": "tool_calls"}]})
+            yield b"data: [DONE]\n\n"
+
+    class ToolChatContext:
+        async def __aenter__(self):
+            return ToolChatStream()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class ToolChatClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def stream(self, *args, **kwargs):
+            return ToolChatContext()
+
+    monkeypatch.setattr(gateway.httpx, "AsyncClient", ToolChatClient)
+
+    chunks = [
+        chunk
+        async for chunk in gateway.relay_stream(
+            "/responses",
+            {
+                "model": "good-model",
+                "input": "call lookup",
+                "tools": [{"type": "function", "name": "lookup", "parameters": {"type": "object"}}],
+                "stream": True,
+            },
+            "responses",
+        )
+    ]
+    payloads = [
+        json.loads(payload)
+        for payload in gateway.iter_sse_data_payloads(b"".join(chunks).decode())
+        if payload != "[DONE]"
+    ]
+    completed = next(item for item in payloads if item.get("type") == "response.completed")
+    output = completed["response"]["output"]
+    assert output[0]["type"] == "function_call"
+    assert output[0]["name"] == "lookup"
+    assert output[0]["arguments"] == '{"query":"ping"}'
 
 
 @pytest.mark.asyncio()

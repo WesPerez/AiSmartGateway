@@ -385,6 +385,8 @@ def response_stream_event(
     error_type: str | None = None,
     message: str | None = None,
     usage: dict[str, Any] | None = None,
+    output: list[dict[str, Any]] | None = None,
+    output_text: str | None = None,
 ) -> bytes:
     response: dict[str, Any] = {
         "id": request_id,
@@ -395,6 +397,9 @@ def response_stream_event(
     }
     if usage:
         response["usage"] = usage
+    if output is not None:
+        response["output"] = output
+        response["output_text"] = output_text if output_text is not None else ""
     payload: dict[str, Any] = {"type": event_type, "response": response}
     if error_type or message:
         payload["error"] = {"type": error_type or "api_error", "message": message or error_type or "stream failed"}
@@ -403,8 +408,22 @@ def response_stream_event(
     return f"event: {event_type}\ndata: {data}\n\n".encode("utf-8")
 
 
-def response_completed_event(request_id: str, model: str | None, usage: dict[str, Any] | None = None) -> bytes:
-    return response_stream_event("response.completed", request_id, model, "completed", usage=usage)
+def response_completed_event(
+    request_id: str,
+    model: str | None,
+    usage: dict[str, Any] | None = None,
+    output: list[dict[str, Any]] | None = None,
+    output_text: str | None = None,
+) -> bytes:
+    return response_stream_event(
+        "response.completed",
+        request_id,
+        model,
+        "completed",
+        usage=usage,
+        output=output,
+        output_text=output_text,
+    )
 
 
 def response_failed_event(request_id: str, model: str | None, error_type: str, message: str) -> bytes:
@@ -2507,11 +2526,62 @@ def chat_to_responses_usage(state: dict[str, Any]) -> dict[str, Any] | None:
     return usage
 
 
+def responses_message_output_item(text: str) -> dict[str, Any]:
+    return {
+        "type": "message",
+        "id": f"msg_{uuid.uuid4().hex[:16]}",
+        "status": "completed",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": text, "annotations": []}],
+    }
+
+
+def chat_to_responses_final_output(state: dict[str, Any]) -> tuple[list[dict[str, Any]], str]:
+    text = "".join(state.get("response_output_parts") or [])
+    output: list[dict[str, Any]] = []
+    if text:
+        output.append(responses_message_output_item(text))
+    tool_calls = state.get("response_tool_calls")
+    if isinstance(tool_calls, dict):
+        for call in tool_calls.values():
+            if not isinstance(call, dict):
+                continue
+            name = str(call.get("name") or "").strip()
+            if not name:
+                continue
+            call_id = str(call.get("call_id") or call.get("id") or f"call_{uuid.uuid4().hex[:16]}")
+            output.append(
+                {
+                    "type": "function_call",
+                    "id": call_id,
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": "".join(call.get("arguments_parts") or []),
+                }
+            )
+    if not output:
+        output.append(responses_message_output_item(""))
+    return output, text
+
+
 def chat_to_responses_completed_event(request_id: str, model: str | None, state: dict[str, Any]) -> bytes:
     if state.get("response_completed_sent"):
         return b""
     state["response_completed_sent"] = True
-    return response_completed_event(request_id, model, chat_to_responses_usage(state))
+    output, output_text = chat_to_responses_final_output(state)
+    return response_completed_event(request_id, model, chat_to_responses_usage(state), output, output_text)
+
+
+def chat_stream_tool_call_state(state: dict[str, Any], index: int, call_id: str, name: str) -> dict[str, Any]:
+    tool_calls = state.setdefault("response_tool_calls", {})
+    key = f"tool_index_{index}"
+    record = tool_calls.setdefault(key, {"id": call_id, "call_id": call_id, "name": "", "arguments_parts": []})
+    if call_id:
+        record["id"] = call_id
+        record["call_id"] = call_id
+    if name:
+        record["name"] = name
+    return record
 
 
 def chat_stream_chunk_to_responses(
@@ -2546,11 +2616,14 @@ def chat_stream_chunk_to_responses(
                 if not isinstance(call, dict):
                     continue
                 index = int(call.get("index") or 0)
-                key = str(call.get("id") or f"tool_index_{index}")
+                key = f"tool_index_{index}"
                 function = call.get("function") if isinstance(call.get("function"), dict) else {}
-                call_id = str(call.get("id") or state.setdefault(f"chat_tool_call_id_{index}", f"call_{uuid.uuid4().hex[:16]}"))
+                if call.get("id"):
+                    state[f"chat_tool_call_id_{index}"] = str(call.get("id"))
+                call_id = str(state.setdefault(f"chat_tool_call_id_{index}", f"call_{uuid.uuid4().hex[:16]}"))
                 name = str(function.get("name") or "")
                 arguments = str(function.get("arguments") or "")
+                tool_state = chat_stream_tool_call_state(state, index, call_id, name)
                 added = state.setdefault("chat_tool_call_added", set())
                 if key not in added and (call.get("id") or name):
                     added.add(key)
@@ -2562,6 +2635,7 @@ def chat_stream_chunk_to_responses(
                         )
                     )
                 if arguments:
+                    tool_state.setdefault("arguments_parts", []).append(arguments)
                     state.setdefault("response_tool_argument_parts", []).append(arguments)
                     out.extend(
                         raw_response_sse_event(
@@ -2570,18 +2644,25 @@ def chat_stream_chunk_to_responses(
                         )
                     )
             if choice.get("finish_reason") == "tool_calls":
-                for index, call_id in [
-                    (int(key.rsplit("_", 1)[-1]), value)
-                    for key, value in state.items()
-                    if isinstance(key, str) and key.startswith("chat_tool_call_id_")
-                ]:
+                tool_calls = state.get("response_tool_calls") if isinstance(state.get("response_tool_calls"), dict) else {}
+                for key, call in tool_calls.items():
+                    if not isinstance(call, dict):
+                        continue
+                    index = int(str(key).rsplit("_", 1)[-1])
+                    call_id = str(call.get("call_id") or call.get("id") or f"call_{uuid.uuid4().hex[:16]}")
                     out.extend(
                         raw_response_sse_event(
                             "response.output_item.done",
                             {
                                 "type": "response.output_item.done",
                                 "output_index": index,
-                                "item": {"type": "function_call", "id": call_id, "call_id": call_id, "arguments": ""},
+                                "item": {
+                                    "type": "function_call",
+                                    "id": call_id,
+                                    "call_id": call_id,
+                                    "name": str(call.get("name") or ""),
+                                    "arguments": "".join(call.get("arguments_parts") or []),
+                                },
                             },
                         )
                     )
