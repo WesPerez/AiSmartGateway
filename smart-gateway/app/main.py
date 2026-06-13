@@ -1207,6 +1207,58 @@ def merge_chat_response_instructions(instructions: str, body: dict[str, Any]) ->
     return "\n\n".join(parts)
 
 
+def anthropic_image_source_url(source: Any) -> str:
+    if isinstance(source, str):
+        return source.strip()
+    if not isinstance(source, dict):
+        return ""
+    source_type = str(source.get("type") or "")
+    if source.get("url"):
+        return str(source.get("url") or "").strip()
+    if source_type == "base64":
+        media_type = str(source.get("media_type") or "image/png")
+        data = str(source.get("data") or "").strip()
+        if data:
+            return f"data:{media_type};base64,{data}"
+    return ""
+
+
+def tool_output_text(content: Any) -> str | None:
+    text = safe_text_from_content(content)
+    if text is not None:
+        return text
+    if isinstance(content, dict):
+        content_type = str(content.get("type") or "")
+        if content_type == "tool_result":
+            return tool_output_text(content.get("content"))
+        if content_type in {"text", "input_text", "output_text"}:
+            return str(content.get("text") or "")
+        if "content" in content:
+            return tool_output_text(content.get("content"))
+        return json.dumps(content, ensure_ascii=False, separators=(",", ":"))
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            item_text = tool_output_text(item)
+            if item_text is None:
+                return None
+            if item_text:
+                parts.append(item_text)
+        return "\n".join(parts)
+    return None
+
+
+def append_responses_message(inputs: list[dict[str, Any]], role: str, content_parts: list[dict[str, Any]]) -> None:
+    if content_parts or role == "user":
+        inputs.append(
+            {
+                "type": "message",
+                "role": role,
+                "content": content_parts or [{"type": "input_text", "text": ""}],
+            }
+        )
+
+
 def codex_responses_content_from_chat_content(content: Any, role: str) -> list[dict[str, Any]] | None:
     text_type = "input_text" if role == "user" else "output_text"
     if content is None:
@@ -1229,6 +1281,8 @@ def codex_responses_content_from_chat_content(content: Any, role: str) -> list[d
             if text or role == "user":
                 converted.append({"type": text_type, "text": text})
             continue
+        if part_type in {"thinking", "redacted_thinking"}:
+            continue
         if part_type == "image_url":
             if role != "user":
                 return None
@@ -1247,6 +1301,17 @@ def codex_responses_content_from_chat_content(content: Any, role: str) -> list[d
             item: dict[str, Any] = {"type": "input_image", "image_url": url}
             if detail:
                 item["detail"] = str(detail)
+            converted.append(item)
+            continue
+        if part_type == "image":
+            if role != "user":
+                return None
+            url = anthropic_image_source_url(part.get("source"))
+            if not url:
+                return None
+            item = {"type": "input_image", "image_url": url}
+            if part.get("detail"):
+                item["detail"] = str(part.get("detail"))
             converted.append(item)
             continue
         if part_type == "input_image":
@@ -1268,6 +1333,8 @@ def codex_responses_content_from_chat_content(content: Any, role: str) -> list[d
                 return None
             converted.append(item)
             continue
+        if part_type in {"tool_use", "tool_result"}:
+            return None
         return None
     return converted
 
@@ -1317,11 +1384,55 @@ def codex_responses_input_from_chat_messages(messages: Any) -> tuple[str, list[d
                 instructions.append(content)
             continue
         if role in {"user", "assistant"}:
-            content_parts = codex_responses_content_from_chat_content(item.get("content"), role)
-            if content_parts is None:
-                return None
-            if content_parts or role == "user":
-                inputs.append({"type": "message", "role": role, "content": content_parts or [{"type": "input_text", "text": ""}]})
+            raw_content = item.get("content")
+            content_items = raw_content if isinstance(raw_content, list) else [raw_content]
+            content_parts: list[dict[str, Any]] = []
+            structural_content_seen = False
+            for content_item in content_items:
+                if isinstance(content_item, dict):
+                    content_type = str(content_item.get("type") or "")
+                    if content_type == "tool_use":
+                        if role != "assistant":
+                            return None
+                        structural_content_seen = True
+                        if content_parts:
+                            append_responses_message(inputs, role, content_parts)
+                        content_parts = []
+                        name = str(content_item.get("name") or "").strip()
+                        if not name:
+                            return None
+                        arguments = content_item.get("input")
+                        if not isinstance(arguments, str):
+                            arguments = json.dumps(arguments or {}, ensure_ascii=False, separators=(",", ":"))
+                        inputs.append(
+                            {
+                                "type": "function_call",
+                                "call_id": str(content_item.get("id") or f"call_{uuid.uuid4().hex[:16]}"),
+                                "name": name,
+                                "arguments": arguments,
+                            }
+                        )
+                        continue
+                    if content_type == "tool_result":
+                        if role != "user":
+                            return None
+                        structural_content_seen = True
+                        if content_parts:
+                            append_responses_message(inputs, role, content_parts)
+                        content_parts = []
+                        call_id = str(content_item.get("tool_use_id") or content_item.get("tool_call_id") or content_item.get("id") or "").strip()
+                        output = tool_output_text(content_item.get("content"))
+                        if not call_id or output is None:
+                            return None
+                        inputs.append({"type": "function_call_output", "call_id": call_id, "output": output})
+                        continue
+                part_content = None if content_item is None else [content_item]
+                converted_parts = codex_responses_content_from_chat_content(part_content, role)
+                if converted_parts is None:
+                    return None
+                content_parts.extend(converted_parts)
+            if content_parts or (role == "user" and not structural_content_seen):
+                append_responses_message(inputs, role, content_parts)
             tool_calls = item.get("tool_calls")
             if tool_calls is not None:
                 if role != "assistant" or not isinstance(tool_calls, list):
@@ -1373,6 +1484,37 @@ def openai_chat_tools_passthrough_compatible(tools: Any) -> bool:
         function = tool.get("function")
         if not isinstance(function, dict) or not str(function.get("name") or "").strip():
             return False
+    return True
+
+
+def openai_chat_messages_passthrough_compatible(messages: Any) -> bool:
+    if not isinstance(messages, list) or not messages:
+        return False
+    for item in messages:
+        if not isinstance(item, dict):
+            return False
+        role = str(item.get("role") or "user")
+        if role not in {"system", "developer", "user", "assistant", "tool"}:
+            return False
+        content = item.get("content")
+        if content is None:
+            if role != "assistant":
+                return False
+            continue
+        if isinstance(content, str):
+            continue
+        if not isinstance(content, list):
+            return False
+        for part in content:
+            if isinstance(part, str):
+                continue
+            if not isinstance(part, dict):
+                return False
+            part_type = str(part.get("type") or "")
+            if part_type not in {"text", "image_url"}:
+                return False
+            if part_type == "image_url" and role != "user":
+                return False
     return True
 
 
@@ -1439,6 +1581,199 @@ def responses_tool_choice_from_chat_tool_choice(tool_choice: Any) -> Any:
     return None
 
 
+def chat_tools_from_any_tools(tools: Any) -> list[dict[str, Any]] | None:
+    response_tools = responses_tools_from_chat_tools(tools)
+    if response_tools is None:
+        return None
+    converted: list[dict[str, Any]] = []
+    for tool in response_tools:
+        if not isinstance(tool, dict) or str(tool.get("type") or "") != "function":
+            return None
+        name = str(tool.get("name") or "").strip()
+        if not name:
+            return None
+        function: dict[str, Any] = {
+            "name": name,
+            "description": str(tool.get("description") or ""),
+            "parameters": tool.get("parameters") if isinstance(tool.get("parameters"), dict) else {"type": "object", "properties": {}},
+        }
+        if "strict" in tool:
+            function["strict"] = bool(tool.get("strict"))
+        converted.append({"type": "function", "function": function})
+    return converted
+
+
+def chat_tool_choice_from_any_tool_choice(tool_choice: Any) -> Any:
+    choice = responses_tool_choice_from_chat_tool_choice(tool_choice)
+    if choice is None:
+        return None
+    if isinstance(choice, dict) and choice.get("type") == "function":
+        return {"type": "function", "function": {"name": choice.get("name")}}
+    return choice
+
+
+def chat_image_url_part(part: dict[str, Any]) -> dict[str, Any] | None:
+    part_type = str(part.get("type") or "")
+    if part_type == "image_url":
+        image_url = part.get("image_url")
+        item: dict[str, Any] = {"type": "image_url"}
+        if isinstance(image_url, dict):
+            item["image_url"] = deepcopy(image_url)
+        elif isinstance(image_url, str):
+            item["image_url"] = {"url": image_url}
+        else:
+            url = str(part.get("url") or "").strip()
+            if not url:
+                return None
+            item["image_url"] = {"url": url}
+        if part.get("detail") and isinstance(item.get("image_url"), dict):
+            item["image_url"]["detail"] = str(part.get("detail"))
+        return item
+    if part_type in {"input_image", "image"}:
+        url = ""
+        if part_type == "image":
+            url = anthropic_image_source_url(part.get("source"))
+        else:
+            image_url = part.get("image_url") or part.get("url")
+            if isinstance(image_url, dict):
+                image_url = image_url.get("url")
+            url = str(image_url or "").strip()
+        if not url:
+            return None
+        item = {"type": "image_url", "image_url": {"url": url}}
+        if part.get("detail"):
+            item["image_url"]["detail"] = str(part.get("detail"))
+        return item
+    return None
+
+
+def append_chat_user_message(messages: list[dict[str, Any]], content_parts: list[dict[str, Any]]) -> None:
+    if not content_parts:
+        return
+    if any(part.get("type") == "image_url" for part in content_parts):
+        messages.append({"role": "user", "content": content_parts})
+        return
+    text = "\n".join(str(part.get("text") or "") for part in content_parts if part.get("type") == "text")
+    messages.append({"role": "user", "content": text})
+
+
+def chat_messages_from_mixed_chat_messages(messages_value: Any, body: dict[str, Any]) -> list[dict[str, Any]] | None:
+    if not isinstance(messages_value, list):
+        return None
+    messages: list[dict[str, Any]] = []
+    if "system" in body:
+        system_text = safe_instruction_text(body.get("system"))
+        if system_text is None:
+            system_text = json.dumps(body.get("system"), ensure_ascii=False, separators=(",", ":"))
+        if system_text:
+            messages.append({"role": "system", "content": system_text})
+    for item in messages_value:
+        if not isinstance(item, dict):
+            return None
+        role = str(item.get("role") or "user")
+        if role in {"system", "developer"}:
+            content = safe_instruction_text(item.get("content"))
+            if content is None:
+                return None
+            if content:
+                messages.append({"role": "system", "content": content})
+            continue
+        if role == "tool":
+            content = tool_output_text(item.get("content"))
+            call_id = str(item.get("tool_call_id") or item.get("call_id") or "").strip()
+            if content is None or not call_id:
+                return None
+            messages.append({"role": "tool", "tool_call_id": call_id, "content": content})
+            continue
+        if role == "user":
+            raw_content = item.get("content")
+            content_items = raw_content if isinstance(raw_content, list) else [raw_content]
+            content_parts: list[dict[str, Any]] = []
+            for content_item in content_items:
+                if content_item is None:
+                    continue
+                if isinstance(content_item, str):
+                    content_parts.append({"type": "text", "text": content_item})
+                    continue
+                if not isinstance(content_item, dict):
+                    return None
+                content_type = str(content_item.get("type") or "")
+                if content_type in {"text", "input_text", "output_text"}:
+                    content_parts.append({"type": "text", "text": str(content_item.get("text") or "")})
+                    continue
+                if content_type in {"image_url", "input_image", "image"}:
+                    image_part = chat_image_url_part(content_item)
+                    if image_part is None:
+                        return None
+                    content_parts.append(image_part)
+                    continue
+                if content_type == "tool_result":
+                    append_chat_user_message(messages, content_parts)
+                    content_parts = []
+                    call_id = str(content_item.get("tool_use_id") or content_item.get("tool_call_id") or content_item.get("id") or "").strip()
+                    output = tool_output_text(content_item.get("content"))
+                    if not call_id or output is None:
+                        return None
+                    messages.append({"role": "tool", "tool_call_id": call_id, "content": output})
+                    continue
+                if content_type in {"thinking", "redacted_thinking"}:
+                    continue
+                return None
+            append_chat_user_message(messages, content_parts)
+            if raw_content is None:
+                messages.append({"role": "user", "content": ""})
+            continue
+        if role == "assistant":
+            raw_content = item.get("content")
+            content_items = raw_content if isinstance(raw_content, list) else [raw_content]
+            text_parts: list[str] = []
+            tool_calls: list[dict[str, Any]] = []
+            for content_item in content_items:
+                if content_item is None:
+                    continue
+                if isinstance(content_item, str):
+                    text_parts.append(content_item)
+                    continue
+                if not isinstance(content_item, dict):
+                    return None
+                content_type = str(content_item.get("type") or "")
+                if content_type in {"text", "input_text", "output_text"}:
+                    text_parts.append(str(content_item.get("text") or ""))
+                    continue
+                if content_type in {"thinking", "redacted_thinking"}:
+                    continue
+                if content_type == "tool_use":
+                    name = str(content_item.get("name") or "").strip()
+                    if not name:
+                        return None
+                    arguments = content_item.get("input")
+                    if not isinstance(arguments, str):
+                        arguments = json.dumps(arguments or {}, ensure_ascii=False, separators=(",", ":"))
+                    tool_calls.append(
+                        {
+                            "id": str(content_item.get("id") or f"call_{uuid.uuid4().hex[:16]}"),
+                            "type": "function",
+                            "function": {"name": name, "arguments": arguments},
+                        }
+                    )
+                    continue
+                return None
+            existing_tool_calls = item.get("tool_calls")
+            if existing_tool_calls is not None:
+                if not isinstance(existing_tool_calls, list):
+                    return None
+                tool_calls.extend(deepcopy(existing_tool_calls))
+            content = "\n".join(text for text in text_parts if text)
+            if content or tool_calls or raw_content is None:
+                message: dict[str, Any] = {"role": "assistant", "content": content if content else None}
+                if tool_calls:
+                    message["tool_calls"] = tool_calls
+                messages.append(message)
+            continue
+        return None
+    return messages
+
+
 RESPONSES_TO_CHAT_UNSAFE_FIELDS = {
     "tools",
     "tool_choice",
@@ -1470,7 +1805,11 @@ def responses_body_can_use_chat_adapter(body: dict[str, Any]) -> bool:
 
 
 def chat_body_can_use_native_chat_upstream(body: dict[str, Any]) -> bool:
-    return openai_chat_tools_passthrough_compatible(body.get("tools"))
+    try:
+        chat_body_to_chat_upstream_body(body, {"actual_model": str(body.get("model") or "")})
+        return True
+    except ValueError:
+        return False
 
 
 def chat_body_can_use_responses_adapter(body: dict[str, Any]) -> bool:
@@ -1512,6 +1851,44 @@ def responses_body_to_chat_body(body: dict[str, Any], chosen: dict[str, Any]) ->
     if "max_output_tokens" in body:
         req_body["max_tokens"] = body.get("max_output_tokens")
     for key in ("temperature", "top_p", "stream", "stop", "user", "metadata"):
+        if key in body:
+            req_body[key] = body[key]
+    return req_body
+
+
+def chat_body_to_chat_upstream_body(body: dict[str, Any], chosen: dict[str, Any]) -> dict[str, Any]:
+    messages = chat_messages_from_mixed_chat_messages(body.get("messages"), body)
+    if messages is None:
+        raise ValueError("chat body cannot be safely normalized for chat upstream")
+    tools = chat_tools_from_any_tools(body.get("tools"))
+    if tools is None:
+        raise ValueError("chat tools cannot be safely normalized for chat upstream")
+    req_body: dict[str, Any] = {"model": chosen["actual_model"], "messages": messages}
+    if "max_tokens" in body:
+        req_body["max_tokens"] = body.get("max_tokens")
+    if tools:
+        req_body["tools"] = tools
+        tool_choice = chat_tool_choice_from_any_tool_choice(body.get("tool_choice"))
+        if tool_choice is not None:
+            req_body["tool_choice"] = tool_choice
+        if "parallel_tool_calls" in body:
+            req_body["parallel_tool_calls"] = bool(body.get("parallel_tool_calls"))
+    for key in (
+        "temperature",
+        "top_p",
+        "stream",
+        "stream_options",
+        "stop",
+        "user",
+        "metadata",
+        "presence_penalty",
+        "frequency_penalty",
+        "seed",
+        "logprobs",
+        "top_logprobs",
+        "n",
+        "reasoning_effort",
+    ):
         if key in body:
             req_body[key] = body[key]
     return req_body
@@ -1590,7 +1967,12 @@ def chat_body_to_codex_compat_responses_body(body: dict[str, Any], chosen: dict[
 def prepare_upstream_body(body: dict[str, Any], chosen: dict[str, Any], client_kind: str) -> dict[str, Any]:
     upstream_kind = chosen.get("_upstream_kind") or client_kind
     if upstream_kind == client_kind:
-        req_body = normalize_responses_upstream_body(body, chosen) if upstream_kind == "responses" else deepcopy(body)
+        if upstream_kind == "responses":
+            req_body = normalize_responses_upstream_body(body, chosen)
+        elif upstream_kind == "chat":
+            req_body = chat_body_to_chat_upstream_body(body, chosen)
+        else:
+            req_body = deepcopy(body)
         req_body["model"] = chosen["actual_model"]
         return req_body
     if client_kind == "responses" and upstream_kind == "chat":

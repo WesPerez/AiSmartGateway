@@ -579,7 +579,7 @@ def test_plain_responses_chat_adapter_accepts_responses_and_anthropic_tool_shape
     assert gateway.responses_tools_from_chat_tools([{"type": "function"}]) is None
 
 
-def test_non_chat_native_tool_shape_skips_native_chat_candidate(gateway):
+def test_response_style_function_tool_shape_can_use_chat_and_responses(gateway):
     gateway.HEALTH = {
         "chat": {
             "good-model": {
@@ -621,12 +621,176 @@ def test_non_chat_native_tool_shape_skips_native_chat_candidate(gateway):
     buckets = gateway.adaptive_candidate_buckets("good-model", "chat", body)
     items = [item for bucket in buckets for item in bucket["items"]]
 
-    assert [item["provider_id"] for item in items] == ["responses-provider"]
-    assert items[0]["_format_adapter"] == "responses_to_chat"
+    assert [item["provider_id"] for item in items] == ["chat-provider", "responses-provider"]
+    assert [item["_format_adapter"] for item in items] == ["native", "responses_to_chat"]
+
+
+def test_anthropic_tool_history_converts_to_responses_items(gateway):
+    messages = [
+        {"role": "user", "content": "Use the tool"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "Need lookup"},
+                {"type": "text", "text": "Checking."},
+                {"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {"query": "ping"}},
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": [{"type": "text", "text": "pong"}]},
+            ],
+        },
+    ]
+
+    converted = gateway.codex_responses_input_from_chat_messages(messages)
+
+    assert converted is not None
+    _, items = converted
+    assert items == [
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Use the tool"}]},
+        {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Checking."}]},
+        {"type": "function_call", "call_id": "toolu_1", "name": "lookup", "arguments": "{\"query\":\"ping\"}"},
+        {"type": "function_call_output", "call_id": "toolu_1", "output": "pong"},
+    ]
+
+
+def test_anthropic_tool_history_can_use_chat_and_responses_candidates(gateway):
+    gateway.HEALTH = {
+        "chat": {
+            "good-model": {
+                "chat-provider": {
+                    "provider_id": "chat-provider",
+                    "actual_model": "good-model",
+                    "healthy": True,
+                    "priority": 100,
+                    "weight": 1,
+                    "latency_ms": 20,
+                },
+            }
+        },
+        "responses": {
+            "good-model": {
+                "responses-provider": {
+                    "provider_id": "responses-provider",
+                    "actual_model": "good-model",
+                    "healthy": True,
+                    "priority": 100,
+                    "weight": 1,
+                    "latency_ms": 20,
+                },
+            }
+        },
+    }
+    body = {
+        "model": "good-model",
+        "system": "Be brief",
+        "messages": [
+            {"role": "user", "content": "Use the tool"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {"query": "ping"}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "pong"}]},
+        ],
+        "tools": [{"name": "lookup", "description": "Lookup", "input_schema": {"type": "object", "properties": {}}}],
+    }
+
+    buckets = gateway.adaptive_candidate_buckets("good-model", "chat", body)
+    items = [item for bucket in buckets for item in bucket["items"]]
+
+    assert [item["provider_id"] for item in items] == ["chat-provider", "responses-provider"]
+    assert [item["_format_adapter"] for item in items] == ["native", "responses_to_chat"]
 
 
 @pytest.mark.asyncio()
-async def test_chat_request_with_responses_style_tools_routes_directly_to_responses(gateway, monkeypatch):
+async def test_chat_request_with_anthropic_tool_history_normalizes_for_chat_upstream(gateway, monkeypatch):
+    gateway.PROVIDERS = [
+        {"id": "chat-provider", "base_url": "https://chat.example/v1", "api_key": "sk-chat", "timeout_seconds": 3, "headers": {}},
+    ]
+    gateway.HEALTH = {
+        "chat": {
+            "good-model": {
+                "chat-provider": {
+                    "provider_id": "chat-provider",
+                    "actual_model": "actual-chat",
+                    "healthy": True,
+                    "priority": 100,
+                    "weight": 1,
+                    "latency_ms": 20,
+                },
+            }
+        },
+        "responses": {},
+    }
+    monkeypatch.setattr(gateway, "pick_weighted", lambda candidates: candidates[0])
+    body = {
+        "model": "good-model",
+        "system": "Be brief",
+        "thinking": {"type": "enabled", "budget_tokens": 128},
+        "output_config": {"format": "text"},
+        "messages": [
+            {"role": "user", "content": "Use the tool"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "Need lookup"},
+                    {"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {"query": "ping"}},
+                ],
+            },
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "pong"}]},
+        ],
+        "tools": [{"name": "lookup", "description": "Lookup", "input_schema": {"type": "object", "properties": {}}}],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent = json.loads(request.content.decode())
+        assert sent["model"] == "actual-chat"
+        assert "system" not in sent
+        assert "thinking" not in sent
+        assert "output_config" not in sent
+        assert sent["messages"] == [
+            {"role": "system", "content": "Be brief"},
+            {"role": "user", "content": "Use the tool"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "toolu_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{\"query\":\"ping\"}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "toolu_1", "content": "pong"},
+        ]
+        assert sent["tools"] == [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "description": "Lookup",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+        return httpx.Response(
+            200,
+            json={
+                "id": "chat-ok",
+                "choices": [{"message": {"role": "assistant", "content": "done"}, "finish_reason": "stop"}],
+            },
+        )
+
+    with respx.mock:
+        route = respx.post("https://chat.example/v1/chat/completions").mock(side_effect=handler)
+        response = await gateway.relay_non_stream("/chat/completions", body, "chat")
+
+    assert response.status_code == 200
+    assert route.call_count == 1
+
+
+@pytest.mark.asyncio()
+async def test_chat_request_with_responses_style_tools_can_fall_back_to_responses(gateway, monkeypatch):
     gateway.PROVIDERS = [
         {"id": "chat-provider", "base_url": "https://chat.example/v1", "api_key": "sk-chat", "timeout_seconds": 3, "headers": {}},
         {"id": "responses-provider", "base_url": "https://responses.example/v1", "api_key": "sk-resp", "timeout_seconds": 3, "headers": {}},
@@ -702,7 +866,7 @@ async def test_chat_request_with_responses_style_tools_routes_directly_to_respon
         response = await gateway.relay_non_stream("/chat/completions", body, "chat")
 
     assert response.status_code == 200
-    assert chat_route.call_count == 0
+    assert chat_route.call_count == 1
     assert responses_route.call_count == 1
     logs = gateway.read_recent_request_logs()
     assert logs[0]["upstream_kind"] == "responses"

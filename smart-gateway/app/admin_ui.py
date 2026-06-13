@@ -1718,7 +1718,7 @@ ADMIN_HTML = """
                 <li><span class="policy-key">Responses 判定</span><span>先用轻量探测请求 ${escapeHtml((data.health_policy || {}).responses_path || "/responses")}；如果上游返回 invalid codex request，会追加一次 Codex 真实诊断形态探测，诊断成功就标健康。</span></li>
                 <li><span class="policy-key">运行时反馈</span><span>真实业务请求成功会把对应上游立即标为 ok；运行时失败会写入 runtime_failure 并进入对应冷却。</span></li>
                 <li><span class="policy-key">健康新鲜度</span><span>最近 ${escapeHtml(freshTtl || "-")} 内成功验证显示为实时健康；超过该窗口但仍在成功 TTL 内显示为缓存健康，表示可路由但需要关注复查时间。</span></li>
-                <li><span class="policy-key">跨格式路由</span><span>${escapeHtml(adaptiveRouting)}。客户端请求格式保持不变，网关可在安全文本形态下选择另一个接口类型的健康上游，并把响应转回客户端格式；工具、reasoning、Codex 高级字段不会降级转换。</span></li>
+                <li><span class="policy-key">跨格式路由</span><span>${escapeHtml(adaptiveRouting)}。客户端请求格式保持不变，网关会把 OpenAI Chat、Responses、Codex 和 Claude 工具/图片/工具结果历史规范化后，按健康、延迟和权重选择可用上游，再把响应转回客户端格式；无法映射的 hosted tool 或高级字段才会被排除。</span></li>
                 <li><span class="policy-key">形态确认</span><span>Responses 的真实请求同一形态连续 ${escapeHtml(confirmations)} 次 invalid_request 后，才确认为 real_shape_invalid；确认前仍会在付费兜底前做验证。</span></li>
                 <li><span class="policy-key">路由使用</span><span>常规路由优先使用健康项；pending/probe_budget_exhausted 或待验证 Responses 可进入影子/探测重试桶；real_shape_invalid 冷却期内不自动抢在付费兜底前。</span></li>
               </ul>

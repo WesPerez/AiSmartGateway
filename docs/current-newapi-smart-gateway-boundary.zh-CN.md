@@ -130,14 +130,15 @@ Smart Gateway 后台是路由运维视图，不是第二套用户/令牌/订阅�
 
 1. 客户端请求格式保持不变；返回格式也保持客户端请求的格式。
 2. 原生健康路径优先，例如 `/v1/responses` 优先选择 Responses 健康上游。
-3. 如果请求是安全形态，网关可以选择另一个接口类型的健康上游：
+3. 网关会先把客户端请求规范化为可比较的形态，再把所有可安全映射的上游接口都放进候选：
    - Responses 客户端请求可转成 Chat 上游请求，再把 Chat 响应转回 Responses。
    - Chat 客户端请求可转成 Responses 上游请求，再把 Responses 响应转回 Chat Completions。
-4. 普通小 JSON 转换仍拒绝工具调用、function calling、`reasoning`、`include`、`prompt_cache_key`、`previous_response_id`、Codex encrypted reasoning 等复杂字段；但已验证为 Codex-compatible Responses 的 health item 可以走 `codex_responses_to_chat`，支持可映射的 OpenAI function tools/tool calls。
-5. 转换路径带 `ADAPTER_LATENCY_PENALTY_MS`，默认 250ms；路由日志会记录 `upstream_kind` 和 `format_adapter`，便于判断是否发生了跨格式转换。
-6. Chat stream + tools 的路由判断按单个 health item 执行：普通 Responses 候选不越权接复杂工具请求；已有 `responses_compat_mode=codex` 或 Codex shape 验证证据的 Responses 候选可以接入 Codex-compatible adapter。
-7. Chat 图片内容同样只在 Codex-compatible Responses 候选中转换：`image_url` 会映射为 Responses `input_image`；普通小 JSON 转换仍保持文本安全边界。`request_shape` 会记录 `message_content_types` 和 `has_image_content`，包括本地无候选的失败日志。
-8. 图片输入被上游判为 `param=input / invalid_value` 时，按客户端输入无效处理，不写坏 provider 健康，也不进入冷却。
+   - Chat 客户端请求即使仍走 Chat 上游，也会先规范化顶层 `system`、Claude/Codex 工具定义、工具调用历史和图片内容，避免把 Anthropic/Codex 形态原样丢给 OpenAI Chat 上游。
+4. 当前支持的通用输入形态包括 OpenAI Chat `tools[].function`、Responses/Codex `{type,name,parameters}` function tools、Claude/Anthropic `{name,input_schema}` tools、assistant `tool_calls`、Claude `tool_use`、Claude `tool_result`、OpenAI `image_url`、Responses `input_image` 和 Anthropic base64/url image。
+5. 无法无损映射的 hosted tool、Responses `include`、`prompt_cache_key`、`previous_response_id`、Codex encrypted reasoning 等高级字段不会强行降级到 Chat；这类请求只会进入能原生承载的上游候选。
+6. 转换路径带 `ADAPTER_LATENCY_PENALTY_MS`，默认 250ms；路由日志会记录 `upstream_kind`、`format_adapter`、`message_content_types`、`tool_types` 和 `tool_key_sets`，便于判断是否发生了跨格式转换以及工具协议来源。
+7. Chat stream + tools 的路由判断按单个 health item 执行：同一请求可同时拥有规范化 Chat 候选、普通 Responses 候选和 Codex-compatible Responses 候选；最终按路由组、优先级、权重、延迟和 adapter penalty 选择，并在失败时继续尝试下一个候选。
+8. 图片输入被上游判为 `param=input / invalid_value`，或工具 schema 被上游判为 `missing tools.function` 这类请求形态错误时，按客户端输入/形态不兼容处理，不写坏 provider 健康，也不进入运行时冷却。
 
 ## 应急写入
 
