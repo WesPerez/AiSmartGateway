@@ -2172,7 +2172,7 @@ ADMIN_HTML = """
 
     if (token()) {
       loadAll().then(() => {
-        applyAutoRefreshSetting(localStorage.getItem(autoRefreshKey) === "1");
+        applyAutoRefreshSetting(localStorage.getItem(autoRefreshKey) !== "0");
       }).catch((err) => showLogin(err.message));
     } else {
       showLogin();
