@@ -187,6 +187,13 @@ def test_build_probe_targets_keeps_declared_models_missing_from_upstream_models(
 def test_classify_error_prefers_semantic_reason(gateway):
     assert gateway.classify_error(403, '{"message":"Insufficient account balance"}') == "quota"
     assert gateway.classify_error(404, '{"error":"当前 API 不支持所选模型 gpt-5.5"}') == "model_unsupported"
+    assert (
+        gateway.classify_error(
+            503,
+            '{"error":{"code":"model_not_found","message":"No available channel for model gpt-5.5 under group codex-unstable"}}',
+        )
+        == "model_unsupported"
+    )
     assert gateway.classify_error(400, '{"code":"invalid_responses_request","message":"invalid codex request"}') == "invalid_request"
     assert (
         gateway.classify_error(400, '{"error":{"param":"input","code":"invalid_value","message":"bad image"}}')
@@ -2574,6 +2581,38 @@ async def test_runtime_failure_sets_probe_cooldown(gateway):
     assert item["next_probe_at"] > gateway.now()
 
 
+@pytest.mark.asyncio()
+async def test_runtime_model_unsupported_expires_upstream_model_cache(gateway):
+    gateway.MODEL_CACHE = {
+        "p1": {
+            "signature": "sig",
+            "models": ["good-model"],
+            "next_refresh_at": int(gateway.now()) + 3600,
+            "reason": "ok",
+        }
+    }
+    gateway.HEALTH = {
+        "chat": {
+            "good-model": {
+                "p1": {
+                    "provider_id": "p1",
+                    "actual_model": "good-model",
+                    "healthy": True,
+                    "source": "upstream_models",
+                    "priority": 100,
+                    "weight": 1,
+                },
+            }
+        },
+        "responses": {},
+    }
+
+    await gateway.mark_runtime_failure("chat", "good-model", "p1", "model_unsupported")
+
+    assert gateway.MODEL_CACHE["p1"]["next_refresh_at"] == 0
+    assert gateway.MODEL_CACHE["p1"]["reason"] == "runtime_model_unsupported"
+
+
 def test_runtime_failure_reason_for_endpoint_failures(gateway):
     assert gateway.should_mark_runtime_failure("invalid_request") is False
     assert gateway.should_mark_runtime_failure("invalid_request", "responses") is False
@@ -2582,7 +2621,12 @@ def test_runtime_failure_reason_for_endpoint_failures(gateway):
     assert gateway.runtime_failure_reason_for_endpoint_failures("responses", ["invalid_request", "invalid_request"]) is None
     assert gateway.runtime_failure_reason_for_endpoint_failures("chat", ["invalid_request"]) is None
     assert gateway.runtime_failure_reason_for_endpoint_failures("responses", ["client_invalid_input"]) is None
-    assert gateway.runtime_failure_reason_for_endpoint_failures("responses", ["invalid_request", "server_unavailable"]) == "all_endpoints_failed"
+    assert gateway.runtime_failure_reason_for_endpoint_failures("chat", ["model_unsupported"]) == "model_unsupported"
+    assert (
+        gateway.runtime_failure_reason_for_endpoint_failures("chat", ["model_unsupported", "not_found"])
+        == "model_unsupported"
+    )
+    assert gateway.runtime_failure_reason_for_endpoint_failures("responses", ["invalid_request", "server_unavailable"]) == "server_unavailable"
 
 
 @pytest.mark.asyncio()

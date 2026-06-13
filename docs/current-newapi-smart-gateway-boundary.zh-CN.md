@@ -144,6 +144,7 @@ Smart Gateway 后台是路由运维视图，不是第二套用户/令牌/订阅�
 8. 图片输入被上游判为 `param=input / invalid_value`，或工具 schema 被上游判为 `missing tools.function` 这类请求形态错误时，按客户端输入/形态不兼容处理，不写坏 provider 健康，也不进入运行时冷却。
 9. Chat 上游转 Responses 客户端时，返回文本、工具调用和 usage 都要转换。Chat usage 会规范成 Responses 的 `input_tokens` / `output_tokens` / `total_tokens`，并保留 `prompt_tokens` / `completion_tokens` 兼容 New API；如果上游没有返回 usage，默认 `ADAPTER_SYNTHESIZE_USAGE=true` 会在 `response.completed` 里带一个 `estimated:true` 的估算 usage，避免 New API 把成功请求记录成 `total tokens is 0, cannot consume quota`。
 10. Chat -> Responses 流式适配不能只发送 `response.output_text.delta`。最终 `response.completed.response` 必须包含完整 `output` 和 `output_text`，否则 New API 把 OpenAI Responses 再转 Claude/Anthropic 时可能返回 `422 format conversion error: NO OUTPUT IN RESPONSE`。文本流会把累计文本写入 final message output；工具调用流会把累计 function call 参数写入 final function_call output。
+11. 对远端 New API distributor，如果返回 `model_not_found` / `No available channel for model ... under group ...`，按 `model_unsupported` 处理，不再笼统显示 `all_endpoints_failed`。如果该模型来自上游 `/models` 自动发现，运行时遇到模型不可用会让该 provider 的模型缓存立即过期，下一轮重新拉 `/models`，避免旧模型列表继续误导。
 
 ## 应急写入
 

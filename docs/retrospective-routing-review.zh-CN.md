@@ -893,6 +893,7 @@ upstream_kind: 网关实际选择的上游接口格式
 20. 上游对图片输入返回 `400 / param=input / code=invalid_value` 时归类为 `client_invalid_input`，不再作为 provider runtime failure 或 Responses shape invalid 证据，避免坏图或不被接受的 data URL 污染上游健康。
 21. 2026-06-14 排查 Claude Desktop 请求 `mimo-v2.5-pro` 的“一堆 422/报错”时，Gateway 请求日志中该模型最近大量请求是 `200`，且集中为客户端 `/v1/responses` 经 `chat_to_responses` 转到上游 `/chat/completions`。第一轮先修了 usage：Chat -> Responses 非流式和流式都把 `prompt_tokens` / `completion_tokens` 规范成 `input_tokens` / `output_tokens` / `total_tokens`，同时保留原字段；流式会把 usage 放进 `response.completed.response.usage`。如果上游没有给 usage，默认 `ADAPTER_SYNTHESIZE_USAGE=true` 会按转换后的上游请求体和实际输出文本/tool 参数生成带 `estimated:true` 的估算 usage，避免 New API 把成功请求落成 0 token 计费错误。
 22. 同一问题继续复查后确认，用户看到的 `422 format conversion error: NO OUTPUT IN RESPONSE` 还有更直接的格式原因：Chat -> Responses 流式适配旧逻辑只发 `response.output_text.delta`，最终补的 `response.completed.response` 只有状态和 usage，没有完整 `output`。New API 在把 OpenAI Responses 结果再转 Claude/Anthropic 时会检查 final response output，缺失就报 `NO OUTPUT IN RESPONSE`。修复改为：Chat -> Responses 流式结束时用累计文本生成 final message output 和 `output_text`；工具调用流用累计 function call 参数生成 final `function_call` output；空输出也保留一个空 message output，避免 final response 没有 output。
+23. 2026-06-14 排查 `https://elysiver.h-e.top`：该上游已同步为 `newapi_ch9_elysiver.h-e.top`，但本地 New API 渠道 `models` 字段为空，Gateway 之前只靠远端 `/models` 自动发现过 `gpt-5.5`。复查时远端 `/v1/models` 返回 `data: []`，直接请求 `gpt-5.5` 以及 34 个常见候选模型均返回 `503 model_not_found / No available channel for model ... under group codex-unstable (distributor)`。结论是：当前这把远端 distributor key 所属组没有可用模型，Gateway 不能把它判健康。优化为：`No available channel` 明确归类为 `model_unsupported`；运行时多 endpoint 都是模型不可用时保留 `model_unsupported`，不再折叠成 `all_endpoints_failed`；如果失败模型来自上游 `/models` 自动发现，则让该 provider 的模型缓存立即过期，下一轮强制重新拉取，避免旧 `gpt-5.5` 缓存继续误导。
 
 ### 当前健康含义
 
@@ -922,6 +923,7 @@ upstream_kind: 网关实际选择的上游接口格式
 - 缺 `partial` 的 Responses provider 在探活、非流式运行时、流式运行时都会通用重试。
 - Chat -> Responses 适配会保留/规范化 usage；上游缺 usage 时会合成带 `estimated:true` 的 Responses usage，覆盖非流式和流式。
 - Chat -> Responses 流式 completed 事件会带完整 `response.output` / `response.output_text`，覆盖文本和工具调用，避免 New API Claude/Anthropic 转换时报 `NO OUTPUT IN RESPONSE`。
+- 远端 New API distributor 返回 `No available channel` 时按 `model_unsupported` 展示；上游自动发现模型遇到运行时模型不可用会让模型缓存过期并重新发现。
 
 真实请求回归：
 
@@ -931,7 +933,7 @@ upstream_kind: 网关实际选择的上游接口格式
 - Anyrouter `gpt-5.5`：普通 Responses 小 JSON 仍返回 `invalid codex request`；Codex-compatible Chat -> Responses 转换已通过。自动路由不是按 Anyrouter 或模型强制，而是根据该 Responses health item 的 `responses_compat_mode=codex` / Codex shape 验证证据选择 `chat -> responses / codex_responses_to_chat`，成功后 health 保留 `responses_compat_mode=codex`。2026-06-14 真实回归中，带 tools 的 Chat stream 返回文本成功；强制 `tool_choice` 调用 `noop` 时，Anyrouter `/responses` 返回的 function_call 流事件已转成 Chat `tool_calls` delta。
 - 管理 API 暴露健康新鲜度字段。
 
-完整验证结果更新：`106 passed`。
+完整验证结果更新：`107 passed`。
 
 ## 2026-06-14 AI Key Vault 借鉴判断
 

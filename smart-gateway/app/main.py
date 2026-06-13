@@ -1190,7 +1190,15 @@ def classify_error(status_code: int, text: str) -> str:
     sample = (text or "").lower()
     if "quota" in sample or "balance" in sample or "insufficient" in sample or "额度" in sample or "余额" in sample:
         return "quota"
-    unsupported = ("not support", "unsupported", "不支持", "model not found", "model_not_found", "模型不存在")
+    unsupported = (
+        "not support",
+        "unsupported",
+        "不支持",
+        "model not found",
+        "model_not_found",
+        "no available channel",
+        "模型不存在",
+    )
     if any(word in sample for word in unsupported):
         return "model_unsupported"
     if status_code == 400 and "invalid_value" in sample and "input" in sample:
@@ -3688,9 +3696,23 @@ def runtime_failure_reason_for_endpoint_failures(kind: str, endpoint_reasons: li
         return "all_endpoints_failed"
     if should_verify_responses_request_shape(kind, endpoint_reasons):
         return None
-    if any(should_mark_runtime_failure(reason, kind) for reason in endpoint_reasons):
-        return "all_endpoints_failed"
-    return None
+    markable = [reason for reason in endpoint_reasons if should_mark_runtime_failure(reason, kind)]
+    if not markable:
+        return None
+    unique = set(markable)
+    if len(unique) == 1:
+        return markable[0]
+    if unique <= {"model_unsupported", "not_found"}:
+        return "model_unsupported"
+    if unique <= {"quota"}:
+        return "quota"
+    if unique <= {"auth_or_forbidden"}:
+        return "auth_or_forbidden"
+    if unique <= {"rate_limited"}:
+        return "rate_limited"
+    if unique <= {"server_unavailable", "empty_stream", "exception"}:
+        return "server_unavailable"
+    return "all_endpoints_failed"
 
 
 def exploration_enabled(controls: dict[str, Any]) -> bool:
@@ -3917,11 +3939,17 @@ async def mark_runtime_failure(kind: str, model: str, provider_id: str, reason: 
             for item in (HEALTH.get(kind, {}).get(model) or {}).values()
             if item.get("provider_id") == provider_id
         ]
+        expire_model_cache = reason in {"model_unsupported", "not_found"} and any(
+            item.get("source") == "upstream_models" for item in matched
+        )
         for item in matched:
             item["healthy"] = False
             item["reason"] = f"runtime_failure:{reason}"
             item["checked_at"] = int(now())
             item["next_probe_at"] = int(now()) + probe_cooldown_seconds(reason, False)
+        if expire_model_cache and provider_id in MODEL_CACHE:
+            MODEL_CACHE[provider_id]["next_refresh_at"] = 0
+            MODEL_CACHE[provider_id]["reason"] = f"runtime_{reason}"
         if matched:
             await save_state()
 
