@@ -1187,6 +1187,104 @@ def responses_input_from_chat_messages(messages: Any) -> tuple[str, list[dict[st
     return "\n\n".join(instructions), inputs
 
 
+def codex_responses_input_from_chat_messages(messages: Any) -> tuple[str, list[dict[str, Any]]] | None:
+    if not isinstance(messages, list) or not messages:
+        return None
+    instructions: list[str] = []
+    inputs: list[dict[str, Any]] = []
+    for item in messages:
+        if not isinstance(item, dict):
+            return None
+        role = str(item.get("role") or "user")
+        content = safe_text_from_content(item.get("content"))
+        if content is None:
+            return None
+        if role in {"system", "developer"}:
+            if content:
+                instructions.append(content)
+            continue
+        if role in {"user", "assistant"}:
+            if content or role == "user":
+                inputs.append(
+                    {
+                        "type": "message",
+                        "role": role,
+                        "content": [{"type": "input_text" if role == "user" else "output_text", "text": content}],
+                    }
+                )
+            tool_calls = item.get("tool_calls")
+            if tool_calls is not None:
+                if role != "assistant" or not isinstance(tool_calls, list):
+                    return None
+                for call in tool_calls:
+                    if not isinstance(call, dict) or str(call.get("type") or "function") != "function":
+                        return None
+                    function = call.get("function") if isinstance(call.get("function"), dict) else {}
+                    name = str(function.get("name") or "").strip()
+                    if not name:
+                        return None
+                    arguments = function.get("arguments")
+                    if not isinstance(arguments, str):
+                        arguments = json.dumps(arguments or {}, ensure_ascii=False, separators=(",", ":"))
+                    inputs.append(
+                        {
+                            "type": "function_call",
+                            "call_id": str(call.get("id") or f"call_{uuid.uuid4().hex[:16]}"),
+                            "name": name,
+                            "arguments": arguments,
+                        }
+                    )
+            continue
+        if role == "tool":
+            call_id = str(item.get("tool_call_id") or item.get("call_id") or "").strip()
+            if not call_id:
+                return None
+            inputs.append({"type": "function_call_output", "call_id": call_id, "output": content})
+            continue
+        return None
+    if not inputs:
+        return None
+    return "\n\n".join(instructions), inputs
+
+
+def responses_tools_from_chat_tools(tools: Any) -> list[dict[str, Any]] | None:
+    if tools is None:
+        return []
+    if not isinstance(tools, list):
+        return None
+    converted: list[dict[str, Any]] = []
+    for tool in tools:
+        if not isinstance(tool, dict) or str(tool.get("type") or "") != "function":
+            return None
+        function = tool.get("function") if isinstance(tool.get("function"), dict) else {}
+        name = str(function.get("name") or "").strip()
+        if not name:
+            return None
+        item: dict[str, Any] = {
+            "type": "function",
+            "name": name,
+            "description": str(function.get("description") or ""),
+            "parameters": function.get("parameters") if isinstance(function.get("parameters"), dict) else {"type": "object", "properties": {}},
+        }
+        if "strict" in function:
+            item["strict"] = bool(function.get("strict"))
+        converted.append(item)
+    return converted
+
+
+def responses_tool_choice_from_chat_tool_choice(tool_choice: Any) -> Any:
+    if tool_choice is None:
+        return None
+    if isinstance(tool_choice, str):
+        return tool_choice
+    if isinstance(tool_choice, dict) and str(tool_choice.get("type") or "") == "function":
+        function = tool_choice.get("function") if isinstance(tool_choice.get("function"), dict) else {}
+        name = str(function.get("name") or "").strip()
+        if name:
+            return {"type": "function", "name": name}
+    return None
+
+
 RESPONSES_TO_CHAT_UNSAFE_FIELDS = {
     "tools",
     "tool_choice",
@@ -1207,6 +1305,11 @@ CHAT_TO_RESPONSES_UNSAFE_FIELDS = {
     "response_format",
     "parallel_tool_calls",
 }
+CHAT_TO_CODEX_RESPONSES_UNSAFE_FIELDS = {
+    "functions",
+    "function_call",
+    "response_format",
+}
 
 
 def responses_body_can_use_chat_adapter(body: dict[str, Any]) -> bool:
@@ -1221,16 +1324,16 @@ def chat_body_can_use_responses_adapter(body: dict[str, Any]) -> bool:
     return responses_input_from_chat_messages(body.get("messages")) is not None
 
 
-def format_adapter_allowed(client_kind: str, upstream_kind: str, body: dict[str, Any]) -> bool:
-    if client_kind == upstream_kind:
-        return True
-    if not ADAPTIVE_FORMAT_ROUTING:
+def chat_body_can_use_codex_compat_responses_adapter(body: dict[str, Any]) -> bool:
+    if any(field in body for field in CHAT_TO_CODEX_RESPONSES_UNSAFE_FIELDS):
         return False
-    if client_kind == "responses" and upstream_kind == "chat":
-        return responses_body_can_use_chat_adapter(body)
-    if client_kind == "chat" and upstream_kind == "responses":
-        return chat_body_can_use_responses_adapter(body)
-    return False
+    if responses_tools_from_chat_tools(body.get("tools")) is None:
+        return False
+    if "tool_choice" in body and responses_tool_choice_from_chat_tool_choice(body.get("tool_choice")) is None:
+        return False
+    if "parallel_tool_calls" in body and not isinstance(body.get("parallel_tool_calls"), bool):
+        return False
+    return codex_responses_input_from_chat_messages(body.get("messages")) is not None
 
 
 def adapter_name(client_kind: str, upstream_kind: str) -> str:
@@ -1273,9 +1376,12 @@ def chat_body_to_responses_body(body: dict[str, Any], chosen: dict[str, Any]) ->
 
 
 def chat_body_to_codex_compat_responses_body(body: dict[str, Any], chosen: dict[str, Any]) -> dict[str, Any]:
-    converted = responses_input_from_chat_messages(body.get("messages"))
+    converted = codex_responses_input_from_chat_messages(body.get("messages"))
     if converted is None:
         raise ValueError("chat body cannot be safely adapted to codex-compatible responses")
+    tools = responses_tools_from_chat_tools(body.get("tools"))
+    if tools is None:
+        raise ValueError("chat tools cannot be safely adapted to codex-compatible responses")
     instructions, input_value = converted
     effort = "low"
     reasoning = body.get("reasoning")
@@ -1297,6 +1403,13 @@ def chat_body_to_codex_compat_responses_body(body: dict[str, Any], chosen: dict[
     }
     if "max_tokens" in body:
         req_body["max_output_tokens"] = body.get("max_tokens")
+    if tools:
+        req_body["tools"] = tools
+        tool_choice = responses_tool_choice_from_chat_tool_choice(body.get("tool_choice"))
+        if tool_choice is not None:
+            req_body["tool_choice"] = tool_choice
+        if "parallel_tool_calls" in body:
+            req_body["parallel_tool_calls"] = bool(body.get("parallel_tool_calls"))
     for key in ("temperature", "top_p", "stop", "user", "metadata"):
         if key in body:
             req_body[key] = body[key]
@@ -1416,9 +1529,41 @@ def convert_chat_response_to_responses(data: Any, request_id: str, model: str | 
     return response
 
 
+def extract_responses_function_calls(data: Any) -> list[dict[str, Any]]:
+    if not isinstance(data, dict) or not isinstance(data.get("output"), list):
+        return []
+    calls: list[dict[str, Any]] = []
+    for item in data["output"]:
+        if not isinstance(item, dict) or str(item.get("type") or "") != "function_call":
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        call_id = str(item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:16]}")
+        arguments = item.get("arguments")
+        if not isinstance(arguments, str):
+            arguments = json.dumps(arguments or {}, ensure_ascii=False, separators=(",", ":"))
+        calls.append(
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {"name": name, "arguments": arguments},
+            }
+        )
+    return calls
+
+
 def convert_responses_response_to_chat(data: Any, request_id: str, model: str | None) -> dict[str, Any]:
     text = extract_responses_output_text(data)
+    tool_calls = extract_responses_function_calls(data)
     usage = data.get("usage") if isinstance(data, dict) and isinstance(data.get("usage"), dict) else None
+    message: dict[str, Any] = {"role": "assistant", "content": text}
+    finish_reason = "stop"
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+        if not text:
+            message["content"] = None
+        finish_reason = "tool_calls"
     response: dict[str, Any] = {
         "id": data.get("id") if isinstance(data, dict) and data.get("id") else request_id,
         "object": "chat.completion",
@@ -1427,8 +1572,8 @@ def convert_responses_response_to_chat(data: Any, request_id: str, model: str | 
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": text},
-                "finish_reason": "stop",
+                "message": message,
+                "finish_reason": finish_reason,
             }
         ],
     }
@@ -1493,7 +1638,65 @@ def chat_stream_chunk_to_responses(chunk: bytes, request_id: str, model: str | N
     return bytes(out)
 
 
-def responses_stream_chunk_to_chat(chunk: bytes, request_id: str, model: str | None) -> bytes:
+def chat_completion_stream_chunk(
+    request_id: str,
+    model: str | None,
+    delta: dict[str, Any],
+    finish_reason: str | None = None,
+    usage: dict[str, Any] | None = None,
+) -> bytes:
+    chunk: dict[str, Any] = {
+        "id": request_id,
+        "object": "chat.completion.chunk",
+        "created": int(now()),
+        "model": model or "",
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+    }
+    if usage:
+        chunk["usage"] = usage
+    return f"data: {json.dumps(chunk, ensure_ascii=False, separators=(',', ':'))}\n\n".encode()
+
+
+def response_stream_tool_call_key(data: dict[str, Any], item: dict[str, Any] | None = None) -> str:
+    item = item or {}
+    for value in (
+        data.get("item_id"),
+        data.get("call_id"),
+        item.get("id"),
+        item.get("call_id"),
+    ):
+        if value:
+            return str(value)
+    output_index = data.get("output_index")
+    if output_index is not None:
+        return f"output:{output_index}"
+    return f"tool:{uuid.uuid4().hex[:16]}"
+
+
+def response_stream_tool_call_index(state: dict[str, Any], key: str) -> int:
+    indexes = state.setdefault("tool_call_indexes", {})
+    if key not in indexes:
+        indexes[key] = len(indexes)
+    return int(indexes[key])
+
+
+def response_stream_usage(data: dict[str, Any]) -> dict[str, Any] | None:
+    usage = data.get("usage")
+    if isinstance(usage, dict):
+        return usage
+    response = data.get("response")
+    if isinstance(response, dict) and isinstance(response.get("usage"), dict):
+        return response["usage"]
+    return None
+
+
+def responses_stream_chunk_to_chat(
+    chunk: bytes,
+    request_id: str,
+    model: str | None,
+    state: dict[str, Any] | None = None,
+) -> bytes:
+    state = state if state is not None else {}
     out = bytearray()
     for payload in iter_sse_data_payloads(chunk.decode("utf-8", "ignore")):
         if payload == "[DONE]":
@@ -1502,18 +1705,75 @@ def responses_stream_chunk_to_chat(chunk: bytes, request_id: str, model: str | N
             data = json.loads(payload)
         except Exception:
             continue
-        delta = data.get("delta")
-        if not delta and data.get("type") in {"response.output_text.delta", "response.output_text.annotation.added"}:
-            delta = data.get("text") or data.get("content")
+        event_type = str(data.get("type") or "")
+        delta = None
+        if event_type in {"response.output_text.delta", "response.output_text.annotation.added"}:
+            delta = data.get("delta")
+            if not delta:
+                delta = data.get("text") or data.get("content")
+        elif not event_type and data.get("delta"):
+            delta = data.get("delta")
         if delta:
-            chat_chunk = {
-                "id": request_id,
-                "object": "chat.completion.chunk",
-                "created": int(now()),
-                "model": model or "",
-                "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
+            out.extend(chat_completion_stream_chunk(request_id, model, {"content": delta}))
+            continue
+        if event_type in {"response.output_item.added", "response.output_item.done"}:
+            item = data.get("item") if isinstance(data.get("item"), dict) else {}
+            if str(item.get("type") or "") != "function_call":
+                continue
+            key = response_stream_tool_call_key(data, item)
+            index = response_stream_tool_call_index(state, key)
+            added_seen = state.setdefault("tool_call_added_seen", set())
+            delta_seen = state.setdefault("tool_call_argument_delta_seen", set())
+            call_id = str(item.get("call_id") or item.get("id") or key)
+            name = str(item.get("name") or "").strip()
+            arguments = item.get("arguments")
+            if not isinstance(arguments, str):
+                arguments = ""
+            if event_type == "response.output_item.added":
+                added_seen.add(key)
+            elif key in delta_seen and key in added_seen:
+                continue
+            elif key in added_seen and not arguments:
+                continue
+            tool_call: dict[str, Any] = {
+                "index": index,
+                "type": "function",
+                "function": {},
             }
-            out.extend(f"data: {json.dumps(chat_chunk, ensure_ascii=False, separators=(',', ':'))}\n\n".encode())
+            if call_id:
+                tool_call["id"] = call_id
+            if name:
+                tool_call["function"]["name"] = name
+            if arguments:
+                tool_call["function"]["arguments"] = arguments
+            state["tool_calls_seen"] = True
+            out.extend(chat_completion_stream_chunk(request_id, model, {"tool_calls": [tool_call]}))
+            continue
+        if event_type in {"response.function_call_arguments.delta", "response.function_call_arguments.done"}:
+            key = response_stream_tool_call_key(data)
+            index = response_stream_tool_call_index(state, key)
+            delta_seen = state.setdefault("tool_call_argument_delta_seen", set())
+            if event_type == "response.function_call_arguments.done" and key in delta_seen:
+                continue
+            argument_value = data.get("delta") if event_type.endswith(".delta") else data.get("arguments")
+            argument_delta = str(argument_value or "")
+            if not argument_delta:
+                continue
+            if event_type.endswith(".delta"):
+                delta_seen.add(key)
+            state["tool_calls_seen"] = True
+            out.extend(
+                chat_completion_stream_chunk(
+                    request_id,
+                    model,
+                    {"tool_calls": [{"index": index, "function": {"arguments": argument_delta}}]},
+                )
+            )
+            continue
+        if event_type in {"response.completed", "response.failed", "response.incomplete"}:
+            finish_reason = "tool_calls" if state.get("tool_calls_seen") else "stop"
+            out.extend(chat_completion_stream_chunk(request_id, model, {}, finish_reason, response_stream_usage(data)))
+            continue
     return bytes(out)
 
 
@@ -1524,6 +1784,7 @@ class StreamFormatAdapter:
         self.request_id = request_id
         self.model = model
         self.buffer = b""
+        self.state: dict[str, Any] = {}
 
     def feed(self, chunk: bytes) -> bytes:
         upstream_kind = self.chosen.get("_upstream_kind") or self.client_kind
@@ -1533,7 +1794,7 @@ class StreamFormatAdapter:
         complete, self.buffer = pop_complete_sse_events(self.buffer)
         if not complete:
             return b""
-        return convert_stream_chunk_for_client(complete, self.chosen, self.client_kind, self.request_id, self.model)
+        return convert_stream_chunk_for_client(complete, self.chosen, self.client_kind, self.request_id, self.model, self.state)
 
     def flush(self) -> bytes:
         upstream_kind = self.chosen.get("_upstream_kind") or self.client_kind
@@ -1544,17 +1805,24 @@ class StreamFormatAdapter:
         self.buffer = b""
         if not pending.endswith((b"\n\n", b"\r\n\r\n")):
             pending += b"\n\n"
-        return convert_stream_chunk_for_client(pending, self.chosen, self.client_kind, self.request_id, self.model)
+        return convert_stream_chunk_for_client(pending, self.chosen, self.client_kind, self.request_id, self.model, self.state)
 
 
-def convert_stream_chunk_for_client(chunk: bytes, chosen: dict[str, Any], client_kind: str, request_id: str, model: str | None) -> bytes:
+def convert_stream_chunk_for_client(
+    chunk: bytes,
+    chosen: dict[str, Any],
+    client_kind: str,
+    request_id: str,
+    model: str | None,
+    state: dict[str, Any] | None = None,
+) -> bytes:
     upstream_kind = chosen.get("_upstream_kind") or client_kind
     if upstream_kind == client_kind:
         return chunk
     if client_kind == "responses" and upstream_kind == "chat":
         return chat_stream_chunk_to_responses(chunk, request_id, model)
     if client_kind == "chat" and upstream_kind == "responses":
-        return responses_stream_chunk_to_chat(chunk, request_id, model)
+        return responses_stream_chunk_to_chat(chunk, request_id, model, state)
     return chunk
 
 
@@ -2490,6 +2758,25 @@ def codex_compat_adapter_candidate(item: dict[str, Any], client_kind: str, upstr
     return shape_status == "codex_shape_verified" or shape_source in {"diagnostic_codex_shape", "runtime_codex_compat_adapter"}
 
 
+def route_item_format_adapter_allowed(
+    item: dict[str, Any],
+    client_kind: str,
+    upstream_kind: str,
+    body: dict[str, Any],
+) -> bool:
+    if client_kind == upstream_kind:
+        return True
+    if not ADAPTIVE_FORMAT_ROUTING:
+        return False
+    if client_kind == "responses" and upstream_kind == "chat":
+        return responses_body_can_use_chat_adapter(body)
+    if client_kind == "chat" and upstream_kind == "responses":
+        if codex_compat_adapter_candidate(item, client_kind, upstream_kind):
+            return chat_body_can_use_codex_compat_responses_adapter(body)
+        return chat_body_can_use_responses_adapter(body)
+    return False
+
+
 def adaptive_candidate_buckets(
     model: str,
     client_kind: str,
@@ -2499,14 +2786,11 @@ def adaptive_candidate_buckets(
     combined: dict[str, list[dict[str, Any]]] = {name: [] for name in ROUTE_BUCKET_ORDER}
     upstream_kinds = [client_kind, "responses" if client_kind == "chat" else "chat"]
     for upstream_kind in upstream_kinds:
-        if not format_adapter_allowed(client_kind, upstream_kind, body):
-            continue
         for bucket in healthy_candidate_buckets(model, upstream_kind, controls):
             target = combined.setdefault(bucket["name"], [])
-            target.extend(
-                annotate_route_item(item, client_kind, upstream_kind)
-                for item in bucket["items"]
-            )
+            for item in bucket["items"]:
+                if route_item_format_adapter_allowed(item, client_kind, upstream_kind, body):
+                    target.append(annotate_route_item(item, client_kind, upstream_kind))
     buckets = []
     for name in ROUTE_BUCKET_ORDER:
         items = combined.get(name) or []

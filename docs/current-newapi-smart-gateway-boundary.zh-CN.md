@@ -130,11 +130,12 @@ Smart Gateway 后台是路由运维视图，不是第二套用户/令牌/订阅�
 
 1. 客户端请求格式保持不变；返回格式也保持客户端请求的格式。
 2. 原生健康路径优先，例如 `/v1/responses` 优先选择 Responses 健康上游。
-3. 如果请求是安全文本形态，网关可以选择另一个接口类型的健康上游：
+3. 如果请求是安全形态，网关可以选择另一个接口类型的健康上游：
    - Responses 客户端请求可转成 Chat 上游请求，再把 Chat 响应转回 Responses。
    - Chat 客户端请求可转成 Responses 上游请求，再把 Responses 响应转回 Chat Completions。
-4. 带工具调用、function calling、`reasoning`、`include`、`prompt_cache_key`、`previous_response_id`、Codex encrypted reasoning 等复杂字段时，不做降级转换，必须走原生 Responses。
+4. 普通小 JSON 转换仍拒绝工具调用、function calling、`reasoning`、`include`、`prompt_cache_key`、`previous_response_id`、Codex encrypted reasoning 等复杂字段；但已验证为 Codex-compatible Responses 的 health item 可以走 `codex_responses_to_chat`，支持可映射的 OpenAI function tools/tool calls。
 5. 转换路径带 `ADAPTER_LATENCY_PENALTY_MS`，默认 250ms；路由日志会记录 `upstream_kind` 和 `format_adapter`，便于判断是否发生了跨格式转换。
+6. Chat stream + tools 的路由判断按单个 health item 执行：普通 Responses 候选不越权接复杂工具请求；已有 `responses_compat_mode=codex` 或 Codex shape 验证证据的 Responses 候选可以接入 Codex-compatible adapter。
 
 ## 应急写入
 

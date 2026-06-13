@@ -452,6 +452,59 @@ def test_chat_adapter_uses_codex_compat_for_codex_shape_responses_health(gateway
     assert buckets[0]["items"][0]["_codex_compat_adapter"] is True
 
 
+def test_codex_compat_chat_adapter_allows_tool_stream_body(gateway):
+    gateway.HEALTH = {
+        "chat": {},
+        "responses": {
+            "good-model": {
+                "codex": {
+                    "provider_id": "codex",
+                    "actual_model": "good-model",
+                    "healthy": True,
+                    "priority": 100,
+                    "weight": 1,
+                    "responses_compat_mode": "codex",
+                },
+                "plain": {
+                    "provider_id": "plain",
+                    "actual_model": "good-model",
+                    "healthy": True,
+                    "priority": 100,
+                    "weight": 1,
+                },
+            }
+        },
+    }
+
+    buckets = gateway.adaptive_candidate_buckets(
+        "good-model",
+        "chat",
+        {
+            "model": "good-model",
+            "messages": [{"role": "user", "content": "ping"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "description": "Lookup a value",
+                        "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+                    },
+                }
+            ],
+            "tool_choice": "auto",
+            "parallel_tool_calls": True,
+            "reasoning_effort": "low",
+            "stream_options": {"include_usage": True},
+            "stream": True,
+        },
+    )
+
+    items = [item for bucket in buckets for item in bucket["items"]]
+    assert [item["provider_id"] for item in items] == ["codex"]
+    assert items[0]["_format_adapter"] == "codex_responses_to_chat"
+
+
 @pytest.mark.asyncio()
 async def test_chat_request_uses_codex_compat_responses_shape_when_required(gateway, monkeypatch):
     gateway.PROVIDERS = [
@@ -523,6 +576,96 @@ async def test_chat_request_uses_codex_compat_responses_shape_when_required(gate
     assert item["shape_status"] == "codex_shape_verified"
     assert item["shape_verification_source"] == "runtime_codex_compat_adapter"
     assert item["responses_compat_mode"] == "codex"
+
+
+@pytest.mark.asyncio()
+async def test_chat_request_uses_codex_compat_responses_shape_with_tools(gateway, monkeypatch):
+    gateway.PROVIDERS = [
+        {"id": "p1", "base_url": "https://p1.example/v1", "api_key": "sk-p1", "timeout_seconds": 3, "headers": {}},
+    ]
+    gateway.HEALTH = {
+        "responses": {
+            "good-model": {
+                "p1": {
+                    "provider_id": "p1",
+                    "actual_model": "actual-responses",
+                    "healthy": True,
+                    "priority": 100,
+                    "weight": 1,
+                    "responses_compat_mode": "codex",
+                },
+            }
+        },
+        "chat": {},
+    }
+    monkeypatch.setattr(gateway, "pick_weighted", lambda candidates: candidates[0])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent = json.loads(request.content.decode())
+        assert request.headers["originator"] == "codex_exec"
+        assert sent["model"] == "actual-responses"
+        assert sent["tools"] == [
+            {
+                "type": "function",
+                "name": "lookup",
+                "description": "Lookup a value",
+                "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+            }
+        ]
+        assert sent["tool_choice"] == {"type": "function", "name": "lookup"}
+        assert sent["parallel_tool_calls"] is True
+        return httpx.Response(
+            200,
+            json={
+                "id": "resp-tool",
+                "output": [
+                    {
+                        "type": "function_call",
+                        "id": "fc_1",
+                        "call_id": "call_1",
+                        "name": "lookup",
+                        "arguments": "{\"query\":\"ping\"}",
+                    },
+                ],
+            },
+        )
+
+    body = {
+        "model": "good-model",
+        "messages": [{"role": "user", "content": "ping"}],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "description": "Lookup a value",
+                    "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+                },
+            }
+        ],
+        "tool_choice": {"type": "function", "function": {"name": "lookup"}},
+        "parallel_tool_calls": True,
+    }
+
+    with respx.mock:
+        route = respx.post("https://p1.example/v1/responses").mock(side_effect=handler)
+        response = await gateway.relay_non_stream("/chat/completions", body, "chat")
+
+    assert response.status_code == 200
+    assert route.call_count == 1
+    payload = json.loads(response.body.decode())
+    message = payload["choices"][0]["message"]
+    assert message["content"] is None
+    assert message["tool_calls"] == [
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": "{\"query\":\"ping\"}"},
+        }
+    ]
+    assert payload["choices"][0]["finish_reason"] == "tool_calls"
+    logs = gateway.read_recent_request_logs()
+    assert logs[0]["format_adapter"] == "codex_responses_to_chat"
 
 
 @pytest.mark.asyncio()
@@ -2122,6 +2265,140 @@ async def test_chat_stream_learns_codex_compat_after_plain_responses_invalid_req
     assert joined.endswith(b"data: [DONE]\n\n")
     item = gateway.HEALTH["responses"]["good-model"]["p1"]
     assert item["responses_compat_mode"] == "codex"
+
+
+@pytest.mark.asyncio()
+async def test_chat_stream_uses_codex_compat_responses_shape_with_tools(gateway, monkeypatch):
+    gateway.PROVIDERS = [
+        {"id": "p1", "base_url": "https://p1.example/v1", "api_key": "sk-p1", "timeout_seconds": 3, "headers": {}},
+    ]
+    gateway.HEALTH = {
+        "responses": {
+            "good-model": {
+                "p1": {
+                    "provider_id": "p1",
+                    "actual_model": "actual-responses",
+                    "healthy": True,
+                    "priority": 100,
+                    "weight": 1,
+                    "responses_compat_mode": "codex",
+                },
+            }
+        },
+        "chat": {},
+    }
+    monkeypatch.setattr(gateway, "pick_weighted", lambda candidates: candidates[0])
+
+    def sse(event_type: str, payload: dict) -> str:
+        return f"event: {event_type}\ndata: {json.dumps(payload, separators=(',', ':'))}\n\n"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent = json.loads(request.content.decode())
+        assert sent["stream"] is True
+        assert sent["tools"][0]["name"] == "lookup"
+        assert sent["tool_choice"] == "auto"
+        text = "".join(
+            [
+                sse(
+                    "response.output_item.added",
+                    {
+                        "type": "response.output_item.added",
+                        "output_index": 0,
+                        "item": {
+                            "type": "function_call",
+                            "id": "fc_1",
+                            "call_id": "call_1",
+                            "name": "lookup",
+                            "arguments": "",
+                        },
+                    },
+                ),
+                sse(
+                    "response.function_call_arguments.delta",
+                    {
+                        "type": "response.function_call_arguments.delta",
+                        "item_id": "fc_1",
+                        "output_index": 0,
+                        "delta": "{\"query\"",
+                    },
+                ),
+                sse(
+                    "response.function_call_arguments.delta",
+                    {
+                        "type": "response.function_call_arguments.delta",
+                        "item_id": "fc_1",
+                        "output_index": 0,
+                        "delta": ":\"ping\"}",
+                    },
+                ),
+                sse(
+                    "response.output_item.done",
+                    {
+                        "type": "response.output_item.done",
+                        "output_index": 0,
+                        "item": {
+                            "type": "function_call",
+                            "id": "fc_1",
+                            "call_id": "call_1",
+                            "name": "lookup",
+                            "arguments": "{\"query\":\"ping\"}",
+                        },
+                    },
+                ),
+                sse(
+                    "response.completed",
+                    {
+                        "type": "response.completed",
+                        "response": {"usage": {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12}},
+                    },
+                ),
+                "data: [DONE]\n\n",
+            ]
+        )
+        return httpx.Response(200, text=text)
+
+    body = {
+        "model": "good-model",
+        "messages": [{"role": "user", "content": "ping"}],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "description": "Lookup a value",
+                    "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+                },
+            }
+        ],
+        "tool_choice": "auto",
+        "parallel_tool_calls": True,
+        "stream_options": {"include_usage": True},
+        "stream": True,
+    }
+
+    with respx.mock:
+        route = respx.post("https://p1.example/v1/responses").mock(side_effect=handler)
+        chunks = [chunk async for chunk in gateway.relay_stream("/chat/completions", body, "chat")]
+
+    assert route.call_count == 1
+    payloads = [
+        json.loads(payload)
+        for payload in gateway.iter_sse_data_payloads(b"".join(chunks).decode())
+        if payload != "[DONE]"
+    ]
+    tool_deltas = [
+        item["choices"][0]["delta"]["tool_calls"][0]
+        for item in payloads
+        if item["choices"][0]["delta"].get("tool_calls")
+    ]
+    assert tool_deltas[0]["id"] == "call_1"
+    assert tool_deltas[0]["function"]["name"] == "lookup"
+    assert tool_deltas[1]["function"]["arguments"] == "{\"query\""
+    assert tool_deltas[2]["function"]["arguments"] == ":\"ping\"}"
+    assert all("content" not in item["choices"][0]["delta"] for item in payloads)
+    assert payloads[-1]["choices"][0]["finish_reason"] == "tool_calls"
+    logs = gateway.read_recent_request_logs()
+    assert logs[0]["format_adapter"] == "codex_responses_to_chat"
 
 
 @pytest.mark.asyncio()

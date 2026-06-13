@@ -355,32 +355,38 @@ upstream kind: the provider endpoint Smart Gateway chooses
 
 Native routes get a lower score penalty, but the router may still choose a
 converted route when the adjusted latency is better. When the request body is a
-safe text-only shape, Smart Gateway may adapt:
+safe shape, Smart Gateway may adapt:
 
 - `/v1/responses` client request -> healthy `/chat/completions` upstream ->
   converted back to a Responses response.
 - `/v1/chat/completions` client request -> healthy `/responses` upstream ->
   converted back to a Chat Completions response.
 
-The adapter intentionally refuses complex or lossy shapes such as tools,
-function calling, `reasoning`, `include`, `prompt_cache_key`,
+The plain small-JSON adapter intentionally refuses complex or lossy shapes such
+as tools, function calling, `reasoning`, `include`, `prompt_cache_key`,
 `previous_response_id`, and Codex-specific encrypted reasoning payloads. Those
-requests require native Responses compatibility. Adapted routes carry an
-`adapter_latency_penalty_ms` score penalty and logs include `upstream_kind` and
-`format_adapter` so operators can see when conversion was used.
+requests require either native compatibility or a dedicated compatibility mode.
+Adapted routes carry an `adapter_latency_penalty_ms` score penalty and logs
+include `upstream_kind` and `format_adapter` so operators can see when
+conversion was used.
 
 There is one important safety boundary: a Responses health item verified only by
 the Codex diagnostic shape (`shape_status=codex_shape_verified` or
 `shape_verification_source=diagnostic_codex_shape`) is not treated as a generic
 small-JSON Chat -> Responses adapter candidate. That evidence proves
 Codex-style Responses works, so the router uses a dedicated
-`codex_responses_to_chat` adapter instead. It converts safe Chat requests into a
+`codex_responses_to_chat` adapter instead. This decision is made per health
+item from `responses_compat_mode=codex`, `shape_status=codex_shape_verified`,
+or a Codex diagnostic/runtime verification source; it is not hard-coded to a
+provider or model. The adapter converts safely mappable Chat requests into a
 Codex-compatible Responses body with Codex identity headers, low reasoning
-effort, `include=["reasoning.encrypted_content"]`, `prompt_cache_key`,
-`client_metadata`, and no tool list, then converts the upstream Responses result
-back to Chat Completions. Successful runtime use persists
-`responses_compat_mode=codex` so later route decisions keep using the same
-compatible shape.
+effort, `include=["reasoning.encrypted_content"]`, `prompt_cache_key`, and
+`client_metadata`. It supports OpenAI function tools, `tool_choice`,
+`parallel_tool_calls`, assistant `tool_calls`, and `tool` result messages when
+they can be represented as Responses function tools/calls/outputs. It still
+refuses legacy `functions`/`function_call` and unsupported lossy shapes.
+Successful runtime use persists `responses_compat_mode=codex` so later route
+decisions keep using the same compatible shape.
 
 This compatibility mode is learned in two generic ways:
 
@@ -395,6 +401,8 @@ This compatibility mode is learned in two generic ways:
 Streaming adapters buffer complete SSE events before conversion, so a single
 event split across multiple upstream network chunks is not dropped. This applies
 to both Chat stream -> Responses stream and Responses stream -> Chat stream.
+Responses `function_call` stream events are converted to Chat `tool_calls`
+deltas instead of being emitted as plain text.
 
 Real validation on 2026-06-13 covered:
 
@@ -410,6 +418,14 @@ Real validation on 2026-06-13 covered:
   selects Anyrouter Responses instead of the paid Chat fallback. Runtime
   learning also covers the case where a new provider has not yet been classified
   as Codex-compatible by probe state.
+- 2026-06-14 follow-up: Chat stream requests from Codex-style clients can carry
+  `tools`, `tool_choice`, `parallel_tool_calls`, `reasoning_effort`, and
+  `stream_options`. The route filter now evaluates Codex-compatible eligibility
+  per Responses health item, so these requests can select a verified Codex
+  Responses upstream instead of failing locally with `no_healthy_upstream`.
+  Real validation against Anyrouter `gpt-5.5` confirmed both a tool-bearing
+  text stream and a forced `tool_choice` stream; the latter returned Chat
+  `tool_calls` deltas after passing through `/responses`.
 
 ## Operations UI
 

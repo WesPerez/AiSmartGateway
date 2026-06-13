@@ -875,7 +875,7 @@ upstream_kind: 网关实际选择的上游接口格式
 2. 原生格式通过 `ADAPTER_LATENCY_PENALTY_MS` 获得偏好，默认 250ms；如果转换后的调整延迟仍更低，路由可以选择跨格式上游。
 3. `/v1/responses` 可以在安全文本形态下选择健康 Chat 上游，再把 Chat 响应转回 Responses。
 4. `/v1/chat/completions` 可以在安全文本形态下选择健康 Responses 上游，再把 Responses 响应转回 Chat Completions。
-5. 带工具调用、function calling、`reasoning`、`include`、`prompt_cache_key`、`previous_response_id`、Codex encrypted reasoning 等复杂字段时，不做降级转换，必须走原生 Responses。
+5. 普通小 JSON 跨格式转换仍拒绝工具调用、function calling、`reasoning`、`include`、`prompt_cache_key`、`previous_response_id`、Codex encrypted reasoning 等复杂字段；但已被证明为 Codex-compatible Responses 的 health item 可以走专用 `codex_responses_to_chat`，支持可映射的 OpenAI function tools/tool calls。
 6. 路由日志新增 `upstream_kind`、`format_adapter`、`adapter_latency_penalty_ms`，用于判断是否发生了转换。
 7. 成功和失败反写健康时，写入实际 `upstream_kind`，避免 Chat 失败污染 Responses 健康，或反过来。
 8. 管理 API 对 health item 动态补充 `health_age_seconds`、`health_fresh`、`health_freshness`、`health_fresh_ttl_seconds`，不污染持久化 health state。
@@ -883,9 +883,11 @@ upstream_kind: 网关实际选择的上游接口格式
 10. 健康策略说明新增实时新鲜窗口和跨格式路由说明。
 11. 流式跨格式转换改为按完整 SSE 事件缓冲后再转换，避免一个事件被上游拆成多个网络 chunk 时丢字。
 12. 只由 Codex diagnostic shape 证明可用的 Responses health，不再使用普通小 JSON 的 Chat -> Responses 转换；改为 `codex_responses_to_chat` adapter，给安全 Chat 请求生成 Codex-compatible Responses body 和 Codex identity headers，再把 Responses 结果转回 Chat。
-13. `codex_responses_to_chat` 默认 `reasoning.effort=low`，带 `include=["reasoning.encrypted_content"]`、`prompt_cache_key`、`client_metadata`，不带工具列表；运行时成功后保留 `responses_compat_mode=codex`，避免下次又退回普通小 JSON。
+13. `codex_responses_to_chat` 默认 `reasoning.effort=low`，带 `include=["reasoning.encrypted_content"]`、`prompt_cache_key`、`client_metadata`；可映射 OpenAI function tools、`tool_choice`、`parallel_tool_calls`、assistant `tool_calls` 历史和 `tool` 结果消息。运行时成功后保留 `responses_compat_mode=codex`，避免下次又退回普通小 JSON。
 14. 兼容模式有两条通用判断路径：探测期 minimal Responses 失败但 Codex diagnostic 成功；运行时普通 Chat -> Responses 小 JSON 在首块前返回 `invalid_request`，则同 endpoint 自动切 `codex_responses_to_chat` 重试一次，成功后学习 `responses_compat_mode=codex`。
 15. 通用 `partial` 兼容改为错误驱动：Responses 运行时、minimal probe、Codex diagnostic 只要明确返回缺 `partial`，同一 endpoint 在首块前自动补 `partial=stream` 重试一次，并学习 provider 默认值。
+16. 2026-06-14 修复 Chat stream + tools 的本地候选筛选：带 `tools/tool_choice/parallel_tool_calls/reasoning_effort/stream_options` 的 Chat 流式请求以前会被普通 Chat -> Responses 安全门提前拒绝，即使 Anyrouter Responses 已有 `responses_compat_mode=codex` 也无法进入候选，最终直接 `no_healthy_upstream`。现在改为按单个 health item 判断：普通 Responses 候选仍走普通安全门，Codex-compatible Responses 候选走 Codex 安全门。
+17. Responses 流式 `function_call` / `function_call_arguments.delta` 会转成 Chat `tool_calls` delta，不再把工具参数误当作普通文本；非流式 Responses `function_call` 输出也会转成 Chat message `tool_calls`。
 
 ### 当前健康含义
 
@@ -907,6 +909,8 @@ upstream_kind: 网关实际选择的上游接口格式
 - 双向流式转换可处理拆分 SSE 事件。
 - Codex diagnostic-only Responses 健康会进入 `codex_responses_to_chat` 转换候选，不再使用会被拒绝的普通小 JSON Responses 形态。
 - 普通 Chat -> Responses 小 JSON 遇到 `invalid_request` 时，非流式和流式都会在首块前自动切 Codex-compatible 形态重试并学习。
+- 带 OpenAI function tools 的 Chat stream 可以选择已验证的 Codex-compatible Responses health item。
+- Responses function_call 非流式和流式事件会转回 Chat `tool_calls`。
 - 缺 `partial` 的 Responses provider 在探活、非流式运行时、流式运行时都会通用重试。
 
 真实请求回归：
@@ -914,7 +918,7 @@ upstream_kind: 网关实际选择的上游接口格式
 - Volcengine `deepseek-v4-pro`：Responses stream 原生成功；Chat 请求实际选择 Responses 上游并 `responses_to_chat` 成功。
 - Fufu `mimo-v2-flash`：Chat 原生成功，Responses 原生成功。
 - Muyuan `claude-opus-4-8`：Responses 客户端请求非流式和流式均成功降级到 Chat 上游，再转回 Responses；provider 级 `User-Agent: Claude-Code/1.0.0` 继续解决该源的客户端限制。
-- Anyrouter `gpt-5.5`：普通 Responses 小 JSON 仍返回 `invalid codex request`；Codex-compatible Chat -> Responses 转换已通过，强制 Anyrouter 和普通自动路由均走 `chat -> responses / codex_responses_to_chat` 并成功返回，health 保留 `responses_compat_mode=codex`。
+- Anyrouter `gpt-5.5`：普通 Responses 小 JSON 仍返回 `invalid codex request`；Codex-compatible Chat -> Responses 转换已通过。自动路由不是按 Anyrouter 或模型强制，而是根据该 Responses health item 的 `responses_compat_mode=codex` / Codex shape 验证证据选择 `chat -> responses / codex_responses_to_chat`，成功后 health 保留 `responses_compat_mode=codex`。2026-06-14 真实回归中，带 tools 的 Chat stream 返回文本成功；强制 `tool_choice` 调用 `noop` 时，Anyrouter `/responses` 返回的 function_call 流事件已转成 Chat `tool_calls` delta。
 - 管理 API 暴露健康新鲜度字段。
 
-完整验证结果：`81 passed`。
+完整验证结果：`84 passed`。
