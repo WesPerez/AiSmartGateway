@@ -1339,6 +1339,53 @@ def codex_responses_content_from_chat_content(content: Any, role: str) -> list[d
     return converted
 
 
+def chat_content_from_responses_content(content: Any, role: str) -> str | list[dict[str, Any]] | None:
+    if content is None:
+        return "" if role != "user" else []
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return None
+    parts: list[dict[str, Any]] = []
+    for part in content:
+        if isinstance(part, str):
+            parts.append({"type": "text", "text": part})
+            continue
+        if not isinstance(part, dict):
+            return None
+        part_type = str(part.get("type") or "")
+        if part_type in {"text", "input_text", "output_text"}:
+            parts.append({"type": "text", "text": str(part.get("text") or "")})
+            continue
+        if part_type in {"image_url", "input_image", "image"}:
+            if role != "user":
+                return None
+            image_part = chat_image_url_part(part)
+            if image_part is None:
+                return None
+            parts.append(image_part)
+            continue
+        return None
+    if not parts:
+        return "" if role != "user" else []
+    if all(part.get("type") == "text" for part in parts):
+        return "\n".join(str(part.get("text") or "") for part in parts)
+    return parts
+
+
+def append_chat_message_from_responses_message(messages: list[dict[str, Any]], item: dict[str, Any]) -> bool:
+    role = str(item.get("role") or "user")
+    if role == "developer":
+        role = "system"
+    if role not in {"system", "user", "assistant"}:
+        return False
+    content = chat_content_from_responses_content(item.get("content"), role)
+    if content is None:
+        return False
+    messages.append({"role": role, "content": content})
+    return True
+
+
 def chat_messages_from_responses_input(input_value: Any) -> list[dict[str, Any]] | None:
     if isinstance(input_value, str):
         return [{"role": "user", "content": input_value}]
@@ -1351,15 +1398,40 @@ def chat_messages_from_responses_input(input_value: Any) -> list[dict[str, Any]]
             continue
         if not isinstance(item, dict):
             return None
-        role = str(item.get("role") or "user")
-        if role == "developer":
-            role = "system"
-        if role not in {"system", "user", "assistant"}:
-            return None
-        content = safe_text_from_content(item.get("content"))
-        if content is None:
-            return None
-        messages.append({"role": role, "content": content})
+        item_type = str(item.get("type") or "")
+        if item_type in {"function_call", "tool_call"}:
+            name = str(item.get("name") or "").strip()
+            if not name:
+                return None
+            arguments = item.get("arguments")
+            if not isinstance(arguments, str):
+                arguments = json.dumps(arguments or {}, ensure_ascii=False, separators=(",", ":"))
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": str(item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:16]}"),
+                            "type": "function",
+                            "function": {"name": name, "arguments": arguments},
+                        }
+                    ],
+                }
+            )
+            continue
+        if item_type in {"function_call_output", "tool_result"}:
+            call_id = str(item.get("call_id") or item.get("tool_call_id") or item.get("tool_use_id") or "").strip()
+            output = tool_output_text(item.get("output") if "output" in item else item.get("content"))
+            if not call_id or output is None:
+                return None
+            messages.append({"role": "tool", "tool_call_id": call_id, "content": output})
+            continue
+        if item_type in {"", "message"}:
+            if not append_chat_message_from_responses_message(messages, item):
+                return None
+            continue
+        return None
     return messages
 
 
@@ -1775,9 +1847,6 @@ def chat_messages_from_mixed_chat_messages(messages_value: Any, body: dict[str, 
 
 
 RESPONSES_TO_CHAT_UNSAFE_FIELDS = {
-    "tools",
-    "tool_choice",
-    "parallel_tool_calls",
     "reasoning",
     "include",
     "prompt_cache_key",
@@ -1800,6 +1869,12 @@ CHAT_TO_CODEX_RESPONSES_UNSAFE_FIELDS = {
 
 def responses_body_can_use_chat_adapter(body: dict[str, Any]) -> bool:
     if any(field in body for field in RESPONSES_TO_CHAT_UNSAFE_FIELDS):
+        return False
+    if chat_tools_from_any_tools(body.get("tools")) is None:
+        return False
+    if "tool_choice" in body and chat_tool_choice_from_any_tool_choice(body.get("tool_choice")) is None:
+        return False
+    if "parallel_tool_calls" in body and not isinstance(body.get("parallel_tool_calls"), bool):
         return False
     return chat_messages_from_responses_input(body.get("input")) is not None
 
@@ -1844,13 +1919,23 @@ def responses_body_to_chat_body(body: dict[str, Any], chosen: dict[str, Any]) ->
     messages = chat_messages_from_responses_input(body.get("input"))
     if messages is None:
         raise ValueError("responses body cannot be safely adapted to chat")
+    tools = chat_tools_from_any_tools(body.get("tools"))
+    if tools is None:
+        raise ValueError("responses tools cannot be safely adapted to chat")
     instructions = body.get("instructions")
     if instructions:
         messages = [{"role": "system", "content": str(instructions)}, *messages]
     req_body: dict[str, Any] = {"model": chosen["actual_model"], "messages": messages}
     if "max_output_tokens" in body:
         req_body["max_tokens"] = body.get("max_output_tokens")
-    for key in ("temperature", "top_p", "stream", "stop", "user", "metadata"):
+    if tools:
+        req_body["tools"] = tools
+        tool_choice = chat_tool_choice_from_any_tool_choice(body.get("tool_choice"))
+        if tool_choice is not None:
+            req_body["tool_choice"] = tool_choice
+        if "parallel_tool_calls" in body:
+            req_body["parallel_tool_calls"] = bool(body.get("parallel_tool_calls"))
+    for key in ("temperature", "top_p", "stream", "stream_options", "stop", "user", "metadata"):
         if key in body:
             req_body[key] = body[key]
     return req_body
@@ -2060,13 +2145,9 @@ def convert_chat_response_to_responses(data: Any, request_id: str, model: str | 
     text = extract_chat_response_text(data)
     response_id = data.get("id") if isinstance(data, dict) and data.get("id") else request_id
     usage = data.get("usage") if isinstance(data, dict) and isinstance(data.get("usage"), dict) else None
-    response: dict[str, Any] = {
-        "id": response_id,
-        "object": "response",
-        "created_at": int(now()),
-        "status": "completed",
-        "model": model or "",
-        "output": [
+    output: list[dict[str, Any]] = []
+    if text:
+        output.append(
             {
                 "type": "message",
                 "id": f"msg_{uuid.uuid4().hex[:16]}",
@@ -2074,7 +2155,48 @@ def convert_chat_response_to_responses(data: Any, request_id: str, model: str | 
                 "role": "assistant",
                 "content": [{"type": "output_text", "text": text, "annotations": []}],
             }
-        ],
+        )
+    if isinstance(data, dict):
+        choices = data.get("choices")
+        first = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
+        message = first.get("message") if isinstance(first, dict) and isinstance(first.get("message"), dict) else {}
+        for call in message.get("tool_calls") or []:
+            if not isinstance(call, dict):
+                continue
+            function = call.get("function") if isinstance(call.get("function"), dict) else {}
+            name = str(function.get("name") or "").strip()
+            if not name:
+                continue
+            arguments = function.get("arguments")
+            if not isinstance(arguments, str):
+                arguments = json.dumps(arguments or {}, ensure_ascii=False, separators=(",", ":"))
+            call_id = str(call.get("id") or f"call_{uuid.uuid4().hex[:16]}")
+            output.append(
+                {
+                    "type": "function_call",
+                    "id": call_id,
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": arguments,
+                }
+            )
+    if not output:
+        output.append(
+            {
+                "type": "message",
+                "id": f"msg_{uuid.uuid4().hex[:16]}",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "", "annotations": []}],
+            }
+        )
+    response: dict[str, Any] = {
+        "id": response_id,
+        "object": "response",
+        "created_at": int(now()),
+        "status": "completed",
+        "model": model or "",
+        "output": output,
         "output_text": text,
     }
     if usage:
@@ -2174,7 +2296,17 @@ def pop_complete_sse_events(buffer: bytes) -> tuple[bytes, bytes]:
     return bytes(events), remaining
 
 
-def chat_stream_chunk_to_responses(chunk: bytes, request_id: str, model: str | None) -> bytes:
+def raw_response_sse_event(event_type: str, data: dict[str, Any]) -> bytes:
+    return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False, separators=(',', ':'))}\n\n".encode()
+
+
+def chat_stream_chunk_to_responses(
+    chunk: bytes,
+    request_id: str,
+    model: str | None,
+    state: dict[str, Any] | None = None,
+) -> bytes:
+    state = state if state is not None else {}
     out = bytearray()
     for payload in iter_sse_data_payloads(chunk.decode("utf-8", "ignore")):
         if payload == "[DONE]":
@@ -2184,10 +2316,55 @@ def chat_stream_chunk_to_responses(chunk: bytes, request_id: str, model: str | N
         except Exception:
             continue
         for choice in data.get("choices") or []:
-            delta = (choice.get("delta") or {}).get("content") if isinstance(choice, dict) else None
+            if not isinstance(choice, dict):
+                continue
+            delta_obj = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+            delta = delta_obj.get("content")
             if delta:
                 event_data = {"type": "response.output_text.delta", "delta": delta}
-                out.extend(f"event: response.output_text.delta\ndata: {json.dumps(event_data, ensure_ascii=False, separators=(',', ':'))}\n\n".encode())
+                out.extend(raw_response_sse_event("response.output_text.delta", event_data))
+            for call in delta_obj.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    continue
+                index = int(call.get("index") or 0)
+                key = str(call.get("id") or f"tool_index_{index}")
+                function = call.get("function") if isinstance(call.get("function"), dict) else {}
+                call_id = str(call.get("id") or state.setdefault(f"chat_tool_call_id_{index}", f"call_{uuid.uuid4().hex[:16]}"))
+                name = str(function.get("name") or "")
+                arguments = str(function.get("arguments") or "")
+                added = state.setdefault("chat_tool_call_added", set())
+                if key not in added and (call.get("id") or name):
+                    added.add(key)
+                    item = {"type": "function_call", "id": call_id, "call_id": call_id, "name": name, "arguments": ""}
+                    out.extend(
+                        raw_response_sse_event(
+                            "response.output_item.added",
+                            {"type": "response.output_item.added", "output_index": index, "item": item},
+                        )
+                    )
+                if arguments:
+                    out.extend(
+                        raw_response_sse_event(
+                            "response.function_call_arguments.delta",
+                            {"type": "response.function_call_arguments.delta", "call_id": call_id, "output_index": index, "delta": arguments},
+                        )
+                    )
+            if choice.get("finish_reason") == "tool_calls":
+                for index, call_id in [
+                    (int(key.rsplit("_", 1)[-1]), value)
+                    for key, value in state.items()
+                    if isinstance(key, str) and key.startswith("chat_tool_call_id_")
+                ]:
+                    out.extend(
+                        raw_response_sse_event(
+                            "response.output_item.done",
+                            {
+                                "type": "response.output_item.done",
+                                "output_index": index,
+                                "item": {"type": "function_call", "id": call_id, "call_id": call_id, "arguments": ""},
+                            },
+                        )
+                    )
     return bytes(out)
 
 
@@ -2373,7 +2550,7 @@ def convert_stream_chunk_for_client(
     if upstream_kind == client_kind:
         return chunk
     if client_kind == "responses" and upstream_kind == "chat":
-        return chat_stream_chunk_to_responses(chunk, request_id, model)
+        return chat_stream_chunk_to_responses(chunk, request_id, model, state)
     if client_kind == "chat" and upstream_kind == "responses":
         return responses_stream_chunk_to_chat(chunk, request_id, model, state)
     return chunk

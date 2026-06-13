@@ -374,6 +374,188 @@ async def test_responses_request_can_use_chat_upstream_with_safe_adapter(gateway
     assert logs[0]["format_adapter"] == "chat_to_responses"
 
 
+def test_responses_body_to_chat_body_converts_images_tools_and_tool_history(gateway):
+    body = {
+        "model": "good-model",
+        "instructions": "Be brief",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Describe this image"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo=", "detail": "low"},
+                ],
+            },
+            {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": {"query": "ping"}},
+            {"type": "function_call_output", "call_id": "call_1", "output": "pong"},
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "name": "lookup",
+                "description": "Lookup a value",
+                "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+            }
+        ],
+        "tool_choice": {"type": "function", "name": "lookup"},
+        "parallel_tool_calls": True,
+        "max_output_tokens": 64,
+    }
+
+    converted = gateway.responses_body_to_chat_body(body, {"actual_model": "actual-chat"})
+
+    assert converted["model"] == "actual-chat"
+    assert converted["messages"] == [
+        {"role": "system", "content": "Be brief"},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Describe this image"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo=", "detail": "low"}},
+            ],
+        },
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{\"query\":\"ping\"}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "pong"},
+    ]
+    assert converted["tools"] == [
+        {
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "Lookup a value",
+                "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+            },
+        }
+    ]
+    assert converted["tool_choice"] == {"type": "function", "function": {"name": "lookup"}}
+    assert converted["parallel_tool_calls"] is True
+    assert converted["max_tokens"] == 64
+
+
+@pytest.mark.asyncio()
+async def test_responses_request_with_image_and_tools_can_use_chat_upstream(gateway, monkeypatch):
+    gateway.PROVIDERS = [
+        {"id": "p1", "base_url": "https://p1.example/v1", "api_key": "sk-p1", "timeout_seconds": 3, "headers": {}},
+    ]
+    gateway.HEALTH = {
+        "chat": {
+            "good-model": {
+                "p1": {
+                    "provider_id": "p1",
+                    "actual_model": "actual-chat",
+                    "healthy": True,
+                    "priority": 100,
+                    "weight": 1,
+                    "latency_ms": 20,
+                },
+            }
+        },
+        "responses": {},
+    }
+    monkeypatch.setattr(gateway, "pick_weighted", lambda candidates: candidates[0])
+    body = {
+        "model": "good-model",
+        "instructions": "Be brief",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "What is in this image?"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="},
+                ],
+            }
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "name": "lookup",
+                "description": "Lookup a value",
+                "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+            }
+        ],
+        "max_output_tokens": 32,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent = json.loads(request.content.decode())
+        assert sent["messages"][0] == {"role": "system", "content": "Be brief"}
+        assert sent["messages"][1]["content"][1] == {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="},
+        }
+        assert sent["tools"][0]["function"]["name"] == "lookup"
+        return httpx.Response(
+            200,
+            json={
+                "id": "chat-ok",
+                "choices": [{"message": {"role": "assistant", "content": "image ok"}, "finish_reason": "stop"}],
+            },
+        )
+
+    with respx.mock:
+        route = respx.post("https://p1.example/v1/chat/completions").mock(side_effect=handler)
+        response = await gateway.relay_non_stream("/responses", body, "responses")
+
+    assert response.status_code == 200
+    assert route.call_count == 1
+    payload = json.loads(response.body.decode())
+    assert payload["object"] == "response"
+    assert payload["output_text"] == "image ok"
+    logs = gateway.read_recent_request_logs()
+    assert logs[0]["kind"] == "responses"
+    assert logs[0]["upstream_kind"] == "chat"
+    assert logs[0]["format_adapter"] == "chat_to_responses"
+
+
+def test_chat_tool_calls_convert_to_responses_function_calls(gateway):
+    converted = gateway.convert_chat_response_to_responses(
+        {
+            "id": "chat-tool",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "lookup", "arguments": "{\"query\":\"ping\"}"},
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+        },
+        "gw_test",
+        "good-model",
+    )
+
+    assert converted["output"] == [
+        {
+            "type": "function_call",
+            "id": "call_1",
+            "call_id": "call_1",
+            "name": "lookup",
+            "arguments": "{\"query\":\"ping\"}",
+        }
+    ]
+    assert converted["output_text"] == ""
+
+
 @pytest.mark.asyncio()
 async def test_chat_request_can_use_responses_upstream_with_safe_adapter(gateway, monkeypatch):
     gateway.PROVIDERS = [
@@ -2743,6 +2925,93 @@ async def test_responses_client_stream_from_chat_upstream_handles_split_sse_even
     assert b'"delta":"hello"' in joined
     assert b"event: response.completed" in joined
     assert joined.endswith(b"data: [DONE]\n\n")
+
+
+@pytest.mark.asyncio()
+async def test_responses_client_stream_with_image_and_tools_can_use_chat_upstream(gateway, monkeypatch):
+    gateway.PROVIDERS = [
+        {"id": "p1", "base_url": "https://p1.example/v1", "api_key": "sk-p1", "timeout_seconds": 3, "headers": {}},
+    ]
+    gateway.HEALTH = {
+        "chat": {
+            "good-model": {
+                "p1": {"provider_id": "p1", "actual_model": "good-model", "healthy": True, "priority": 100, "weight": 1},
+            }
+        },
+        "responses": {},
+    }
+    monkeypatch.setattr(gateway, "pick_weighted", lambda candidates: candidates[0])
+    seen = {}
+
+    class ImageToolChatStream:
+        status_code = 200
+
+        async def aiter_raw(self):
+            yield b'data: {"id":"chatcmpl_test","choices":[{"delta":{"content":"image ok"}}]}\n\n'
+            yield b"data: [DONE]\n\n"
+
+    class ImageToolChatContext:
+        async def __aenter__(self):
+            return ImageToolChatStream()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class ImageToolChatClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def stream(self, method, url, headers=None, json=None):
+            seen["url"] = url
+            seen["body"] = json
+            return ImageToolChatContext()
+
+    monkeypatch.setattr(gateway.httpx, "AsyncClient", ImageToolChatClient)
+
+    chunks = [
+        chunk
+        async for chunk in gateway.relay_stream(
+            "/responses",
+            {
+                "model": "good-model",
+                "instructions": "Be brief",
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": "Describe"},
+                            {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="},
+                        ],
+                    }
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "lookup",
+                        "parameters": {"type": "object", "properties": {}},
+                    }
+                ],
+                "stream": True,
+            },
+            "responses",
+        )
+    ]
+    joined = b"".join(chunks)
+    assert seen["url"] == "https://p1.example/v1/chat/completions"
+    assert seen["body"]["messages"][1]["content"][1]["type"] == "image_url"
+    assert seen["body"]["tools"][0]["function"]["name"] == "lookup"
+    assert b'"delta":"image ok"' in joined
+    assert b"event: response.completed" in joined
+    logs = gateway.read_recent_request_logs()
+    assert logs[0]["upstream_kind"] == "chat"
+    assert logs[0]["format_adapter"] == "chat_to_responses"
 
 
 @pytest.mark.asyncio()
