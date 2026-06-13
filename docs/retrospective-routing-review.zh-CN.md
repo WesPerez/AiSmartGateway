@@ -884,7 +884,8 @@ upstream_kind: 网关实际选择的上游接口格式
 11. 流式跨格式转换改为按完整 SSE 事件缓冲后再转换，避免一个事件被上游拆成多个网络 chunk 时丢字。
 12. 只由 Codex diagnostic shape 证明可用的 Responses health，不再使用普通小 JSON 的 Chat -> Responses 转换；改为 `codex_responses_to_chat` adapter，给安全 Chat 请求生成 Codex-compatible Responses body 和 Codex identity headers，再把 Responses 结果转回 Chat。
 13. `codex_responses_to_chat` 默认 `reasoning.effort=low`，带 `include=["reasoning.encrypted_content"]`、`prompt_cache_key`、`client_metadata`，不带工具列表；运行时成功后保留 `responses_compat_mode=codex`，避免下次又退回普通小 JSON。
-14. 通用 `partial` 兼容改为错误驱动：Responses 运行时、minimal probe、Codex diagnostic 只要明确返回缺 `partial`，同一 endpoint 在首块前自动补 `partial=stream` 重试一次，并学习 provider 默认值。
+14. 兼容模式有两条通用判断路径：探测期 minimal Responses 失败但 Codex diagnostic 成功；运行时普通 Chat -> Responses 小 JSON 在首块前返回 `invalid_request`，则同 endpoint 自动切 `codex_responses_to_chat` 重试一次，成功后学习 `responses_compat_mode=codex`。
+15. 通用 `partial` 兼容改为错误驱动：Responses 运行时、minimal probe、Codex diagnostic 只要明确返回缺 `partial`，同一 endpoint 在首块前自动补 `partial=stream` 重试一次，并学习 provider 默认值。
 
 ### 当前健康含义
 
@@ -905,6 +906,7 @@ upstream_kind: 网关实际选择的上游接口格式
 - Chat 客户端请求使用 Responses 上游并转回 Chat。
 - 双向流式转换可处理拆分 SSE 事件。
 - Codex diagnostic-only Responses 健康会进入 `codex_responses_to_chat` 转换候选，不再使用会被拒绝的普通小 JSON Responses 形态。
+- 普通 Chat -> Responses 小 JSON 遇到 `invalid_request` 时，非流式和流式都会在首块前自动切 Codex-compatible 形态重试并学习。
 - 缺 `partial` 的 Responses provider 在探活、非流式运行时、流式运行时都会通用重试。
 
 真实请求回归：
@@ -915,4 +917,4 @@ upstream_kind: 网关实际选择的上游接口格式
 - Anyrouter `gpt-5.5`：普通 Responses 小 JSON 仍返回 `invalid codex request`；Codex-compatible Chat -> Responses 转换已通过，强制 Anyrouter 和普通自动路由均走 `chat -> responses / codex_responses_to_chat` 并成功返回，health 保留 `responses_compat_mode=codex`。
 - 管理 API 暴露健康新鲜度字段。
 
-完整验证结果：`79 passed`。
+完整验证结果：`81 passed`。

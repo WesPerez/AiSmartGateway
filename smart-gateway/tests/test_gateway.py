@@ -526,6 +526,73 @@ async def test_chat_request_uses_codex_compat_responses_shape_when_required(gate
 
 
 @pytest.mark.asyncio()
+async def test_chat_request_learns_codex_compat_after_plain_responses_invalid_request(gateway, monkeypatch):
+    gateway.PROVIDERS = [
+        {"id": "p1", "base_url": "https://p1.example/v1", "api_key": "sk-p1", "timeout_seconds": 3, "headers": {}},
+    ]
+    gateway.HEALTH = {
+        "responses": {
+            "good-model": {
+                "p1": {
+                    "provider_id": "p1",
+                    "actual_model": "actual-responses",
+                    "healthy": True,
+                    "priority": 100,
+                    "weight": 1,
+                },
+            }
+        },
+        "chat": {},
+    }
+    monkeypatch.setattr(gateway, "pick_weighted", lambda candidates: candidates[0])
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent = json.loads(request.content.decode())
+        seen.append(sent)
+        if "reasoning" not in sent:
+            return httpx.Response(
+                400,
+                json={"error": {"message": "invalid codex request", "code": "invalid_responses_request"}},
+            )
+        assert request.headers["originator"] == "codex_exec"
+        assert "gateway-chat-adapter" in request.headers["user-agent"]
+        return httpx.Response(
+            200,
+            json={
+                "id": "resp-ok",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "pong"}],
+                    },
+                ],
+            },
+        )
+
+    with respx.mock:
+        route = respx.post("https://p1.example/v1/responses").mock(side_effect=handler)
+        response = await gateway.relay_non_stream(
+            "/chat/completions",
+            {"model": "good-model", "messages": [{"role": "user", "content": "ping"}]},
+            "chat",
+        )
+
+    assert response.status_code == 200
+    assert route.call_count == 2
+    assert "reasoning" not in seen[0]
+    assert seen[1]["reasoning"]["effort"] == "low"
+    assert seen[1]["include"] == ["reasoning.encrypted_content"]
+    payload = json.loads(response.body.decode())
+    assert payload["choices"][0]["message"]["content"] == "pong"
+    item = gateway.HEALTH["responses"]["good-model"]["p1"]
+    assert item["responses_compat_mode"] == "codex"
+    logs = gateway.read_recent_request_logs()
+    assert logs[0]["format_adapter"] == "codex_responses_to_chat"
+
+
+@pytest.mark.asyncio()
 async def test_responses_non_stream_retries_missing_partial_generically(gateway, monkeypatch):
     gateway.RESPONSES_COMPAT_DEFAULTS.clear()
     gateway.PROVIDERS = [
@@ -1996,6 +2063,65 @@ async def test_responses_client_stream_from_chat_upstream_handles_split_sse_even
     assert b'"delta":"hello"' in joined
     assert b"event: response.completed" in joined
     assert joined.endswith(b"data: [DONE]\n\n")
+
+
+@pytest.mark.asyncio()
+async def test_chat_stream_learns_codex_compat_after_plain_responses_invalid_request(gateway, monkeypatch):
+    gateway.PROVIDERS = [
+        {"id": "p1", "base_url": "https://p1.example/v1", "api_key": "sk-p1", "timeout_seconds": 3, "headers": {}},
+    ]
+    gateway.HEALTH = {
+        "responses": {
+            "good-model": {
+                "p1": {
+                    "provider_id": "p1",
+                    "actual_model": "actual-responses",
+                    "healthy": True,
+                    "priority": 100,
+                    "weight": 1,
+                },
+            }
+        },
+        "chat": {},
+    }
+    monkeypatch.setattr(gateway, "pick_weighted", lambda candidates: candidates[0])
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent = json.loads(request.content.decode())
+        seen.append(sent)
+        if "reasoning" not in sent:
+            return httpx.Response(
+                400,
+                json={"error": {"message": "invalid codex request", "code": "invalid_responses_request"}},
+            )
+        assert request.headers["originator"] == "codex_exec"
+        return httpx.Response(
+            200,
+            text='event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"pong"}\n\nevent: response.completed\ndata: {"type":"response.completed"}\n\ndata: [DONE]\n\n',
+        )
+
+    with respx.mock:
+        route = respx.post("https://p1.example/v1/responses").mock(side_effect=handler)
+        chunks = [
+            chunk
+            async for chunk in gateway.relay_stream(
+                "/chat/completions",
+                {"model": "good-model", "messages": [{"role": "user", "content": "ping"}], "stream": True},
+                "chat",
+            )
+        ]
+
+    joined = b"".join(chunks)
+    assert route.call_count == 2
+    assert "reasoning" not in seen[0]
+    assert seen[1]["stream"] is True
+    assert seen[1]["reasoning"]["effort"] == "low"
+    assert b'"object":"chat.completion.chunk"' in joined
+    assert b'"content":"pong"' in joined
+    assert joined.endswith(b"data: [DONE]\n\n")
+    item = gateway.HEALTH["responses"]["good-model"]["p1"]
+    assert item["responses_compat_mode"] == "codex"
 
 
 @pytest.mark.asyncio()

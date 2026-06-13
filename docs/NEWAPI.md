@@ -382,6 +382,16 @@ back to Chat Completions. Successful runtime use persists
 `responses_compat_mode=codex` so later route decisions keep using the same
 compatible shape.
 
+This compatibility mode is learned in two generic ways:
+
+- Probe-time: a minimal Responses probe fails with request-shape
+  `invalid_request`, but the Codex diagnostic shape succeeds.
+- Runtime: a safe Chat -> Responses conversion first tries the ordinary small
+  Responses body; if the upstream returns `invalid_request` before any client
+  output starts, the gateway retries the same endpoint once with
+  `codex_responses_to_chat` and persists `responses_compat_mode=codex` on
+  success.
+
 Streaming adapters buffer complete SSE events before conversion, so a single
 event split across multiple upstream network chunks is not dropped. This applies
 to both Chat stream -> Responses stream and Responses stream -> Chat stream.
@@ -397,7 +407,9 @@ Real validation on 2026-06-13 covered:
 - Anyrouter `gpt-5.5`: plain Responses small JSON still returns
   `invalid codex request`, but Codex-compatible Chat -> Responses conversion now
   succeeds through `codex_responses_to_chat`; normal `gpt-5.5` Chat routing
-  selects Anyrouter Responses instead of the paid Chat fallback.
+  selects Anyrouter Responses instead of the paid Chat fallback. Runtime
+  learning also covers the case where a new provider has not yet been classified
+  as Codex-compatible by probe state.
 
 ## Operations UI
 

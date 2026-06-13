@@ -1330,6 +1330,26 @@ def upstream_request_headers(
     return provider_headers(provider, incoming_headers, upstream_kind, extra_headers)
 
 
+def can_retry_with_codex_compat_adapter(
+    client_kind: str,
+    upstream_kind: str,
+    status_code: int,
+    text: str,
+    chosen: dict[str, Any],
+) -> bool:
+    return (
+        client_kind == "chat"
+        and upstream_kind == "responses"
+        and not chosen.get("_codex_compat_adapter")
+        and classify_error(status_code, text) == "invalid_request"
+    )
+
+
+def enable_codex_compat_adapter(chosen: dict[str, Any]) -> None:
+    chosen["_codex_compat_adapter"] = True
+    chosen["_format_adapter"] = "codex_responses_to_chat"
+
+
 def extract_chat_response_text(data: Any) -> str:
     if not isinstance(data, dict):
         return ""
@@ -2720,15 +2740,24 @@ async def relay_non_stream(
             ) as client:
                 response = None
                 endpoint_url = ""
+                codex_compat_retry_used = False
                 for candidate_url in upstream_urls(provider, upstream_path):
                     endpoint_url = candidate_url
-                    headers = upstream_request_headers(provider, incoming_headers, upstream_kind, chosen, request_id, bool(req_body.get("stream", False)))
-                    response = await client.post(candidate_url, headers=headers, json=req_body)
-                    if can_retry_with_partial(upstream_kind, response.status_code, response.text[:1000], req_body):
-                        learn_responses_partial_default(chosen)
-                        req_body = apply_responses_provider_defaults(req_body, chosen)
+                    while True:
                         headers = upstream_request_headers(provider, incoming_headers, upstream_kind, chosen, request_id, bool(req_body.get("stream", False)))
                         response = await client.post(candidate_url, headers=headers, json=req_body)
+                        text_sample = response.text[:1000]
+                        if can_retry_with_partial(upstream_kind, response.status_code, text_sample, req_body):
+                            learn_responses_partial_default(chosen)
+                            req_body = apply_responses_provider_defaults(req_body, chosen)
+                            continue
+                        if not codex_compat_retry_used and can_retry_with_codex_compat_adapter(kind, upstream_kind, response.status_code, text_sample, chosen):
+                            codex_compat_retry_used = True
+                            enable_codex_compat_adapter(chosen)
+                            req_body = prepare_upstream_body(body, chosen, kind)
+                            route_fields = log_route_fields(chosen, route_bucket)
+                            continue
+                        break
                     if 200 <= response.status_code < 300:
                         break
                     endpoint_reasons.append(classify_error(response.status_code, response.text[:1000]))
@@ -2907,6 +2936,7 @@ async def relay_stream(
                 timeout=httpx.Timeout(provider.get("timeout_seconds") or REQUEST_TIMEOUT_SECONDS),
                 follow_redirects=True,
             ) as client:
+                codex_compat_retry_used = False
                 for endpoint_url in upstream_urls(provider, upstream_path):
                     partial_retry_used = False
                     while True:
@@ -2919,6 +2949,12 @@ async def relay_stream(
                                     partial_retry_used = True
                                     learn_responses_partial_default(chosen)
                                     req_body = apply_responses_provider_defaults(req_body, chosen)
+                                    continue
+                                if not codex_compat_retry_used and can_retry_with_codex_compat_adapter(kind, upstream_kind, response.status_code, raw_text[:1000], chosen):
+                                    codex_compat_retry_used = True
+                                    enable_codex_compat_adapter(chosen)
+                                    req_body = prepare_upstream_body(body, chosen, kind)
+                                    route_fields = log_route_fields(chosen, route_bucket)
                                     continue
                                 reason = classify_error(response.status_code, raw_text[:1000])
                                 endpoint_reasons.append(reason)
