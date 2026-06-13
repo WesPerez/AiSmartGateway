@@ -100,6 +100,37 @@ def test_sync_model_ratio_keeps_only_active_models_and_archives_prices(tmp_path)
     assert restored == {"old-model": 2.5}
 
 
+def test_sync_model_sort_rank_orders_same_family_versions_desc():
+    sync = load_sync_module()
+    models = ["gpt-5.4-mini", "gpt-5.5", "gpt-4.1", "claude-opus-4-8", "claude-opus-4-6"]
+
+    assert sorted(models, key=sync.model_sort_rank) == [
+        "gpt-5.5",
+        "gpt-5.4-mini",
+        "gpt-4.1",
+        "claude-opus-4-8",
+        "claude-opus-4-6",
+    ]
+
+
+def test_provider_from_channel_adds_muyuan_client_headers(tmp_path):
+    sync = load_sync_module()
+    con = make_db(tmp_path / "one-api.db")
+    con.execute(
+        """
+        insert into channels (
+            id, name, status, base_url, models, tag, "group", priority, weight, key
+        ) values (4, 'muyuan.do', 1, 'https://muyuan.do', 'claude-opus-4-8', 'gateway-source', 'default', 90, 100, 'sk-test')
+        """
+    )
+    row = con.execute("select * from channels where id = 4").fetchone()
+
+    provider = sync.provider_from_channel(row)
+
+    assert provider["base_url"] == "https://muyuan.do/v1"
+    assert provider["headers"] == {"User-Agent": "Claude-Code/1.0.0"}
+
+
 def test_sync_models_table_auto_hides_and_restores_gateway_models(tmp_path):
     sync = load_sync_module()
     con = make_db(tmp_path / "one-api.db")

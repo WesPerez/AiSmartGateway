@@ -45,6 +45,8 @@ model_include:
   - mimo-*
 
 model_exclude:
+  - "gpt-5.4*"
+  - "*-20??????"
   - "*embedding*"
   - "*moderation*"
   - "*audio*"

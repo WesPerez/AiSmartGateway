@@ -135,6 +135,168 @@ ADMIN_HTML = """
     .upstream-filters input {
       width: 180px;
     }
+    .availability-toolbar {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      gap: 12px;
+      align-items: center;
+      margin-bottom: 12px;
+    }
+    .segmented {
+      display: inline-flex;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+      background: #fff;
+      width: fit-content;
+    }
+    .segmented button {
+      border: 0;
+      border-right: 1px solid var(--line);
+      border-radius: 0;
+      padding: 8px 12px;
+      white-space: nowrap;
+    }
+    .segmented button:last-child {
+      border-right: 0;
+    }
+    .segmented button.active {
+      background: var(--accent);
+      color: #fff;
+    }
+    .availability-filters {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .availability-filters input {
+      width: 190px;
+    }
+    .availability-summary {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.5;
+      margin-bottom: 10px;
+    }
+    .availability-table,
+    .upstream-availability-table {
+      table-layout: fixed;
+    }
+    .availability-table { min-width: 1520px; }
+    .availability-table th:nth-child(1), .availability-table td:nth-child(1) { width: 190px; }
+    .availability-table th:nth-child(2), .availability-table td:nth-child(2) { width: 140px; }
+    .availability-table th:nth-child(3), .availability-table td:nth-child(3) { width: 300px; }
+    .availability-table th:nth-child(4), .availability-table td:nth-child(4) { width: 260px; }
+    .availability-table th:nth-child(5), .availability-table td:nth-child(5) { width: 110px; }
+    .availability-table th:nth-child(6), .availability-table td:nth-child(6) { width: 170px; }
+    .availability-table th:nth-child(7), .availability-table td:nth-child(7) { width: 170px; }
+    .availability-table th:nth-child(8), .availability-table td:nth-child(8) { width: 180px; }
+    .upstream-availability-table { min-width: 1760px; }
+    .upstream-availability-table th:nth-child(1), .upstream-availability-table td:nth-child(1) { width: 240px; }
+    .upstream-availability-table th:nth-child(2), .upstream-availability-table td:nth-child(2) { width: 130px; }
+    .upstream-availability-table th:nth-child(3), .upstream-availability-table td:nth-child(3) { width: 210px; }
+    .upstream-availability-table th:nth-child(4), .upstream-availability-table td:nth-child(4) { width: 250px; }
+    .upstream-availability-table th:nth-child(5), .upstream-availability-table td:nth-child(5) { width: 105px; }
+    .upstream-availability-table th:nth-child(6), .upstream-availability-table td:nth-child(6) { width: 95px; }
+    .upstream-availability-table th:nth-child(7), .upstream-availability-table td:nth-child(7) { width: 165px; }
+    .upstream-availability-table th:nth-child(8), .upstream-availability-table td:nth-child(8) { width: 165px; }
+    .upstream-availability-table th:nth-child(9), .upstream-availability-table td:nth-child(9) { width: 230px; }
+    .upstream-availability-table th:nth-child(10), .upstream-availability-table td:nth-child(10) { width: 170px; }
+    .matrix-helpbar {
+      display: grid;
+      grid-template-columns: minmax(220px, auto) minmax(0, 1fr);
+      gap: 12px;
+      align-items: start;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      margin-bottom: 12px;
+    }
+    .matrix-help-title {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-weight: 800;
+      line-height: 1.4;
+    }
+    .matrix-help-summary {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.6;
+    }
+    .help-popover {
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+    }
+    .help-dot {
+      width: 20px;
+      height: 20px;
+      padding: 0;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: #f8fafc;
+      color: var(--accent-dark);
+      font-weight: 900;
+      font-size: 12px;
+      cursor: help;
+    }
+    .help-popover-panel {
+      position: absolute;
+      left: 0;
+      top: calc(100% + 8px);
+      width: min(680px, calc(100vw - 48px));
+      max-height: min(70vh, 620px);
+      overflow: auto;
+      opacity: 0;
+      visibility: hidden;
+      transform: translateY(-4px);
+      transition: opacity .12s ease, transform .12s ease;
+      z-index: 20;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      box-shadow: 0 16px 32px rgba(15, 23, 42, .14);
+      padding: 12px;
+      color: var(--text);
+      font-size: 12px;
+      line-height: 1.6;
+    }
+    .help-popover:hover .help-popover-panel,
+    .help-popover:focus-within .help-popover-panel {
+      opacity: 1;
+      visibility: visible;
+      transform: translateY(0);
+    }
+    .help-popover-panel h3 {
+      margin: 0 0 8px;
+      font-size: 13px;
+    }
+    .policy-list {
+      display: grid;
+      gap: 6px;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+    .policy-list li {
+      display: grid;
+      grid-template-columns: 140px minmax(0, 1fr);
+      gap: 8px;
+    }
+    .policy-key {
+      color: var(--muted);
+      font-weight: 700;
+    }
     input, textarea, select {
       width: 100%;
       border: 1px solid var(--line);
@@ -463,6 +625,10 @@ ADMIN_HTML = """
       .provider-grid, .provider-wide { grid-template-columns: 1fr; }
       .policy-hero { grid-template-columns: 1fr; }
       .route-board { grid-template-columns: 1fr; }
+      .matrix-helpbar { grid-template-columns: 1fr; }
+      .availability-toolbar { grid-template-columns: 1fr; }
+      .availability-filters { justify-content: flex-start; }
+      .help-popover-panel { left: auto; right: 0; }
     }
     @media (max-width: 560px) {
       .grid { grid-template-columns: 1fr; }
@@ -476,7 +642,7 @@ ADMIN_HTML = """
     <div class="wrap topbar">
       <div>
         <h1>AI Smart Gateway Operations</h1>
-        <div class="sub">New API 后置智能路由层：运行观测、健康矩阵、最终流向和兜底策略</div>
+        <div class="sub">New API 后置智能路由层：运行观测、模型可用性、探测矩阵、最终流向和兜底策略</div>
       </div>
       <div class="row">
         <button id="refreshBtn" title="只刷新当前管理页展示数据，不触发同步或探测">刷新</button>
@@ -521,9 +687,8 @@ ADMIN_HTML = """
 
       <div class="tabs">
         <button class="tab active" data-tab="overview">运行概览</button>
-        <button class="tab" data-tab="models">运行时模型</button>
-        <button class="tab" data-tab="matrix">健康矩阵</button>
-        <button class="tab" data-tab="upstreams">上游模型状态</button>
+        <button class="tab" data-tab="models">模型可用性</button>
+        <button class="tab" data-tab="matrix">探测矩阵</button>
         <button class="tab" data-tab="logs">路由日志</button>
         <button class="tab" data-tab="providers">源池策略</button>
       </div>
@@ -579,24 +744,70 @@ ADMIN_HTML = """
       </section>
 
       <section id="tab-models" class="tabpane hidden">
-        <div class="tablewrap">
-          <table>
-            <thead>
-              <tr>
-                <th>模型</th>
-                <th>Chat 健康数</th>
-                <th>Responses 健康数</th>
-                <th>上游摘要</th>
-                <th>状态</th>
-              </tr>
-            </thead>
-            <tbody id="modelsBody"></tbody>
-          </table>
+        <div class="availability-toolbar">
+          <div class="segmented" role="tablist" aria-label="模型可用性视图">
+            <button type="button" class="active" data-availability-view="model">按模型</button>
+            <button type="button" data-availability-view="upstream">按上游</button>
+          </div>
+          <div class="availability-filters">
+            <input id="availabilityModelFilter" list="upstreamModelOptions" placeholder="输入或选择模型">
+            <input id="availabilityUpstreamFilter" list="upstreamOptions" placeholder="输入或选择上游">
+            <label class="inline-toggle" title="默认只显示至少一个接口健康的模型/上游；勾选后显示异常和无健康项。">
+              <input id="showUnhealthyAvailability" type="checkbox" aria-label="显示异常和无健康项">
+              <span>显示异常</span>
+            </label>
+          </div>
         </div>
-        <div id="modelsPager" class="pager"></div>
+        <datalist id="upstreamOptions"></datalist>
+        <datalist id="upstreamModelOptions"></datalist>
+        <div id="availabilityModelView">
+          <div class="availability-summary">默认按对外模型汇总可用性；排障时切到“按上游”查看每个上游模型的检测、冷却和详情。</div>
+          <div class="tablewrap wide-table">
+            <table class="availability-table">
+              <thead>
+                <tr>
+                  <th>模型</th>
+                  <th>接口健康</th>
+                  <th>首选上游</th>
+                  <th>备份/兜底</th>
+                  <th>最低延迟</th>
+                  <th>最近检测</th>
+                  <th>下次探测</th>
+                  <th>主要状态</th>
+                </tr>
+              </thead>
+              <tbody id="modelsBody"></tbody>
+            </table>
+          </div>
+          <div id="modelsPager" class="pager"></div>
+        </div>
+        <div id="availabilityUpstreamView" class="hidden">
+          <div class="availability-summary">按上游展开模型明细，用于定位某个源池渠道贡献了哪些模型、哪些接口异常、当前处于什么冷却策略。</div>
+          <div class="tablewrap wide-table">
+            <table class="upstream-availability-table">
+              <thead>
+                <tr>
+                  <th>上游</th>
+                  <th>策略</th>
+                  <th>模型</th>
+                  <th>接口</th>
+                  <th>状态</th>
+                  <th>延迟</th>
+                  <th>最近检测</th>
+                  <th>下次探测</th>
+                  <th>检测/冷却策略</th>
+                  <th>详情</th>
+                </tr>
+              </thead>
+              <tbody id="upstreamsBody"></tbody>
+            </table>
+          </div>
+          <div id="upstreamsPager" class="pager"></div>
+        </div>
       </section>
 
       <section id="tab-matrix" class="tabpane hidden">
+        <div id="matrixPolicyHelp" class="matrix-helpbar"></div>
         <div class="tablewrap">
           <table>
             <thead>
@@ -643,38 +854,6 @@ ADMIN_HTML = """
           </table>
         </div>
         <div id="logsPager" class="pager"></div>
-      </section>
-
-      <section id="tab-upstreams" class="tabpane hidden">
-        <div class="upstream-toolbar">
-          <div class="upstream-filters">
-            <input id="upstreamFilter" list="upstreamOptions" placeholder="输入或选择上游">
-            <datalist id="upstreamOptions"></datalist>
-            <input id="upstreamModelFilter" list="upstreamModelOptions" placeholder="输入或选择模型">
-            <datalist id="upstreamModelOptions"></datalist>
-          </div>
-          <div class="sub">按上游查看每个模型的当前健康、接口支持、延迟、最近检测和下次探测。这里只显示启用源池上游。</div>
-        </div>
-        <div class="tablewrap wide-table">
-          <table>
-            <thead>
-              <tr>
-                <th>上游</th>
-                <th>策略</th>
-                <th>模型</th>
-                <th>接口</th>
-                <th>状态 <label class="inline-toggle" title="默认只显示至少一个接口健康的上游模型；勾选后显示异常和无健康接口的上游模型。"><input id="showUnhealthyUpstreams" type="checkbox" aria-label="显示异常上游模型"></label></th>
-                <th>延迟</th>
-                <th>最近检测</th>
-                <th>下次探测</th>
-                <th>检测/冷却策略</th>
-                <th>详情</th>
-              </tr>
-            </thead>
-            <tbody id="upstreamsBody"></tbody>
-          </table>
-        </div>
-        <div id="upstreamsPager" class="pager"></div>
       </section>
 
       <section id="tab-providers" class="tabpane hidden">
@@ -732,6 +911,7 @@ ADMIN_HTML = """
     let providers = [];
     let logsData = { logs: [] };
     let providerDrafts = {};
+    let availabilityView = "model";
     const pageSizeOptions = [10, 25, 50, 100, 200];
     const pageSizes = { models: 10, matrix: 10, upstreams: 10, logs: 10, providers: 10 };
     const pages = { models: 1, matrix: 1, upstreams: 1, logs: 1, providers: 1 };
@@ -774,6 +954,15 @@ ADMIN_HTML = """
 
     function formatTs(ts, empty = "") {
       return ts ? new Date(ts * 1000).toLocaleString() : empty;
+    }
+
+    function formatDuration(seconds) {
+      if (seconds == null || seconds === "") return "";
+      const value = Math.max(0, Number(seconds));
+      if (value >= 86400) return `${Math.round(value / 86400)} 天`;
+      if (value >= 3600) return `${Math.round(value / 3600)} 小时`;
+      if (value >= 60) return `${Math.round(value / 60)} 分钟`;
+      return `${value} 秒`;
     }
 
     const editableRoutes = [
@@ -875,7 +1064,7 @@ ADMIN_HTML = """
         }
       }
       return items.sort((a, b) =>
-        compareText(a.model, b.model) ||
+        compareModelId(a.model, b.model) ||
         compareText(a.kind, b.kind)
       );
     }
@@ -889,7 +1078,7 @@ ADMIN_HTML = """
         if (latency != null && (row.bestLatency == null || latency < row.bestLatency)) row.bestLatency = latency;
         byModel.set(entry.model, row);
       }
-      return Array.from(byModel.values()).sort((a, b) => compareText(a.model, b.model));
+      return Array.from(byModel.values()).sort((a, b) => compareModelId(a.model, b.model));
     }
 
     function enabledProviderRows() {
@@ -1005,6 +1194,23 @@ ADMIN_HTML = """
       return 9;
     }
 
+    function modelVersionParts(modelId) {
+      return (String(modelId || "").match(/\\d+/g) || []).map((value) => Number(value));
+    }
+
+    function compareModelId(a, b) {
+      const rank = modelSortRank(a) - modelSortRank(b);
+      if (rank !== 0) return rank;
+      const av = modelVersionParts(a);
+      const bv = modelVersionParts(b);
+      const max = Math.max(av.length, bv.length);
+      for (let i = 0; i < max; i += 1) {
+        const diff = Number(bv[i] ?? -1) - Number(av[i] ?? -1);
+        if (diff !== 0) return diff;
+      }
+      return compareText(a, b);
+    }
+
     function providerHealthyModels(providerId) {
       const byModel = new Map();
       for (const kind of ["chat", "responses"]) {
@@ -1021,12 +1227,12 @@ ADMIN_HTML = """
       }
       return Array.from(byModel.entries())
         .map(([model, kinds]) => ({ model, kinds: Array.from(kinds).sort() }))
-        .sort((a, b) => compareText(a.model, b.model));
+        .sort((a, b) => compareModelId(a.model, b.model));
     }
 
     function updateModelOptions() {
       const models = new Set((state?.models || []).map((m) => m.id).filter(Boolean));
-      $("modelOptions").innerHTML = Array.from(models).sort().map((model) => `<option value="${escapeHtml(model)}"></option>`).join("");
+      $("modelOptions").innerHTML = Array.from(models).sort(compareModelId).map((model) => `<option value="${escapeHtml(model)}"></option>`).join("");
     }
 
     function updateUpstreamOptions() {
@@ -1037,14 +1243,19 @@ ADMIN_HTML = """
         if (row.provider?.id) upstreams.add(String(row.provider.id));
         for (const model of row.provider?.declared_models || []) models.add(model);
       }
-      for (const row of buildUpstreamRows()) {
-        if (row.provider_name) upstreams.add(row.provider_name);
-        if (row.provider_id) upstreams.add(row.provider_id);
-        if (row.model) models.add(row.model);
-        for (const actual of row.actual_models || []) models.add(actual);
+      for (const kind of ["chat", "responses"]) {
+        const health = state?.health?.[kind] || {};
+        for (const model of Object.keys(health)) {
+          models.add(model);
+          for (const item of Object.values(health[model] || {})) {
+            if (item.provider_name) upstreams.add(item.provider_name);
+            if (item.provider_id) upstreams.add(item.provider_id);
+            if (item.actual_model) models.add(item.actual_model);
+          }
+        }
       }
       $("upstreamOptions").innerHTML = Array.from(upstreams).sort().map((item) => `<option value="${escapeHtml(item)}"></option>`).join("");
-      $("upstreamModelOptions").innerHTML = Array.from(models).sort().map((item) => `<option value="${escapeHtml(item)}"></option>`).join("");
+      $("upstreamModelOptions").innerHTML = Array.from(models).sort(compareModelId).map((item) => `<option value="${escapeHtml(item)}"></option>`).join("");
     }
 
     function smallModelChips(items, limit = 8) {
@@ -1069,7 +1280,7 @@ ADMIN_HTML = """
       const models = selectedModel
         ? [{ model: selectedModel, kind: Array.from(row.kinds || []).sort().join("+") }]
         : providerHealthyModelDetails(provider.id || "", "");
-      const actualModels = row.actual_models ? Array.from(row.actual_models).sort() : [];
+      const actualModels = row.actual_models ? Array.from(row.actual_models).sort(compareModelId) : [];
       return `
         <div class="route-card">
           <div class="route-card-title">
@@ -1156,33 +1367,220 @@ ADMIN_HTML = """
       setNotice(`最后探测: ${formatTs(data.last_probe_at, "未完成")}`);
     }
 
-    function renderModels(data) {
-      const ordered = [...data.models].sort((a, b) =>
-        modelSortRank(a.id) - modelSortRank(b.id) ||
-        (b.chat_ok + b.responses_ok) - (a.chat_ok + a.responses_ok) ||
-        compareText(a.id, b.id)
+    function availabilityFilters() {
+      return {
+        modelKeyword: ($("availabilityModelFilter")?.value || "").trim().toLowerCase(),
+        upstreamKeyword: ($("availabilityUpstreamFilter")?.value || "").trim().toLowerCase(),
+        showUnhealthy: $("showUnhealthyAvailability")?.checked === true
+      };
+    }
+
+    function rowKindLabels(row) {
+      const kinds = [];
+      if (row.kinds.chat?.healthy) kinds.push("chat");
+      if (row.kinds.responses?.healthy) kinds.push("responses");
+      return kinds;
+    }
+
+    function routeRowChips(rows, limit = 4) {
+      if (!rows.length) return '<span class="muted">无健康上游</span>';
+      const shown = rows.slice(0, limit);
+      const rest = rows.length - shown.length;
+      return `
+        <div class="chiprow">
+          ${shown.map((row) => {
+            const latency = row.best_healthy_latency ?? row.best_failed_latency;
+            const kindText = rowKindLabels(row).join("+") || "无健康接口";
+            const cls = row.healthy_count > 0 ? "ok" : "warn";
+            return `<span class="chip ${cls}" title="${escapeHtml(row.provider_name + " / " + row.model)}">${escapeHtml(row.provider_name)}<span class="model-kind">${escapeHtml(routeLabel(row.route_group))} ${escapeHtml(kindText)}${latency == null ? "" : " " + latency + "ms"}</span></span>`;
+          }).join("")}
+          ${rest > 0 ? `<span class="chip dark">+${rest}</span>` : ""}
+        </div>
+      `;
+    }
+
+    function reasonSummary(reasons) {
+      const values = Array.from(reasons || []).filter((reason) => reason && reason !== "ok");
+      if (!values.length) return "";
+      const priority = [
+        "runtime_failure:real_shape_invalid",
+        "real_shape_invalid",
+        "auth_or_forbidden",
+        "quota",
+        "rate_limited",
+        "server_unavailable",
+        "exception:ReadTimeout",
+        "model_unsupported",
+        "not_found",
+        "responses_request_shape_unverified"
+      ];
+      values.sort((a, b) => {
+        const ai = priority.findIndex((item) => a === item || a.startsWith(item));
+        const bi = priority.findIndex((item) => b === item || b.startsWith(item));
+        return (ai < 0 ? 99 : ai) - (bi < 0 ? 99 : bi) || compareText(a, b);
+      });
+      return values.slice(0, 3).join(", ");
+    }
+
+    function buildModelAvailabilityRows() {
+      const rows = buildUpstreamRows();
+      const filters = availabilityFilters();
+      const byModel = new Map();
+      for (const row of rows) {
+        const current = byModel.get(row.model) || {
+          id: row.model,
+          chat_ok: 0,
+          responses_ok: 0,
+          rows: [],
+          healthy_rows: [],
+          checked_at: 0,
+          next_probe_at: null,
+          best_latency: null,
+          reasons: new Set()
+        };
+        current.rows.push(row);
+        if (row.healthy_count > 0) current.healthy_rows.push(row);
+        if (row.kinds.chat?.healthy) current.chat_ok += 1;
+        if (row.kinds.responses?.healthy) current.responses_ok += 1;
+        if (row.checked_at && row.checked_at > current.checked_at) current.checked_at = row.checked_at;
+        if (row.next_probe_at && (current.next_probe_at == null || row.next_probe_at < current.next_probe_at)) current.next_probe_at = row.next_probe_at;
+        const latency = row.best_healthy_latency ?? row.best_failed_latency;
+        if (latency != null && (current.best_latency == null || latency < current.best_latency)) current.best_latency = latency;
+        for (const reason of row.reasons) current.reasons.add(reason);
+        byModel.set(row.model, current);
+      }
+      if (!filters.upstreamKeyword) {
+        for (const model of state?.models || []) {
+          const id = model.id || "";
+          if (!id) continue;
+          if (filters.modelKeyword && !id.toLowerCase().includes(filters.modelKeyword)) continue;
+          if (!filters.showUnhealthy && Number(model.chat_ok || 0) + Number(model.responses_ok || 0) <= 0) continue;
+          if (!byModel.has(id)) {
+            byModel.set(id, {
+              id,
+              chat_ok: Number(model.chat_ok || 0),
+              responses_ok: Number(model.responses_ok || 0),
+              rows: [],
+              healthy_rows: [],
+              checked_at: 0,
+              next_probe_at: null,
+              best_latency: null,
+              reasons: new Set()
+            });
+          }
+        }
+      }
+      return Array.from(byModel.values()).sort((a, b) =>
+        compareModelId(a.id, b.id) ||
+        Number(b.chat_ok + b.responses_ok) - Number(a.chat_ok + a.responses_ok) ||
+        Number(a.best_latency ?? 999999) - Number(b.best_latency ?? 999999)
       );
+    }
+
+    function renderModels(data) {
+      const ordered = buildModelAvailabilityRows();
       const page = paginate("models", ordered);
       $("modelsBody").innerHTML = page.items.map((m) => {
+        const healthyRows = sortedRouteRows(m.healthy_rows);
+        const primary = healthyRows.filter((row) => row.route_group !== "paid_fallback" && !row.fallback_only);
+        const first = primary[0] || healthyRows[0];
+        const secondary = healthyRows.filter((row) => row !== first);
+        const detail = reasonSummary(m.reasons);
         return `
         <tr>
-          <td class="mono">${m.id}</td>
-          <td>${m.chat_ok}</td>
-          <td>${m.responses_ok}</td>
-          <td>${modelProviderSummary(m.id)}</td>
-          <td>${modelStatusPill(m)}</td>
+          <td class="mono">${escapeHtml(m.id)}</td>
+          <td>
+            <div class="chiprow">
+              <span class="chip ${m.chat_ok > 0 ? "ok" : "dark"}">chat ${m.chat_ok}</span>
+              <span class="chip ${m.responses_ok > 0 ? "ok" : "dark"}">responses ${m.responses_ok}</span>
+            </div>
+          </td>
+          <td>${first ? routeRowChips([first], 1) : '<span class="muted">无健康首选</span>'}</td>
+          <td>${routeRowChips(secondary, 4)}</td>
+          <td>${m.best_latency == null ? "" : m.best_latency + " ms"}</td>
+          <td>${formatTs(m.checked_at, "未检测")}</td>
+          <td>${formatTs(m.next_probe_at)}</td>
+          <td>
+            ${modelStatusPill(m)}
+            ${detail ? `<div class="cell-sub mono">${escapeHtml(detail)}</div>` : ""}
+          </td>
         </tr>
       `;
       }).join("");
       renderPager("models", page.total, page.totalPages);
     }
 
+    function renderAvailability() {
+      $("availabilityModelView").classList.toggle("hidden", availabilityView !== "model");
+      $("availabilityUpstreamView").classList.toggle("hidden", availabilityView !== "upstream");
+      document.querySelectorAll("[data-availability-view]").forEach((btn) => {
+        btn.classList.toggle("active", btn.dataset.availabilityView === availabilityView);
+      });
+      renderModels(state);
+      renderUpstreams();
+    }
+
+    function renderMatrixPolicy(data) {
+      const el = $("matrixPolicyHelp");
+      if (!el) return;
+      const policy = data.health_policy || {};
+      const cooldowns = policy.cooldowns || {};
+      const interval = formatDuration(policy.probe_interval_seconds);
+      const maxPerCycle = Number(policy.probe_max_per_cycle || 0);
+      const confirmations = Number(policy.responses_invalid_request_confirmations || 3);
+      const responsesProbe = policy.enable_responses_probe === false ? "Responses 探测关闭" : "Responses 开启二段形态验证";
+      const cooldown = (key) => formatDuration(cooldowns[key]);
+      const visible = [
+        `每 ${interval || "-"} 增量探测，最多 ${maxPerCycle || "-"} 项`,
+        "健康 = 2xx 且响应无 error",
+        `${responsesProbe}`,
+        `真实请求成功会立即刷新健康；Responses 同形态 ${confirmations} 次失败才确认不兼容`
+      ];
+      el.innerHTML = `
+        <div class="matrix-help-title">
+          <span>健康判定 / 冷却策略</span>
+          <div class="help-popover">
+            <button type="button" class="help-dot" aria-label="查看探测矩阵规则">?</button>
+            <div class="help-popover-panel" role="tooltip">
+              <h3>探测矩阵怎么读</h3>
+              <ul class="policy-list">
+                <li><span class="policy-key">记录粒度</span><span>每一行是接口类型、网关模型、上游、实际模型的组合。Chat 和 Responses 独立判定。</span></li>
+                <li><span class="policy-key">探测节奏</span><span>后台每 ${escapeHtml(interval || "-")} 跑增量探测；每轮最多 ${escapeHtml(maxPerCycle || "-")} 项。新记录、到期记录、配置签名变化优先探测，未到期记录保留上次结果。</span></li>
+                <li><span class="policy-key">Chat 判定</span><span>按配置请求 ${escapeHtml((data.health_policy || {}).chat_path || "/chat/completions")}；HTTP 2xx 且响应 JSON 没有 error 就是健康。</span></li>
+                <li><span class="policy-key">Responses 判定</span><span>先用轻量探测请求 ${escapeHtml((data.health_policy || {}).responses_path || "/responses")}；如果上游返回 invalid codex request，会追加一次 Codex 真实诊断形态探测，诊断成功就标健康。</span></li>
+                <li><span class="policy-key">运行时反馈</span><span>真实业务请求成功会把对应上游立即标为 ok；运行时失败会写入 runtime_failure 并进入对应冷却。</span></li>
+                <li><span class="policy-key">形态确认</span><span>Responses 的真实请求同一形态连续 ${escapeHtml(confirmations)} 次 invalid_request 后，才确认为 real_shape_invalid；确认前仍会在付费兜底前做验证。</span></li>
+                <li><span class="policy-key">路由使用</span><span>常规路由优先使用健康项；pending/probe_budget_exhausted 或待验证 Responses 可进入影子/探测重试桶；real_shape_invalid 冷却期内不自动抢在付费兜底前。</span></li>
+              </ul>
+              <h3 style="margin-top: 12px;">冷却时间</h3>
+              <ul class="policy-list">
+                <li><span class="policy-key">健康 ok</span><span>${escapeHtml(cooldown("success") || "-")} 后到期重探。</span></li>
+                <li><span class="policy-key">模型不支持</span><span>${escapeHtml(cooldown("model_unsupported") || "-")}，对应 not_found / model_unsupported。</span></li>
+                <li><span class="policy-key">鉴权失败</span><span>${escapeHtml(cooldown("auth_or_forbidden") || "-")}，对应 401 / 403。</span></li>
+                <li><span class="policy-key">额度不足</span><span>${escapeHtml(cooldown("quota") || "-")}。</span></li>
+                <li><span class="policy-key">限流</span><span>${escapeHtml(cooldown("rate_limited") || "-")}。</span></li>
+                <li><span class="policy-key">服务异常</span><span>${escapeHtml(cooldown("server_unavailable") || "-")}，对应 5xx / empty_stream。</span></li>
+                <li><span class="policy-key">网络异常</span><span>${escapeHtml(cooldown("exception") || "-")}，对应超时、连接错误等 exception。</span></li>
+                <li><span class="policy-key">形态待确认</span><span>${escapeHtml(cooldown("responses_shape_retry") || "-")} 后快速重试。</span></li>
+                <li><span class="policy-key">形态不兼容</span><span>${escapeHtml(cooldown("responses_real_shape_invalid") || "-")} 后再尝试。</span></li>
+                <li><span class="policy-key">未知错误</span><span>${escapeHtml(cooldown("unknown") || "-")}。</span></li>
+              </ul>
+            </div>
+          </div>
+        </div>
+        <div class="matrix-help-summary">
+          ${visible.map((text) => `<span class="chip dark">${escapeHtml(text)}</span>`).join("")}
+        </div>
+      `;
+    }
+
     function renderMatrix(data) {
+      renderMatrixPolicy(data);
       const rows = [];
       const items = [];
       for (const kind of ["chat", "responses"]) {
         const group = data.health[kind] || {};
-        for (const model of Object.keys(group).sort()) {
+        for (const model of Object.keys(group).sort(compareModelId)) {
           for (const item of Object.values(group[model])) {
             items.push({ kind, model, item });
           }
@@ -1192,7 +1590,7 @@ ADMIN_HTML = """
         Number(b.item.checked_at || 0) - Number(a.item.checked_at || 0) ||
         Number(a.item.next_probe_at || 0) - Number(b.item.next_probe_at || 0) ||
         compareText(a.kind, b.kind) ||
-        compareText(a.model, b.model) ||
+        compareModelId(a.model, b.model) ||
         compareText(a.item.provider_name || a.item.provider_id, b.item.provider_name || b.item.provider_id)
       );
       const page = paginate("matrix", items);
@@ -1276,22 +1674,21 @@ ADMIN_HTML = """
           }
         }
       }
-      const upstreamKeyword = ($("upstreamFilter")?.value || "").trim().toLowerCase();
-      const modelKeyword = ($("upstreamModelFilter")?.value || "").trim().toLowerCase();
-      const showUnhealthy = $("showUnhealthyUpstreams")?.checked === true;
+      const { upstreamKeyword, modelKeyword, showUnhealthy } = availabilityFilters();
       return Array.from(byKey.values()).filter((row) => {
         if (!showUnhealthy && row.healthy_count <= 0) return false;
         const upstreamText = `${row.provider_name} ${row.provider_id}`.toLowerCase();
         const modelText = `${row.model} ${Array.from(row.actual_models).join(" ")}`.toLowerCase();
         return (!upstreamKeyword || upstreamText.includes(upstreamKeyword)) && (!modelKeyword || modelText.includes(modelKeyword));
       }).sort((a, b) =>
+        compareText(a.provider_name, b.provider_name) ||
+        compareText(a.provider_id, b.provider_id) ||
+        compareModelId(a.model, b.model) ||
         (routeOrder[a.route_group] ?? 99) - (routeOrder[b.route_group] ?? 99) ||
         Number(b.priority) - Number(a.priority) ||
         Number(b.weight) - Number(a.weight) ||
         Number(b.healthy_count > 0) - Number(a.healthy_count > 0) ||
-        Number((a.best_healthy_latency ?? a.best_failed_latency) ?? 999999) - Number((b.best_healthy_latency ?? b.best_failed_latency) ?? 999999) ||
-        compareText(a.provider_name, b.provider_name) ||
-        compareText(a.model, b.model)
+        Number((a.best_healthy_latency ?? a.best_failed_latency) ?? 999999) - Number((b.best_healthy_latency ?? b.best_failed_latency) ?? 999999)
       );
     }
 
@@ -1307,13 +1704,6 @@ ADMIN_HTML = """
     function cooldownSeconds(data) {
       if (!data || !data.checked_at || !data.next_probe_at) return null;
       return Math.max(0, Number(data.next_probe_at) - Number(data.checked_at));
-    }
-
-    function formatDuration(seconds) {
-      if (seconds == null) return "";
-      if (seconds >= 3600) return `${Math.round(seconds / 3600)} 小时`;
-      if (seconds >= 60) return `${Math.round(seconds / 60)} 分钟`;
-      return `${seconds} 秒`;
     }
 
     function upstreamPolicyDetail(row) {
@@ -1351,7 +1741,7 @@ ADMIN_HTML = """
         return "Responses 探活或真实请求形态被拒，按三次真实请求确认后再判不可用";
       }
       if (row.healthy_count <= 0 && reasons.length) return reasons.join(", ");
-      const mapped = Array.from(row.actual_models).filter((actual) => actual && actual !== row.model).sort();
+      const mapped = Array.from(row.actual_models).filter((actual) => actual && actual !== row.model).sort(compareModelId);
       if (mapped.length) return `映射 ${mapped.join(", ")}`;
       if (row.healthy_count > 0 && row.healthy_count < row.total_count && reasons.length) return reasons.join(", ");
       return "";
@@ -1541,9 +1931,8 @@ ADMIN_HTML = """
       providerDrafts = {};
       logsData = logs;
       renderOverview(overview);
-      renderModels(overview);
       renderMatrix(overview);
-      renderUpstreams();
+      renderAvailability();
       renderLogs(logs);
       renderProviders();
       updateModelOptions();
@@ -1638,9 +2027,9 @@ ADMIN_HTML = """
       const name = btn.dataset.page;
       if (name === "providers") syncVisibleProviderDrafts();
       pages[name] = (pages[name] || 1) + Number(btn.dataset.dir || 0);
-      if (name === "models") renderModels(state);
+      if (name === "models") renderAvailability();
       if (name === "matrix") renderMatrix(state);
-      if (name === "upstreams") renderUpstreams();
+      if (name === "upstreams") renderAvailability();
       if (name === "logs") renderLogs(logsData);
       if (name === "providers") {
         renderProviders();
@@ -1655,9 +2044,9 @@ ADMIN_HTML = """
       if (name === "providers") syncVisibleProviderDrafts();
       pageSizes[name] = Number(select.value || 25);
       pages[name] = 1;
-      if (name === "models") renderModels(state);
+      if (name === "models") renderAvailability();
       if (name === "matrix") renderMatrix(state);
-      if (name === "upstreams") renderUpstreams();
+      if (name === "upstreams") renderAvailability();
       if (name === "logs") renderLogs(logsData);
       if (name === "providers") {
         renderProviders();
@@ -1671,18 +2060,26 @@ ADMIN_HTML = """
         document.querySelectorAll(".tabpane").forEach((x) => x.classList.add("hidden"));
         tab.classList.add("active");
         $("tab-" + tab.dataset.tab).classList.remove("hidden");
+        if (tab.dataset.tab === "models") renderAvailability();
         if (tab.dataset.tab === "providers") renderRouteBoard();
       });
     });
 
     $("modelFilter").addEventListener("input", renderRouteBoard);
-    function handleUpstreamFilterInput() {
+    function handleAvailabilityFilterInput() {
+      pages.models = 1;
       pages.upstreams = 1;
-      renderUpstreams();
+      renderAvailability();
     }
-    $("upstreamFilter").addEventListener("input", handleUpstreamFilterInput);
-    $("upstreamModelFilter").addEventListener("input", handleUpstreamFilterInput);
-    $("showUnhealthyUpstreams").addEventListener("change", handleUpstreamFilterInput);
+    document.querySelectorAll("[data-availability-view]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        availabilityView = btn.dataset.availabilityView || "model";
+        renderAvailability();
+      });
+    });
+    $("availabilityModelFilter").addEventListener("input", handleAvailabilityFilterInput);
+    $("availabilityUpstreamFilter").addEventListener("input", handleAvailabilityFilterInput);
+    $("showUnhealthyAvailability").addEventListener("change", handleAvailabilityFilterInput);
 
     document.addEventListener("input", (event) => {
       if (!event.target.closest("#tab-providers")) return;

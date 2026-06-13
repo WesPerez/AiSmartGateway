@@ -129,6 +129,24 @@ The public New API model list should be driven by the Smart Gateway router
 channel and Smart Gateway's effective availability. Operators can still disable
 models in New API model management; sync should respect those manual disables.
 
+The current public model list is additionally constrained by Smart Gateway
+`model_include` and `model_exclude`. These filters apply before health exposure
+and before the New API router channel ability sync. Current operational
+excludes include:
+
+```yaml
+model_exclude:
+  - "gpt-5.4*"
+  - "*-20??????"
+```
+
+The first rule temporarily hides `gpt-5.4` variants after clients were observed
+requesting cached `gpt-5.4` models while the intended operational model was
+`gpt-5.5`. The second hides long date-suffixed models such as
+`claude-haiku-4-5-20251001` while keeping shorter aliases such as
+`claude-opus-4-8` visible. To re-enable those models, remove the matching
+exclude, reload Smart Gateway, and sync the New API router channel again.
+
 ## Health Detection Strategy
 
 Health is tracked by:
@@ -153,6 +171,25 @@ Cooldowns should apply to unsupported models, quota, rate limits, server
 errors, auth errors, and exceptions. Responses request-shape failures should be
 handled separately because they often mean the probe is weaker than a real
 client request.
+
+Default health-loop and cooldown values:
+
+- `PROBE_INTERVAL_SECONDS=60`
+- `PROBE_TIMEOUT_SECONDS=12`
+- `PROBE_MAX_PER_CYCLE=12`
+- `MODELS_REFRESH_SECONDS=3600`
+- success cache: 21600 seconds
+- unsupported/not found: 86400 seconds
+- auth/forbidden and quota: 3600 seconds
+- rate limited: 1800 seconds
+- server unavailable and exceptions: 900 seconds
+- unknown: 1800 seconds
+- Responses request-shape retry: 60 seconds
+- Responses confirmed real-shape invalid: 1800 seconds
+
+The admin overview API exposes these values as `health_policy`; the operations
+UI renders them in the `探测矩阵` help panel so operators can see the live
+policy instead of reading code.
 
 ## Responses and Codex Compatibility
 
@@ -181,6 +218,14 @@ provider credential.
 Smart Gateway currently normalizes Responses bodies by adding safe defaults
 such as `instructions: ""` and `store: false` when absent. It does not invent
 large tool lists or hidden Codex metadata.
+
+For upstreams that restrict accepted clients, provider-level headers may be
+used to force a compatible client identity. One Claude aggregation provider was
+observed returning a client-restricted error when probes looked like
+`python-httpx`; the sync script now preserves a provider-specific
+`User-Agent: Claude-Code/1.0.0` override for that source. This only fixes
+client identity for supported paths. If the same provider returns
+`not implemented` for `/responses`, it remains non-healthy for Responses.
 
 ## Real Codex Shape Verification
 
@@ -294,14 +339,31 @@ New API UI is for public gateway administration:
 
 Smart Gateway UI is for route operations:
 
-- Runtime model health.
-- Health matrix.
+- Model availability, with `按模型` and `按上游` views in one tab.
+- Probe matrix (`探测矩阵`) with live health-policy help.
 - Final upstream route logs.
 - Source pool strategy.
-- Per-upstream model status.
 - Sync/reload controls.
 
 Smart Gateway UI should not replace New API's channel/user/token system.
+
+The former top-level `运行时模型` and `上游模型状态` pages were merged because
+they represented the same health matrix from two angles. `按模型` answers
+"which public model is usable and through which preferred/fallback upstreams";
+`按上游` answers "which models does this source provide and what cooldown or
+error state is each one in". Both views share model/upstream filters and the
+`显示异常` toggle. Tables use fixed layouts so showing unhealthy rows does not
+change column widths.
+
+Model ordering is consistent across backend APIs, UI lists, and the New API
+sync script:
+
+```text
+model family rank -> numeric version parts descending -> text
+```
+
+This puts `gpt-5.5` before `gpt-5.4-mini` and `claude-opus-4-8` before
+`claude-opus-4-6`.
 
 ## Known Operational Issues and Lessons
 

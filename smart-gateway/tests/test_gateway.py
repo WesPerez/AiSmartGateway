@@ -139,6 +139,18 @@ def test_provider_model_filter_selects_latest_per_rule(gateway):
     ]
 
 
+def test_model_sort_rank_orders_same_family_versions_desc(gateway):
+    models = ["gpt-5.4-mini", "gpt-5.5", "gpt-4.1", "claude-opus-4-8", "claude-opus-4-6"]
+
+    assert sorted(models, key=gateway.model_sort_rank) == [
+        "gpt-5.5",
+        "gpt-5.4-mini",
+        "gpt-4.1",
+        "claude-opus-4-8",
+        "claude-opus-4-6",
+    ]
+
+
 def test_build_probe_targets_keeps_declared_models_missing_from_upstream_models(gateway):
     provider = {
         "declared_models": ["glm-5.1", "deepseek-v4-flash"],
@@ -191,6 +203,17 @@ def test_provider_headers_adds_responses_beta(gateway):
 
     assert headers["Authorization"] == "Bearer sk-upstream"
     assert headers["OpenAI-Beta"] == "responses=v1"
+
+
+def test_probe_cooldown_retries_responses_shape_quickly(gateway):
+    assert (
+        gateway.probe_cooldown_seconds("responses_request_shape_unverified", False)
+        == gateway.RESPONSES_INVALID_REQUEST_RETRY_SECONDS
+    )
+    assert (
+        gateway.probe_cooldown_seconds("runtime_failure:real_shape_invalid", False)
+        == gateway.RESPONSES_INVALID_REQUEST_COOLDOWN_SECONDS
+    )
 
 
 def test_normalize_responses_upstream_body_adds_codex_required_defaults(gateway):
@@ -304,6 +327,113 @@ async def test_probe_success_overrides_responses_request_shape_runtime_failure(g
     assert item["healthy"] is True
     assert item["reason"] == "ok"
     assert item["next_probe_at"] > next_probe_at
+
+
+@pytest.mark.asyncio()
+@respx.mock
+async def test_responses_probe_verifies_codex_shape_after_simple_probe_rejection(gateway):
+    seen_requests = []
+
+    def responses_handler(request: httpx.Request) -> httpx.Response:
+        seen_requests.append(
+            {
+                "headers": request.headers,
+                "body": json.loads(request.content.decode()),
+            }
+        )
+        if len(seen_requests) == 1:
+            return httpx.Response(
+                400,
+                json={
+                    "error": {
+                        "message": "invalid codex request",
+                        "type": "new_api_error",
+                        "code": "invalid_responses_request",
+                    }
+                },
+            )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text='event: response.completed\ndata: {"type":"response.completed","response":{"error":null}}\n\ndata: [DONE]\n\n',
+        )
+
+    respx.get("https://p1.example/v1/models").mock(return_value=httpx.Response(200, json={"data": [{"id": "good-model"}]}))
+    respx.get("https://p2.example/v1/models").mock(return_value=httpx.Response(200, json={"data": []}))
+    respx.post("https://p1.example/v1/chat/completions").mock(return_value=httpx.Response(200, json={"id": "ok"}))
+    responses_route = respx.post("https://p1.example/v1/responses").mock(side_effect=responses_handler)
+    respx.post("https://p2.example/v1/chat/completions").mock(return_value=httpx.Response(403, json={"error": "bad"}))
+    respx.post("https://p2.example/v1/responses").mock(return_value=httpx.Response(403, json={"error": "bad"}))
+
+    await gateway.probe_all()
+
+    item = gateway.HEALTH["responses"]["good-model"]["p1::good-model"]
+    assert item["healthy"] is True
+    assert item["reason"] == "ok"
+    assert item["shape_status"] == "codex_shape_verified"
+    assert item["shape_verification_source"] == "diagnostic_codex_shape"
+    assert responses_route.call_count == 2
+    assert seen_requests[0]["body"]["input"] == "ping"
+    assert seen_requests[0]["headers"]["openai-beta"] == "responses=v1"
+    assert seen_requests[1]["body"]["stream"] is True
+    assert "prompt_cache_key" in seen_requests[1]["body"]
+    assert "x-codex-turn-metadata" in seen_requests[1]["headers"]
+
+
+@pytest.mark.asyncio()
+async def test_preserved_responses_shape_cooldown_is_capped_to_retry_window(gateway):
+    await gateway.reload_config()
+    p1 = next(provider for provider in gateway.PROVIDERS if provider["id"] == "p1")
+    p2 = next(provider for provider in gateway.PROVIDERS if provider["id"] == "p2")
+    signature = gateway.provider_signature(p1)
+    checked_at = int(gateway.now())
+    gateway.MODEL_CACHE = {
+        "p1": {
+            "signature": signature,
+            "models": ["good-model"],
+            "next_refresh_at": checked_at + 3600,
+        },
+        "p2": {
+            "signature": gateway.provider_signature(p2),
+            "models": [],
+            "next_refresh_at": checked_at + 3600,
+        },
+    }
+    gateway.HEALTH = {
+        "responses": {
+            "good-model": {
+                "p1::good-model": {
+                    "provider_id": "p1",
+                    "provider_name": "Provider 1",
+                    "base_url": "https://p1.example/v1",
+                    "local_model": "good-model",
+                    "actual_model": "good-model",
+                    "source": "upstream_models+declared",
+                    "kind": "responses",
+                    "request_format": "openai-compatible",
+                    "probe_path": "/responses",
+                    "priority": 100,
+                    "weight": 100,
+                    "route_group": "primary",
+                    "cost_tier": "free",
+                    "fallback_only": False,
+                    "provider_signature": signature,
+                    "healthy": False,
+                    "reason": "responses_request_shape_unverified",
+                    "checked_at": checked_at,
+                    "next_probe_at": checked_at + 1800,
+                }
+            }
+        },
+        "chat": {},
+    }
+
+    await gateway.probe_all()
+
+    item = gateway.HEALTH["responses"]["good-model"]["p1::good-model"]
+    assert item["next_probe_at"] == checked_at + gateway.RESPONSES_INVALID_REQUEST_RETRY_SECONDS
+    assert item["skipped"] is True
+    assert item["skip_reason"] == "cooldown"
 
 
 @pytest.mark.asyncio()

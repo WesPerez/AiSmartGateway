@@ -370,10 +370,10 @@ Smart Gateway 后台逐步增加和调整了：
 
 ### 上游新增与清理
 
-- 添加过多个新上游和 key，包括共享类、Volcengine Coding、anyrouter、muyuan、付费兜底等。
+- 添加过多个新上游和 key，包括共享类、Volcengine Coding、anyrouter、某 Claude 聚合上游、付费兜底等。
 - 清理过重复 Volcengine 配置、无用 key、重复或多余上游。
 - 确认付费上游应作为兜底。
-- 确认 anyrouter 和 muyuan 可作为主力或高优先级候选。
+- 确认 anyrouter 和某 Claude 聚合上游可作为主力或高优先级候选。
 - 结论：真实上游不再直接写死到公开文档，统一在 New API 渠道中管理，Smart Gateway 通过 `gateway-source` 同步。
 
 ### Volcengine Coding
@@ -551,6 +551,263 @@ Smart Gateway 后台逐步增加和调整了：
 - 真实 Codex shape 捕获验证确认：anyrouter 两个 base URL 均 3/3 成功。
 - UI 显示优化。
 - 测试覆盖。
+
+## 2026-06-13 运行优化记录
+
+本节记录最近一轮对 Smart Gateway 的实际检查、结论、代码调整、配置调整和验证结果。内容保留工程判断和排查思路，但不包含真实密钥、完整请求日志、私有请求 id 或运行目录。
+
+### 触发问题
+
+这一轮从几个具体感觉异常的问题开始：
+
+- 用户感觉健康检测仍然“不太对”，要求讲清楚当前健康检查策略和冷却制度。
+- `运行时模型` 与 `上游模型状态` 两个页面功能有重复，希望判断是否整合。
+- `健康矩阵` 页签需要一眼能懂的策略说明，最好用小问号或美观的解释区。
+- `模型可用性` 中“按模型 / 按上游”切换“显示异常”时，表格列宽不应跳动。
+- 按模型和按上游排序时，同族模型版本号应数字倒序，例如 `gpt-5.5` 排在 `gpt-5.4` 前，`claude-opus-4-8` 排在 `claude-opus-4-6` 前。
+- 某 Claude 聚合上游曾返回 `channel:client_restricted`，提示只允许 Claude Code 或 Codex 类客户端。
+- 用户明明使用 `gpt-5.5`，却看到近期有一堆 `gpt-5.4` 请求和探测记录。
+- 后续要求先屏蔽 `gpt-5.4*`，并屏蔽 `claude-haiku-4-5-20251001` 这类长日期后缀模型。
+
+### 当前健康检查策略
+
+当前健康矩阵的记录粒度是：
+
+```text
+API kind -> local model -> provider -> actual upstream model
+```
+
+其中 `kind` 分为 `chat` 和 `responses`，两者独立探测、独立缓存、独立冷却。一个模型 Chat 健康不代表 Responses 健康；Responses 健康也不代表 Chat 健康。
+
+运行策略：
+
+- 启动后按配置执行探测，默认 `PROBE_ON_STARTUP=true`。
+- 后台探测循环默认每 `PROBE_INTERVAL_SECONDS=60` 秒运行一次。
+- 单轮最多探测 `PROBE_MAX_PER_CYCLE=12` 个候选，避免一次全量打爆上游或浪费额度。
+- 单次探测默认超时 `PROBE_TIMEOUT_SECONDS=12` 秒。
+- 上游 `/models` 结果按 provider 签名缓存，默认 `MODELS_REFRESH_SECONDS=3600` 秒刷新。
+- 模型候选来自上游 `/models`、New API 渠道声明模型、provider `model_map`、canonical aliases。
+- New API 源渠道模型声明不会因为健康失败被自动清空；真实可用性由 Smart Gateway health state 决定。
+- `/v1/models` 只公开当前至少有一个健康接口的模型，并受 `model_include` / `model_exclude` 过滤。
+
+基础探活请求：
+
+- Chat 使用配置里的 `/chat/completions` minimal body。
+- Responses 使用配置里的 `/responses` minimal body。
+- Responses 请求自动补 `OpenAI-Beta: responses=v1`，除非请求已有该 header。
+- 运行时请求会透传允许列表中的 Codex/OpenAI headers，但始终用 provider 自己的 `Authorization` 覆盖上游授权。
+
+### 当前冷却制度
+
+默认冷却值如下，实际部署可通过环境变量覆盖：
+
+| 状态 | 默认冷却 | 说明 |
+| --- | ---: | --- |
+| `ok` / healthy | 21600 秒 | 成功结果缓存，减少重复探测 |
+| `model_unsupported` / `not_found` | 86400 秒 | 模型大概率不支持，长冷却 |
+| `auth_or_forbidden` | 3600 秒 | 凭据、权限或客户端限制类问题 |
+| `quota` | 3600 秒 | 余额或额度不足 |
+| `rate_limited` | 1800 秒 | 限流 |
+| `server_unavailable` | 900 秒 | 5xx、网关错误、上游临时不可用 |
+| `exception:*` | 900 秒 | 超时、网络异常等 |
+| `unknown` | 1800 秒 | 未归类错误 |
+| `responses_request_shape_unverified` | 60 秒 | Responses 探活形态不可信，快速复查 |
+| `runtime_failure:real_shape_invalid` | 1800 秒 | 真实请求形态确认不兼容后短冷却 |
+
+Responses 的 `invalid_request` 特殊处理：
+
+- 固定探活返回 `invalid_request` 或 `invalid codex request` 时，不直接判死。
+- Gateway 会追加一次 Codex diagnostic shape 的流式探测。该诊断请求包含 Codex 风格 `instructions`、`input`、`tools`、`reasoning`、`store=false`、`stream=true`、`include=["reasoning.encrypted_content"]`、`prompt_cache_key`、`client_metadata`，并带 `Originator: codex_exec`、`User-Agent: codex_exec/...`、`X-Codex-Beta-Features`、`X-Codex-Turn-Metadata`、`Session-Id`、`Thread-Id`、`X-Client-Request-Id` 等 header。
+- 诊断成功则标记 `shape_status=codex_shape_verified`，健康原因仍为 `ok`。
+- 诊断仍失败但错误是形态类，则保留为 `responses_request_shape_unverified`，进入 60 秒快速重试。
+- 真实运行时 Responses 请求同一 provider/model/kind/request-shape fingerprint 连续 3 次失败后，才确认 `runtime_failure:real_shape_invalid`。
+- 任意一次真实运行时请求成功，会立即把该 provider/model/kind 标回健康，并清除 shape 失败计数。
+- 保留健康状态时，如果旧的 shape 冷却过长，会把下一次探测时间压到当前 shape 策略允许的窗口内，避免旧 30 分钟或更长冷却拖住快速复查。
+
+### UI 信息架构调整
+
+本轮重新判断后，认为 `运行时模型` 和 `上游模型状态` 的确存在功能重复。它们展示的是同一批健康矩阵数据的两个视角：
+
+- 按模型看：适合日常判断“对外这个模型现在能不能用，有哪些首选/备份上游”。
+- 按上游看：适合排障，判断“某个上游贡献了哪些模型、哪些接口异常、处于什么冷却策略”。
+
+因此两者被整合成一个顶级页签：
+
+```text
+模型可用性
+  -> 按模型
+  -> 按上游
+```
+
+原 `健康矩阵` 改名为 `探测矩阵`，语义更准确：它展示的是探测记录，不等于最终用户可用模型列表。
+
+`模型可用性` 的实现细节：
+
+- 使用分段按钮在 `按模型` 和 `按上游` 间切换。
+- 共用模型筛选、上游筛选和“显示异常”开关。
+- 默认只显示至少有一个接口健康的模型/上游模型；勾选“显示异常”后展示异常和无健康项。
+- `按模型` 行展示模型、接口健康数、首选上游、备份/兜底、最低延迟、最近检测、下次探测、主要状态。
+- `按上游` 行展示上游、策略、模型、接口、状态、延迟、最近检测、下次探测、检测/冷却策略、详情。
+- “检测/冷却策略”会把健康缓存、模型不支持长冷却、异常冷却、Responses 真实请求确认进度等解释成可读文本。
+
+表格稳定性修复：
+
+- `availability-table` 和 `upstream-availability-table` 均使用 `table-layout: fixed`。
+- 按模型表格设置固定最小宽度 1520px，并为 8 列设置固定列宽。
+- 按上游表格设置固定最小宽度 1760px，并为 10 列设置固定列宽。
+- 因此“显示异常”切换时，即使异常详情很长，列宽也不会重新计算导致布局跳动。
+
+`探测矩阵` 说明区：
+
+- 顶部新增健康策略 helpbar。
+- 默认展示短摘要 chip，例如探测间隔、单轮预算、超时、Responses 二段验证、三次真实请求确认等。
+- 通过小问号 hover/focus 展示完整策略说明，包括记录粒度、探测来源、Responses 判定、形态确认、路由使用、各类冷却时间。
+- 说明内容来自 `/gateway-admin/api/overview` 返回的 `health_policy`，避免 UI 文案和后端实际配置长期漂移。
+
+### 模型排序规则
+
+旧排序主要按字符串排序，会出现同族版本顺序不符合直觉的问题。现在统一为：
+
+```text
+模型族 rank -> 数字版本号倒序 -> 文本排序
+```
+
+模型族 rank：
+
+1. GPT
+2. Claude
+3. Gemini
+4. DeepSeek
+5. GLM
+6. 其它
+
+数字版本号倒序示例：
+
+- `gpt-5.5` 排在 `gpt-5.4-mini` 前。
+- `gpt-5.4-mini` 排在 `gpt-4.1` 前。
+- `claude-opus-4-8` 排在 `claude-opus-4-6` 前。
+
+这个规则已经同步到：
+
+- Smart Gateway 后端 `/v1/models` 和概览模型排序。
+- Smart Gateway UI 的模型 chips、datalist、健康矩阵、路由视图、模型可用性。
+- New API 同步脚本生成 Router channel 模型列表时的排序。
+- 测试覆盖：`test_model_sort_rank_orders_same_family_versions_desc` 和同步脚本对应测试。
+
+### Claude 聚合上游客户端限制排查
+
+某 Claude 聚合上游曾在健康状态中出现 `channel:client_restricted`，样例提示当前客户端被识别为 `python-httpx/...`，而该渠道只允许 Claude Code 或 Codex 类客户端。
+
+排查思路：
+
+- 先直接对 `/chat/completions` 做多种 `User-Agent` / header 组合探测。
+- 再对 `/responses` 分别测试 minimal Responses body、Codex diagnostic shape、Codex headers、Claude Code headers。
+- 再探测是否存在 `/codex`、`/codex/v1`、`/openai/v1` 或 Anthropic `/v1/messages` 等专用入口。
+- 探测只记录状态码、延迟和脱敏错误摘要，不输出 key。
+
+结论：
+
+- `/chat/completions` 当前可用；默认 httpx 在复测时也可成功，但历史健康状态确实有过 client restricted。
+- `/v1/messages` Anthropic/Claude Code 形态可用。
+- `/responses` 对该上游返回的是 `convert_request_failed` / `not implemented`，即使换 Codex/Claude Code headers 和 Codex diagnostic body 也一样。
+- 因此不能把该上游标记为 Responses 可用；它应作为 Chat/Anthropic-compatible 能力看待。
+- 对 Chat 路径，为避免再次被识别为 `python-httpx`，给该 provider 注入固定 `User-Agent: Claude-Code/1.0.0` 是最小且可逆的修复。
+
+实现：
+
+- 当前运行 provider 配置中给该上游加 provider-level header。
+- 同步脚本增加 `provider_client_headers()`，识别该上游后自动生成 `User-Agent: Claude-Code/1.0.0`，避免下次从 New API 同步时把手工 header 覆盖掉。
+- `provider_headers()` 的既有顺序是：基础 headers -> 透传允许的客户端 headers -> Responses beta 默认值 -> provider headers 覆盖 -> provider Authorization 覆盖。因此 provider-level header 能稳定覆盖默认 `python-httpx`。
+
+复测结果：
+
+- Chat：健康模型数恢复，旧的 `client_restricted/python-httpx` 从健康状态消失。
+- Responses：继续显示 `server_unavailable` / `not implemented`，这是正确的不可用状态，不应伪装成健康。
+
+### `gpt-5.5` 请求为什么出现 `gpt-5.4`
+
+近期日志里出现一批 `gpt-5.4`，最初怀疑是 Gateway 把用户请求的 `gpt-5.5` 降级或串路由到了 `gpt-5.4`。
+
+排查顺序：
+
+1. 查 Smart Gateway request log 的 `requested_model` 和 `actual_model`。
+2. 查健康矩阵中 `gpt-5.5`、`gpt-5.4`、`gpt-5.4-mini` 的 provider 状态。
+3. 查 `/v1/models` 当前公开模型。
+4. 查路由代码 `healthy_candidate_buckets(model, kind, controls)`。
+5. 查 New API Router channel 能力表。
+
+结论：
+
+- `gpt-5.5` 的运行时请求记录中，`requested_model=gpt-5.5` 且 `actual_model=gpt-5.5`，成功走主力 provider。
+- 那批 `gpt-5.4` 记录中，`requested_model` 本身就是 `gpt-5.4`，不是 Gateway 从 5.5 改成 5.4。
+- 路由代码只从 `HEALTH[kind][requested_model]` 取候选，不会从 `gpt-5.5` 的候选池选出 `gpt-5.4`。
+- 根因是 `/v1/models` 曾公开 `gpt-5.4`、`gpt-5.4-mini`，因为某付费兜底上游声明了这些模型，且全局 `model_include` 允许 `gpt-*`。
+- 客户端如果读取或缓存了旧模型列表，可能自动选择或重试 `gpt-5.4`。
+
+临时止血：
+
+```yaml
+model_exclude:
+  - "gpt-5.4*"
+```
+
+作用：
+
+- `gpt-5.4`、`gpt-5.4-mini`、`gpt-5.4-openai-compact` 等不再进入探测目标。
+- `/v1/models` 不再公开这些模型。
+- New API Router channel 能力表不再包含这些模型。
+- 客户端即使继续请求 `gpt-5.4`，Gateway 也不会为它找健康上游。
+
+影响：
+
+- 后续如果要重新启用 `gpt-5.4*`，必须删除这条 exclude，reload Smart Gateway，再同步 New API Router channel。
+- 更细的长期做法是按上游过滤或按 Router channel 暴露策略过滤，而不是全局屏蔽。
+
+### 日期后缀模型屏蔽
+
+用户随后要求先屏蔽类似 `claude-haiku-4-5-20251001` 这类长日期后缀模型。
+
+第一直觉规则 `*-????????` 被否决，因为它太宽，会误伤尾段刚好 8 个字符的模型，例如某些 `mini` 或 `pro` 结尾模型。最终使用更窄的规则：
+
+```yaml
+model_exclude:
+  - "*-20??????"
+```
+
+含义：
+
+- 屏蔽以 `-20` 加 6 个任意字符结尾的模型，匹配现代日期形态，例如 `-20251001`、`-20251101`。
+- 保留不带长日期后缀的短别名，例如 `claude-opus-4-8`、`claude-opus-4-7`、`claude-opus-4-6`、`claude-sonnet-4-6`。
+- 不误伤 `mimo-v2.5-pro` 这类非日期尾缀模型。
+
+已验证：
+
+- `/v1/models` 中没有 `-20xxxxxx` 日期后缀模型。
+- 健康矩阵中没有日期后缀 health key。
+- New API Router channel 能力表中没有日期后缀模型。
+- New API 同步后模型活跃价格集移除对应日期版模型，但历史价格归档仍保留。
+
+### 同步和部署验证
+
+本轮使用过的关键验证：
+
+- `PYTHONPATH=/tmp/asg-testdeps python3 -m pytest -q`：62 个测试通过。
+- `PYTHONPATH=/tmp/asg-testdeps python3 -m compileall -q app tests`：通过。
+- 从 `ADMIN_HTML` 抽取 `<script>` 后执行 `node --check`：通过。
+- `docker compose up -d --build smart-gateway`：重建并启动成功。
+- 容器健康检查：`ai-smart-gateway` 状态为 healthy。
+- 管理页 HTML 校验：新页签 `模型可用性`、`探测矩阵` 存在，旧顶级页签 `运行时模型`、`上游模型状态` 不存在。
+- `/v1/models` 校验：GPT 当前只公开 `gpt-5.5`；日期后缀模型为空。
+- New API Router channel 能力表校验：GPT 只剩 `gpt-5.5`，Claude 只保留无长日期后缀的短别名。
+- 同步脚本执行后，Router abilities 从包含旧模型的状态收敛；模型倍率 active set 移除已屏蔽模型，保留归档。
+
+### 当前已知取舍
+
+- `gpt-5.4*` 和 `*-20??????` 是临时运营屏蔽，不是模型永久不可用声明。
+- 这些规则会影响未来使用对应模型；恢复时需要删规则、reload、sync。
+- 对 Claude 聚合上游注入 `Claude-Code` UA 是针对该 provider 的兼容策略；它解决 Chat 客户端识别问题，但不改变 Responses `not implemented` 的事实。
+- Health UI 中“探测矩阵”不是公开模型列表；公开模型仍以 `/v1/models` 和 New API Router channel 同步结果为准。
+- 客户端如果缓存了旧模型列表，服务端已不再公开旧模型，但客户端可能仍短期继续发旧模型请求；这类请求应以 request log 的 `requested_model` 为准排查。
 
 ## 后续优化清单
 

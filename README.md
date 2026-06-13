@@ -52,9 +52,11 @@ Core behavior:
 - Maintain health by API kind, canonical model, provider, and actual model.
 - Treat Responses `invalid_request` from weak probes as request-shape-unverified; verify Codex providers with real Codex-shaped requests before marking them unavailable.
 - Return only currently healthy models to New API through the router channel.
+- Apply `model_include` and `model_exclude` before exposing models; current operations can hide `gpt-5.4*` and long date-suffixed models such as `*-20??????`.
 - Fail over current `/v1/chat/completions` and `/v1/responses` requests to another healthy upstream for the same model.
 - Expose `/gateway-admin/` for authenticated route operations.
-- Show currently healthy models and model-level health matrix.
+- Show model availability as one workflow with `按模型` and `按上游` views.
+- Show the probe matrix with live health-policy and cooldown explanations.
 - Show Smart Gateway's read-only source-pool strategy generated from New API.
 - Keep provider writes disabled by default; manage upstream channels in New API.
 - Expose `/gateway-admin/matrix` for authenticated raw model-level health inspection.
@@ -89,7 +91,7 @@ systemctl status ai-smart-gateway-sync-newapi.timer
 
 - [New API, Sub2API, and Smart Gateway operations](docs/NEWAPI.md)
 - [New API 与 Smart Gateway 边界](docs/current-newapi-smart-gateway-boundary.zh-CN.md)
-- [最近路由策略回顾](docs/retrospective-routing-review.zh-CN.md)
+- [最近路由策略回顾](docs/retrospective-routing-review.zh-CN.md)：包含健康策略、冷却制度、Responses 真实形态验证、模型可用性 UI、上游客户端限制、`gpt-5.4*` 和日期后缀模型屏蔽的完整记录。
 - [Implementation review](docs/full-api-gateway-implementation-review.md)
 
 ## Backups

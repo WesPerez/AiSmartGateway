@@ -79,6 +79,9 @@ VOLCES_CODING_DECLARED_MODELS = [
     "deepseek-v4-pro",
     "glm-5.1",
 ]
+MUYUAN_CLIENT_HEADERS = {
+    "User-Agent": "Claude-Code/1.0.0",
+}
 
 
 def resolve_path(path: str, alternates: list[str]) -> Path:
@@ -202,6 +205,13 @@ def compatible_base_urls(name: str, base_url: str) -> list[str]:
     return list(dict.fromkeys(candidates))
 
 
+def provider_client_headers(name: str, base_url: str) -> dict[str, str]:
+    text = f"{name} {base_url}".lower()
+    if "muyuan.do" in text:
+        return dict(MUYUAN_CLIENT_HEADERS)
+    return {}
+
+
 def provider_from_channel(row: sqlite3.Row) -> dict[str, Any]:
     name = row["name"] or f"newapi_channel_{row['id']}"
     base_url, exact = normalize_base_url(row["base_url"] or "")
@@ -219,7 +229,7 @@ def provider_from_channel(row: sqlite3.Row) -> dict[str, Any]:
         "cost_tier": policy["cost_tier"],
         "fallback_only": policy["fallback_only"],
         "declared_models": [item.strip() for item in (row["models"] or "").split(",") if item.strip()],
-        "headers": {},
+        "headers": provider_client_headers(name, base_url),
         "source": "new-api-channel",
         "new_api_channel_id": row["id"],
     }
@@ -253,19 +263,24 @@ def load_router_models(master_key: str, gateway_url: str) -> str:
     return ",".join(models) if models else "gpt-5.5"
 
 
-def model_sort_rank(model: str) -> tuple[int, str]:
+def model_version_key(model: str) -> tuple[int, ...]:
+    return tuple(int(value) for value in re.findall(r"\d+", str(model or "")))
+
+
+def model_sort_rank(model: str) -> tuple[int, tuple[int, ...], str]:
     model_id = str(model or "").lower()
+    version_rank = tuple(-value for value in model_version_key(model_id))
     if model_id.startswith("gpt") or "/gpt" in model_id:
-        return (0, model_id)
+        return (0, version_rank, model_id)
     if model_id.startswith("claude") or "/claude" in model_id:
-        return (1, model_id)
+        return (1, version_rank, model_id)
     if model_id.startswith("gemini") or "/gemini" in model_id:
-        return (2, model_id)
+        return (2, version_rank, model_id)
     if model_id.startswith("deepseek") or "/deepseek" in model_id:
-        return (3, model_id)
+        return (3, version_rank, model_id)
     if model_id.startswith("glm") or "/glm" in model_id:
-        return (4, model_id)
-    return (9, model_id)
+        return (4, version_rank, model_id)
+    return (9, version_rank, model_id)
 
 
 def load_json_option(con: sqlite3.Connection, key: str) -> dict[str, Any]:

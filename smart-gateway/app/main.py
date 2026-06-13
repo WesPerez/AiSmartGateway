@@ -326,6 +326,10 @@ def probe_cooldown_seconds(reason: str | None, healthy: bool) -> int:
     if healthy or reason == "ok":
         return PROBE_SUCCESS_TTL_SECONDS
     reason = reason or ""
+    if responses_request_shape_reason(reason):
+        return RESPONSES_INVALID_REQUEST_RETRY_SECONDS
+    if responses_real_shape_invalid_reason(reason):
+        return RESPONSES_INVALID_REQUEST_COOLDOWN_SECONDS
     if reason in {"not_found", "model_unsupported"}:
         return PROBE_UNSUPPORTED_TTL_SECONDS
     if reason == "auth_or_forbidden":
@@ -367,6 +371,11 @@ def preserve_probe_state(new_item: dict[str, Any], previous: dict[str, Any] | No
     next_probe_at = preserved.get("next_probe_at")
     if not next_probe_at:
         next_probe_at = int(now()) + probe_cooldown_seconds(preserved.get("reason"), bool(preserved.get("healthy")))
+    reason = str(preserved.get("reason") or "")
+    if responses_request_shape_reason(reason) or responses_real_shape_invalid_reason(reason):
+        checked_at = int(preserved.get("checked_at") or now())
+        capped_next_probe_at = checked_at + probe_cooldown_seconds(reason, False)
+        next_probe_at = min(int(next_probe_at), capped_next_probe_at)
     preserved.update(
         {
             "provider_name": new_item["provider_name"],
@@ -651,19 +660,50 @@ def build_models_summary() -> list[dict[str, Any]]:
     return models
 
 
-def model_sort_rank(model: str) -> tuple[int, str]:
+def health_policy_summary() -> dict[str, Any]:
+    probe = CONFIG.get("probe") or {}
+    chat_probe = probe.get("chat") or {}
+    responses_probe = probe.get("responses") or {}
+    return {
+        "probe_interval_seconds": PROBE_INTERVAL_SECONDS,
+        "probe_timeout_seconds": PROBE_TIMEOUT_SECONDS,
+        "probe_max_per_cycle": PROBE_MAX_PER_CYCLE,
+        "probe_on_startup": PROBE_ON_STARTUP,
+        "models_refresh_seconds": MODELS_REFRESH_SECONDS,
+        "enable_responses_probe": ENABLE_RESPONSES_PROBE,
+        "min_healthy_providers": MIN_HEALTHY_PROVIDERS,
+        "chat_path": chat_probe.get("path") or "/chat/completions",
+        "responses_path": responses_probe.get("path") or "/responses",
+        "responses_invalid_request_confirmations": RESPONSES_INVALID_REQUEST_CONFIRMATIONS,
+        "cooldowns": {
+            "success": PROBE_SUCCESS_TTL_SECONDS,
+            "model_unsupported": PROBE_UNSUPPORTED_TTL_SECONDS,
+            "auth_or_forbidden": PROBE_AUTH_TTL_SECONDS,
+            "quota": PROBE_QUOTA_TTL_SECONDS,
+            "rate_limited": PROBE_RATE_LIMIT_TTL_SECONDS,
+            "server_unavailable": PROBE_SERVER_ERROR_TTL_SECONDS,
+            "exception": PROBE_EXCEPTION_TTL_SECONDS,
+            "responses_shape_retry": RESPONSES_INVALID_REQUEST_RETRY_SECONDS,
+            "responses_real_shape_invalid": RESPONSES_INVALID_REQUEST_COOLDOWN_SECONDS,
+            "unknown": PROBE_UNKNOWN_ERROR_TTL_SECONDS,
+        },
+    }
+
+
+def model_sort_rank(model: str) -> tuple[int, tuple[int, ...], str]:
     model_id = str(model or "").lower()
+    version_rank = tuple(-value for value in model_version_key(model_id))
     if model_id.startswith("gpt") or "/gpt" in model_id:
-        return (0, model_id)
+        return (0, version_rank, model_id)
     if model_id.startswith("claude") or "/claude" in model_id:
-        return (1, model_id)
+        return (1, version_rank, model_id)
     if model_id.startswith("gemini") or "/gemini" in model_id:
-        return (2, model_id)
+        return (2, version_rank, model_id)
     if model_id.startswith("deepseek") or "/deepseek" in model_id:
-        return (3, model_id)
+        return (3, version_rank, model_id)
     if model_id.startswith("glm") or "/glm" in model_id:
-        return (4, model_id)
-    return (9, model_id)
+        return (4, version_rank, model_id)
+    return (9, version_rank, model_id)
 
 
 def public_base_url(request: Request) -> str:
@@ -724,8 +764,12 @@ PASSTHROUGH_REQUEST_HEADERS = {
     "openai-project",
     "originator",
     "session_id",
+    "session-id",
+    "thread-id",
+    "x-client-request-id",
     "x-codex-beta-features",
     "x-codex-turn-metadata",
+    "x-codex-window-id",
     "x-stainless-arch",
     "x-stainless-lang",
     "x-stainless-os",
@@ -795,6 +839,97 @@ def request_shape(body: dict[str, Any], incoming_headers: dict[str, str] | None 
             if key.lower() in PASSTHROUGH_REQUEST_HEADERS or key.lower().startswith("x-gateway-")
         ),
     }
+
+
+def codex_shape_diagnostic_body(model: str, effort: str = "high") -> dict[str, Any]:
+    return {
+        "model": model,
+        "instructions": (
+            "You are Codex, a coding agent. This is a gateway diagnostic request. "
+            "Do not use tools. Reply exactly: OK"
+        ),
+        "input": [
+            {
+                "type": "message",
+                "role": "developer",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": (
+                            "<permissions instructions>\n"
+                            "Filesystem sandboxing is read-only for this diagnostic. "
+                            "Do not request tool execution.\n"
+                            "</permissions instructions>"
+                        ),
+                    }
+                ],
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Do not use tools. Reply exactly: OK"}],
+            },
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "name": "exec_command",
+                "description": "Diagnostic placeholder tool. Do not call it.",
+                "strict": False,
+                "parameters": {
+                    "type": "object",
+                    "properties": {"cmd": {"type": "string"}},
+                    "required": ["cmd"],
+                    "additionalProperties": False,
+                },
+            }
+        ],
+        "tool_choice": "auto",
+        "parallel_tool_calls": True,
+        "reasoning": {"effort": effort},
+        "store": False,
+        "stream": True,
+        "include": ["reasoning.encrypted_content"],
+        "prompt_cache_key": f"gateway-diagnostic-{model}",
+        "text": {"verbosity": "low"},
+        "client_metadata": {
+            "x-codex-window-id": "gateway-diagnostic:0",
+            "x-codex-installation-id": "gateway-diagnostic",
+        },
+    }
+
+
+def codex_shape_diagnostic_headers() -> dict[str, str]:
+    metadata = {
+        "session_id": "gateway-diagnostic",
+        "thread_id": "gateway-diagnostic",
+        "thread_source": "gateway-admin",
+        "turn_id": f"gw_diag_{uuid.uuid4().hex[:12]}",
+        "sandbox": "seccomp",
+        "request_kind": "turn",
+        "window_id": "gateway-diagnostic:0",
+    }
+    return {
+        "accept": "text/event-stream",
+        "originator": "codex_exec",
+        "user-agent": "codex_exec/0.139.0 (gateway-diagnostic)",
+        "x-codex-beta-features": "terminal_resize_reflow",
+        "x-codex-turn-metadata": json.dumps(metadata, ensure_ascii=False, separators=(",", ":")),
+        "x-codex-window-id": "gateway-diagnostic:0",
+        "x-client-request-id": "gateway-diagnostic",
+        "session-id": "gateway-diagnostic",
+        "thread-id": "gateway-diagnostic",
+    }
+
+
+def event_stream_probe_has_error(text: str) -> bool:
+    sample = (text or "").lower()
+    return (
+        "response.failed" in sample
+        or "invalid codex request" in sample
+        or bool(re.search(r'"type"\s*:\s*"error"', sample))
+        or bool(re.search(r'"error"\s*:\s*\{', sample))
+    )
 
 
 def upstream_url(provider: dict[str, Any], path: str) -> str:
@@ -892,6 +1027,78 @@ async def get_models_for_provider(provider: dict[str, Any], force: bool = False)
         return previous_models
 
 
+async def probe_codex_responses_shape(
+    client: httpx.AsyncClient,
+    provider: dict[str, Any],
+    actual_model: str,
+    url: str,
+    start: float,
+) -> dict[str, Any]:
+    headers = provider_headers(provider, codex_shape_diagnostic_headers(), "responses")
+    headers["Accept"] = "text/event-stream"
+    async with client.stream("POST", url, headers=headers, json=codex_shape_diagnostic_body(actual_model)) as response:
+        latency_ms = int((now() - start) * 1000)
+        if response.status_code < 200 or response.status_code >= 300:
+            raw = await response.aread()
+            text = raw.decode("utf-8", "ignore")[:2000]
+            reason = classify_error(response.status_code, text)
+            if reason == "invalid_request":
+                reason = "responses_request_shape_unverified"
+            return {
+                "healthy": False,
+                "reason": reason,
+                "shape_status": "probe_unverified" if reason == "responses_request_shape_unverified" else "",
+                "shape_invalid_required": RESPONSES_INVALID_REQUEST_CONFIRMATIONS if reason == "responses_request_shape_unverified" else None,
+                "status_code": response.status_code,
+                "latency_ms": latency_ms,
+                "sample": text[:300],
+                "endpoint_url": url,
+            }
+        first = b""
+        async for chunk in response.aiter_raw():
+            if chunk:
+                first = chunk
+                break
+        text = first.decode("utf-8", "ignore")[:2000] if first else ""
+    if not text:
+        return {
+            "healthy": False,
+            "reason": "empty_stream",
+            "status_code": response.status_code,
+            "latency_ms": latency_ms,
+            "sample": "",
+            "endpoint_url": url,
+        }
+    try:
+        data = json.loads(text)
+    except Exception:
+        data = None
+    if response_has_error_json(data) or event_stream_probe_has_error(text):
+        sample = json.dumps(data, ensure_ascii=False)[:1000] if data is not None else text
+        reason = classify_error(response.status_code, sample)
+        if reason == "invalid_request":
+            reason = "responses_request_shape_unverified"
+        return {
+            "healthy": False,
+            "reason": reason,
+            "shape_status": "probe_unverified" if reason == "responses_request_shape_unverified" else "",
+            "shape_invalid_required": RESPONSES_INVALID_REQUEST_CONFIRMATIONS if reason == "responses_request_shape_unverified" else None,
+            "status_code": response.status_code,
+            "latency_ms": latency_ms,
+            "sample": sample[:300],
+            "endpoint_url": url,
+        }
+    return {
+        "healthy": True,
+        "reason": "ok",
+        "status_code": response.status_code,
+        "latency_ms": latency_ms,
+        "endpoint_url": url,
+        "shape_status": "codex_shape_verified",
+        "shape_verification_source": "diagnostic_codex_shape",
+    }
+
+
 async def probe_one(provider: dict[str, Any], local_model: str, actual_model: str, kind: str) -> dict[str, Any]:
     probe_cfg = (CONFIG.get("probe") or {}).get(kind) or {}
     if not probe_cfg.get("enabled", True):
@@ -908,7 +1115,7 @@ async def probe_one(provider: dict[str, Any], local_model: str, actual_model: st
             for url in upstream_urls(provider, probe_cfg.get("path") or f"/{kind}"):
                 response = await client.post(
                     url,
-                    headers=provider_headers(provider),
+                    headers=provider_headers(provider, kind=kind),
                     json=body,
                 )
                 latency_ms = int((now() - start) * 1000)
@@ -917,6 +1124,11 @@ async def probe_one(provider: dict[str, Any], local_model: str, actual_model: st
                     reason = classify_error(response.status_code, text)
                     if kind == "responses" and reason == "invalid_request":
                         reason = "responses_request_shape_unverified"
+                        diagnostic = await probe_codex_responses_shape(client, provider, actual_model, url, start)
+                        if diagnostic.get("healthy"):
+                            return diagnostic
+                        last_result = diagnostic
+                        continue
                     last_result = {
                         "healthy": False,
                         "reason": reason,
@@ -934,6 +1146,11 @@ async def probe_one(provider: dict[str, Any], local_model: str, actual_model: st
                     reason = classify_error(response.status_code, sample)
                     if kind == "responses" and reason == "invalid_request":
                         reason = "responses_request_shape_unverified"
+                        diagnostic = await probe_codex_responses_shape(client, provider, actual_model, url, start)
+                        if diagnostic.get("healthy"):
+                            return diagnostic
+                        last_result = diagnostic
+                        continue
                     last_result = {
                         "healthy": False,
                         "reason": reason,
@@ -1057,6 +1274,7 @@ async def probe_all(force: bool = False) -> None:
                     "sample": result.get("sample", ""),
                     "shape_status": result.get("shape_status") or "",
                     "shape_invalid_required": result.get("shape_invalid_required"),
+                    "shape_verification_source": result.get("shape_verification_source") or "",
                     "skipped": False,
                     "skip_reason": "",
                 }
@@ -1179,6 +1397,7 @@ async def admin_overview(
             "responses_healthy": responses_healthy,
             "models": models,
             "health": HEALTH,
+            "health_policy": health_policy_summary(),
         }
 
 

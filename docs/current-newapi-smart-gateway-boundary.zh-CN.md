@@ -33,6 +33,25 @@ https://api.example.com
 5. 记录最终真实上游、路由桶、成本层级、失败原因和耗时。
 6. 对 Responses `invalid_request` 区分“请求形态待验证”和“模型真实不可用”。
 
+## 当前模型暴露规则
+
+Smart Gateway 的 `/v1/models` 不是所有上游 `/models` 的并集。当前公开模型必须同时满足：
+
+1. 通过 `model_include`。
+2. 未命中 `model_exclude`。
+3. 至少一个 `chat` 或 `responses` 健康上游达到 `MIN_HEALTHY_PROVIDERS`。
+4. 同步到 New API Router channel 后未被 New API 模型管理手动禁用。
+
+当前运营屏蔽包含：
+
+```yaml
+model_exclude:
+  - "gpt-5.4*"
+  - "*-20??????"
+```
+
+这会隐藏 `gpt-5.4`、`gpt-5.4-mini` 以及 `claude-haiku-4-5-20251001` 这类长日期后缀模型。后续如果要恢复这些模型，需要删除对应规则、reload Smart Gateway，并重新同步 New API Router channel。
+
 ## 运维入口
 
 ```text
@@ -53,6 +72,16 @@ Smart Gateway 后台是路由运维视图，不是第二套用户/令牌/订阅�
 7. 模型价格/倍率：在 New API 模型管理或倍率配置里维护。
 8. 最终流向日志：New API 看用户和扣费；Smart Gateway 看最终真实上游和路由原因。
 9. 源渠道模型声明：不要因为健康失败自动清空；实际可用性由 Smart Gateway 运行时健康决定。
+10. 客户端声称请求模型与日志不一致时，以 Smart Gateway request log 的 `requested_model` 和 `actual_model` 为准；客户端 catalog 或缓存可能发出旧模型。
+
+## Smart Gateway 运维 UI
+
+当前 Smart Gateway 后台顶级页签中，模型相关视图为：
+
+- `模型可用性`：包含 `按模型` 和 `按上游` 两个视角。两者读取同一健康矩阵，只是面向日常确认和排障的不同展示，不再拆成两个顶级页签。
+- `探测矩阵`：展示原始探测记录，并带健康策略说明。说明区展示探测间隔、单轮预算、超时、Responses 二段验证、真实请求三次确认和各类冷却时间。
+
+`模型可用性` 默认只显示至少一个接口健康的模型或上游模型；勾选“显示异常”后展示异常项。表格使用固定列宽，避免异常详情过长时列宽跳动。
 
 ## 多 Base URL
 
@@ -74,6 +103,18 @@ Smart Gateway 后台是路由运维视图，不是第二套用户/令牌/订阅�
 3. 对同一 provider/model/kind/request-shape fingerprint，真实形态连续 3 次失败后才标记 `real_shape_invalid` 并短冷却。
 4. 任意一次真实形态成功，立即恢复健康并清空失败计数。
 5. 多 Base URL 的同一逻辑上游，应逐个 base URL 验证，但仍归并为一个 provider。
+
+当前默认冷却策略：
+
+- 成功：21600 秒。
+- 模型不支持或不存在：86400 秒。
+- 鉴权/权限、额度：3600 秒。
+- 限流：1800 秒。
+- 服务异常、网络异常：900 秒。
+- Responses 探活形态待确认：60 秒。
+- Responses 真实形态确认不兼容：1800 秒。
+
+如果某上游只支持 Claude Code / Anthropic Messages / Chat 形态，但 `/responses` 返回 `not implemented`，不能因为加了客户端 header 就把 Responses 标健康。该上游应按实际可用接口展示。
 
 ## 应急写入
 
