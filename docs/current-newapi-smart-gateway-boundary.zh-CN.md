@@ -136,6 +136,8 @@ Smart Gateway 后台是路由运维视图，不是第二套用户/令牌/订阅�
 4. 普通小 JSON 转换仍拒绝工具调用、function calling、`reasoning`、`include`、`prompt_cache_key`、`previous_response_id`、Codex encrypted reasoning 等复杂字段；但已验证为 Codex-compatible Responses 的 health item 可以走 `codex_responses_to_chat`，支持可映射的 OpenAI function tools/tool calls。
 5. 转换路径带 `ADAPTER_LATENCY_PENALTY_MS`，默认 250ms；路由日志会记录 `upstream_kind` 和 `format_adapter`，便于判断是否发生了跨格式转换。
 6. Chat stream + tools 的路由判断按单个 health item 执行：普通 Responses 候选不越权接复杂工具请求；已有 `responses_compat_mode=codex` 或 Codex shape 验证证据的 Responses 候选可以接入 Codex-compatible adapter。
+7. Chat 图片内容同样只在 Codex-compatible Responses 候选中转换：`image_url` 会映射为 Responses `input_image`；普通小 JSON 转换仍保持文本安全边界。`request_shape` 会记录 `message_content_types` 和 `has_image_content`，包括本地无候选的失败日志。
+8. 图片输入被上游判为 `param=input / invalid_value` 时，按客户端输入无效处理，不写坏 provider 健康，也不进入冷却。
 
 ## 应急写入
 

@@ -888,6 +888,9 @@ upstream_kind: 网关实际选择的上游接口格式
 15. 通用 `partial` 兼容改为错误驱动：Responses 运行时、minimal probe、Codex diagnostic 只要明确返回缺 `partial`，同一 endpoint 在首块前自动补 `partial=stream` 重试一次，并学习 provider 默认值。
 16. 2026-06-14 修复 Chat stream + tools 的本地候选筛选：带 `tools/tool_choice/parallel_tool_calls/reasoning_effort/stream_options` 的 Chat 流式请求以前会被普通 Chat -> Responses 安全门提前拒绝，即使 Anyrouter Responses 已有 `responses_compat_mode=codex` 也无法进入候选，最终直接 `no_healthy_upstream`。现在改为按单个 health item 判断：普通 Responses 候选仍走普通安全门，Codex-compatible Responses 候选走 Codex 安全门。
 17. Responses 流式 `function_call` / `function_call_arguments.delta` 会转成 Chat `tool_calls` delta，不再把工具参数误当作普通文本；非流式 Responses `function_call` 输出也会转成 Chat message `tool_calls`。
+18. 2026-06-14 继续修复图片/多模态 Chat 请求：Codex 客户端发图时 `messages[].content` 会包含 `image_url`，旧逻辑只接受文本，导致本地候选筛选拒绝 Anyrouter Responses，随后只尝试不可用的 Chat shadow 上游并出现 `stream disconnected before completion: No healthy upstream`。现在 Codex-compatible adapter 会把 Chat `image_url` 转成 Responses `input_image` 并保留 `detail`；普通小 JSON adapter 仍保持文本安全边界。
+19. 路由日志增强：`request_shape` 新增 `message_roles`、`message_content_types`、`has_image_content`，且本地 `no_healthy_upstream` / 流式最终 `all_upstreams_failed` 也会写入 request shape，方便直接判断是否为图片、工具或其它请求形态导致候选被过滤。
+20. 上游对图片输入返回 `400 / param=input / code=invalid_value` 时归类为 `client_invalid_input`，不再作为 provider runtime failure 或 Responses shape invalid 证据，避免坏图或不被接受的 data URL 污染上游健康。
 
 ### 当前健康含义
 
@@ -911,6 +914,9 @@ upstream_kind: 网关实际选择的上游接口格式
 - 普通 Chat -> Responses 小 JSON 遇到 `invalid_request` 时，非流式和流式都会在首块前自动切 Codex-compatible 形态重试并学习。
 - 带 OpenAI function tools 的 Chat stream 可以选择已验证的 Codex-compatible Responses health item。
 - Responses function_call 非流式和流式事件会转回 Chat `tool_calls`。
+- 带 `image_url` 的 Chat stream 可以选择已验证的 Codex-compatible Responses health item，并转换为 Responses `input_image`。
+- 本地无候选时也会记录 `message_content_types` 和 `has_image_content`。
+- 图片输入的 `client_invalid_input` 不会把 provider 打入冷却。
 - 缺 `partial` 的 Responses provider 在探活、非流式运行时、流式运行时都会通用重试。
 
 真实请求回归：
@@ -921,4 +927,4 @@ upstream_kind: 网关实际选择的上游接口格式
 - Anyrouter `gpt-5.5`：普通 Responses 小 JSON 仍返回 `invalid codex request`；Codex-compatible Chat -> Responses 转换已通过。自动路由不是按 Anyrouter 或模型强制，而是根据该 Responses health item 的 `responses_compat_mode=codex` / Codex shape 验证证据选择 `chat -> responses / codex_responses_to_chat`，成功后 health 保留 `responses_compat_mode=codex`。2026-06-14 真实回归中，带 tools 的 Chat stream 返回文本成功；强制 `tool_choice` 调用 `noop` 时，Anyrouter `/responses` 返回的 function_call 流事件已转成 Chat `tool_calls` delta。
 - 管理 API 暴露健康新鲜度字段。
 
-完整验证结果：`84 passed`。
+完整验证结果：`87 passed`。

@@ -169,6 +169,10 @@ def test_classify_error_prefers_semantic_reason(gateway):
     assert gateway.classify_error(403, '{"message":"Insufficient account balance"}') == "quota"
     assert gateway.classify_error(404, '{"error":"当前 API 不支持所选模型 gpt-5.5"}') == "model_unsupported"
     assert gateway.classify_error(400, '{"code":"invalid_responses_request","message":"invalid codex request"}') == "invalid_request"
+    assert (
+        gateway.classify_error(400, '{"error":{"param":"input","code":"invalid_value","message":"bad image"}}')
+        == "client_invalid_input"
+    )
 
 
 def test_with_channel_fields_treats_only_status_one_as_enabled(gateway):
@@ -503,6 +507,90 @@ def test_codex_compat_chat_adapter_allows_tool_stream_body(gateway):
     items = [item for bucket in buckets for item in bucket["items"]]
     assert [item["provider_id"] for item in items] == ["codex"]
     assert items[0]["_format_adapter"] == "codex_responses_to_chat"
+
+
+def test_codex_compat_chat_adapter_allows_image_url_stream_body(gateway):
+    image_url = "data:image/png;base64,iVBORw0KGgo="
+    gateway.HEALTH = {
+        "chat": {},
+        "responses": {
+            "good-model": {
+                "codex": {
+                    "provider_id": "codex",
+                    "actual_model": "good-model",
+                    "healthy": True,
+                    "priority": 100,
+                    "weight": 1,
+                    "responses_compat_mode": "codex",
+                },
+                "plain": {
+                    "provider_id": "plain",
+                    "actual_model": "good-model",
+                    "healthy": True,
+                    "priority": 100,
+                    "weight": 1,
+                },
+            }
+        },
+    }
+    body = {
+        "model": "good-model",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this image"},
+                    {"type": "image_url", "image_url": {"url": image_url, "detail": "low"}},
+                ],
+            }
+        ],
+        "stream": True,
+    }
+
+    buckets = gateway.adaptive_candidate_buckets("good-model", "chat", body)
+    items = [item for bucket in buckets for item in bucket["items"]]
+    assert [item["provider_id"] for item in items] == ["codex"]
+
+    converted = gateway.chat_body_to_codex_compat_responses_body(
+        body,
+        {"actual_model": "actual-responses"},
+    )
+    content = converted["input"][0]["content"]
+    assert content == [
+        {"type": "input_text", "text": "Describe this image"},
+        {"type": "input_image", "image_url": image_url, "detail": "low"},
+    ]
+
+
+@pytest.mark.asyncio()
+async def test_no_healthy_stream_logs_image_request_shape(gateway):
+    gateway.HEALTH = {"chat": {}, "responses": {}}
+
+    chunks = [
+        chunk
+        async for chunk in gateway.relay_stream(
+            "/chat/completions",
+            {
+                "model": "good-model",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Describe this image"},
+                            {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}},
+                        ],
+                    }
+                ],
+                "stream": True,
+            },
+            "chat",
+        )
+    ]
+
+    assert b"no_healthy_upstream" in b"".join(chunks)
+    logs = gateway.read_recent_request_logs()
+    assert logs[0]["request_shape"]["message_content_types"] == ["text", "image_url"]
+    assert logs[0]["request_shape"]["has_image_content"] is True
 
 
 @pytest.mark.asyncio()
@@ -1783,9 +1871,11 @@ async def test_runtime_failure_sets_probe_cooldown(gateway):
 def test_runtime_failure_reason_for_endpoint_failures(gateway):
     assert gateway.should_mark_runtime_failure("invalid_request") is False
     assert gateway.should_mark_runtime_failure("invalid_request", "responses") is False
+    assert gateway.should_mark_runtime_failure("client_invalid_input", "responses") is False
     assert gateway.should_mark_runtime_failure("quota") is True
     assert gateway.runtime_failure_reason_for_endpoint_failures("responses", ["invalid_request", "invalid_request"]) is None
     assert gateway.runtime_failure_reason_for_endpoint_failures("chat", ["invalid_request"]) is None
+    assert gateway.runtime_failure_reason_for_endpoint_failures("responses", ["client_invalid_input"]) is None
     assert gateway.runtime_failure_reason_for_endpoint_failures("responses", ["invalid_request", "server_unavailable"]) == "all_endpoints_failed"
 
 
@@ -2397,6 +2487,65 @@ async def test_chat_stream_uses_codex_compat_responses_shape_with_tools(gateway,
     assert tool_deltas[2]["function"]["arguments"] == ":\"ping\"}"
     assert all("content" not in item["choices"][0]["delta"] for item in payloads)
     assert payloads[-1]["choices"][0]["finish_reason"] == "tool_calls"
+    logs = gateway.read_recent_request_logs()
+    assert logs[0]["format_adapter"] == "codex_responses_to_chat"
+
+
+@pytest.mark.asyncio()
+async def test_chat_stream_uses_codex_compat_responses_shape_with_image(gateway, monkeypatch):
+    gateway.PROVIDERS = [
+        {"id": "p1", "base_url": "https://p1.example/v1", "api_key": "sk-p1", "timeout_seconds": 3, "headers": {}},
+    ]
+    gateway.HEALTH = {
+        "responses": {
+            "good-model": {
+                "p1": {
+                    "provider_id": "p1",
+                    "actual_model": "actual-responses",
+                    "healthy": True,
+                    "priority": 100,
+                    "weight": 1,
+                    "responses_compat_mode": "codex",
+                },
+            }
+        },
+        "chat": {},
+    }
+    monkeypatch.setattr(gateway, "pick_weighted", lambda candidates: candidates[0])
+    image_url = "data:image/png;base64,iVBORw0KGgo="
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent = json.loads(request.content.decode())
+        assert sent["input"][0]["content"] == [
+            {"type": "input_text", "text": "What is in this image?"},
+            {"type": "input_image", "image_url": image_url, "detail": "low"},
+        ]
+        return httpx.Response(
+            200,
+            text='event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"image received"}\n\nevent: response.completed\ndata: {"type":"response.completed"}\n\ndata: [DONE]\n\n',
+        )
+
+    body = {
+        "model": "good-model",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What is in this image?"},
+                    {"type": "image_url", "image_url": {"url": image_url, "detail": "low"}},
+                ],
+            }
+        ],
+        "stream": True,
+    }
+
+    with respx.mock:
+        route = respx.post("https://p1.example/v1/responses").mock(side_effect=handler)
+        chunks = [chunk async for chunk in gateway.relay_stream("/chat/completions", body, "chat")]
+
+    assert route.call_count == 1
+    joined = b"".join(chunks)
+    assert b'"content":"image received"' in joined
     logs = gateway.read_recent_request_logs()
     assert logs[0]["format_adapter"] == "codex_responses_to_chat"
 

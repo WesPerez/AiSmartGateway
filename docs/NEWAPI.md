@@ -426,6 +426,18 @@ Real validation on 2026-06-13 covered:
   Real validation against Anyrouter `gpt-5.5` confirmed both a tool-bearing
   text stream and a forced `tool_choice` stream; the latter returned Chat
   `tool_calls` deltas after passing through `/responses`.
+- Image-bearing Chat requests use the same Codex-compatible path when the
+  Responses health item has Codex evidence. Chat content parts such as
+  `{"type":"image_url","image_url":{"url":"..."}}` are mapped to Responses
+  `{"type":"input_image","image_url":"..."}` while preserving `detail`. Plain
+  small-JSON conversion remains text-only. Request logs now include
+  `message_content_types` and `has_image_content` even for local
+  `no_healthy_upstream` decisions, so multimodal routing failures can be
+  diagnosed from logs without seeing the full image payload.
+  Upstream `400 invalid_value` errors on `param=input` are classified as
+  `client_invalid_input` and do not cool down provider health, because malformed
+  or unsupported image data is a request issue rather than proof that the
+  provider/model/kind is unhealthy.
 
 ## Operations UI
 

@@ -869,6 +869,8 @@ def request_shape(body: dict[str, Any], incoming_headers: dict[str, str] | None 
     tools_value = body.get("tools")
     input_roles: list[str] = []
     input_content_types: list[str] = []
+    message_roles: list[str] = []
+    message_content_types: list[str] = []
     if isinstance(input_value, list):
         for item in input_value[:20]:
             if isinstance(item, dict):
@@ -882,6 +884,25 @@ def request_shape(body: dict[str, Any], incoming_headers: dict[str, str] | None 
                         content_type = content_item.get("type")
                         if isinstance(content_type, str) and content_type not in input_content_types:
                             input_content_types.append(content_type)
+    if isinstance(messages_value, list):
+        for item in messages_value[:20]:
+            if isinstance(item, dict):
+                role = item.get("role")
+                if isinstance(role, str) and role not in message_roles:
+                    message_roles.append(role)
+                content = item.get("content")
+                content_items = content if isinstance(content, list) else [content]
+                for content_item in content_items[:20]:
+                    if isinstance(content_item, dict):
+                        content_type = content_item.get("type")
+                    elif isinstance(content_item, str):
+                        content_type = "text"
+                    elif content_item is None:
+                        content_type = "null"
+                    else:
+                        content_type = type(content_item).__name__
+                    if content_type and content_type not in message_content_types:
+                        message_content_types.append(str(content_type))
     return {
         "body_keys": sorted(str(key) for key in body.keys()),
         "input_type": type(input_value).__name__ if "input" in body else "",
@@ -889,6 +910,9 @@ def request_shape(body: dict[str, Any], incoming_headers: dict[str, str] | None 
         "input_roles": input_roles,
         "input_content_types": input_content_types,
         "messages_count": len(messages_value) if isinstance(messages_value, list) else None,
+        "message_roles": message_roles,
+        "message_content_types": message_content_types,
+        "has_image_content": any(content_type in {"image_url", "input_image"} for content_type in message_content_types + input_content_types),
         "tools_count": len(tools_value) if isinstance(tools_value, list) else None,
         "has_prompt_cache_key": "prompt_cache_key" in body,
         "has_reasoning": "reasoning" in body,
@@ -1046,6 +1070,8 @@ def classify_error(status_code: int, text: str) -> str:
     unsupported = ("not support", "unsupported", "不支持", "model not found", "model_not_found", "模型不存在")
     if any(word in sample for word in unsupported):
         return "model_unsupported"
+    if status_code == 400 and "invalid_value" in sample and "input" in sample:
+        return "client_invalid_input"
     invalid_request = (
         "invalid codex request",
         "invalid_responses_request",
@@ -1133,6 +1159,71 @@ def safe_text_from_content(content: Any) -> str | None:
     return None
 
 
+def codex_responses_content_from_chat_content(content: Any, role: str) -> list[dict[str, Any]] | None:
+    text_type = "input_text" if role == "user" else "output_text"
+    if content is None:
+        return []
+    if isinstance(content, str):
+        return [{"type": text_type, "text": content}] if content or role == "user" else []
+    if not isinstance(content, list):
+        return None
+    converted: list[dict[str, Any]] = []
+    for part in content:
+        if isinstance(part, str):
+            if part or role == "user":
+                converted.append({"type": text_type, "text": part})
+            continue
+        if not isinstance(part, dict):
+            return None
+        part_type = str(part.get("type") or "")
+        if part_type in {"text", "input_text", "output_text"}:
+            text = str(part.get("text") or "")
+            if text or role == "user":
+                converted.append({"type": text_type, "text": text})
+            continue
+        if part_type == "image_url":
+            if role != "user":
+                return None
+            image_url = part.get("image_url")
+            if isinstance(image_url, dict):
+                url = str(image_url.get("url") or "").strip()
+                detail = image_url.get("detail")
+            elif isinstance(image_url, str):
+                url = image_url.strip()
+                detail = part.get("detail")
+            else:
+                url = str(part.get("url") or "").strip()
+                detail = part.get("detail")
+            if not url:
+                return None
+            item: dict[str, Any] = {"type": "input_image", "image_url": url}
+            if detail:
+                item["detail"] = str(detail)
+            converted.append(item)
+            continue
+        if part_type == "input_image":
+            if role != "user":
+                return None
+            item: dict[str, Any] = {"type": "input_image"}
+            image_url = part.get("image_url") or part.get("url")
+            if isinstance(image_url, dict):
+                image_url = image_url.get("url")
+            if image_url:
+                item["image_url"] = str(image_url)
+            file_id = part.get("file_id")
+            if file_id:
+                item["file_id"] = str(file_id)
+            detail = part.get("detail")
+            if detail:
+                item["detail"] = str(detail)
+            if "image_url" not in item and "file_id" not in item:
+                return None
+            converted.append(item)
+            continue
+        return None
+    return converted
+
+
 def chat_messages_from_responses_input(input_value: Any) -> list[dict[str, Any]] | None:
     if isinstance(input_value, str):
         return [{"role": "user", "content": input_value}]
@@ -1196,22 +1287,19 @@ def codex_responses_input_from_chat_messages(messages: Any) -> tuple[str, list[d
         if not isinstance(item, dict):
             return None
         role = str(item.get("role") or "user")
-        content = safe_text_from_content(item.get("content"))
-        if content is None:
-            return None
         if role in {"system", "developer"}:
+            content = safe_text_from_content(item.get("content"))
+            if content is None:
+                return None
             if content:
                 instructions.append(content)
             continue
         if role in {"user", "assistant"}:
-            if content or role == "user":
-                inputs.append(
-                    {
-                        "type": "message",
-                        "role": role,
-                        "content": [{"type": "input_text" if role == "user" else "output_text", "text": content}],
-                    }
-                )
+            content_parts = codex_responses_content_from_chat_content(item.get("content"), role)
+            if content_parts is None:
+                return None
+            if content_parts or role == "user":
+                inputs.append({"type": "message", "role": role, "content": content_parts or [{"type": "input_text", "text": ""}]})
             tool_calls = item.get("tool_calls")
             if tool_calls is not None:
                 if role != "assistant" or not isinstance(tool_calls, list):
@@ -1236,6 +1324,9 @@ def codex_responses_input_from_chat_messages(messages: Any) -> tuple[str, list[d
                     )
             continue
         if role == "tool":
+            content = safe_text_from_content(item.get("content"))
+            if content is None:
+                return None
             call_id = str(item.get("tool_call_id") or item.get("call_id") or "").strip()
             if not call_id:
                 return None
@@ -2611,7 +2702,7 @@ def shadow_route_source_allowed(item: dict[str, Any]) -> bool:
 def should_mark_runtime_failure(reason: str, kind: str | None = None) -> bool:
     if kind == "responses" and responses_request_shape_reason(reason):
         return False
-    return reason != "invalid_request"
+    return reason not in {"invalid_request", "client_invalid_input"}
 
 
 def should_verify_responses_request_shape(kind: str, endpoint_reasons: list[str]) -> bool:
@@ -2990,6 +3081,7 @@ async def relay_non_stream(
                 "success": False,
                 "error_type": "no_healthy_upstream",
                 "route_controls": controls,
+                "request_shape": request_shape(body, incoming_headers),
             }
         )
         return JSONResponse(
@@ -3183,6 +3275,7 @@ async def relay_stream(
                 "success": False,
                 "error_type": "no_healthy_upstream",
                 "route_controls": controls,
+                "request_shape": request_shape(body, incoming_headers),
             }
         )
         if kind == "responses":
@@ -3397,6 +3490,7 @@ async def relay_stream(
             "success": False,
             "error_type": "all_upstreams_failed",
             "route_controls": controls,
+            "request_shape": request_shape(body, incoming_headers),
         }
     )
     if kind == "responses":
