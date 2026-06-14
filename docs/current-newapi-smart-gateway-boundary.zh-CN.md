@@ -125,6 +125,7 @@ Smart Gateway 后台是路由运维视图，不是第二套用户/令牌/订阅�
 3. 对同一 provider/model/kind/request-shape fingerprint，真实形态连续 3 次失败后才标记 `real_shape_invalid` 并短冷却。
 4. 任意一次真实形态成功，立即恢复健康并清空失败计数。
 5. 多 Base URL 的同一逻辑上游，应逐个 base URL 验证，但仍归并为一个 provider。
+6. 运行时 `server_unavailable`、`empty_stream`、`all_endpoints_failed`、`exception:*` 属于瞬时失败；默认连续 2 次才把刚健康的候选打入冷却，单次失败只记录 `runtime_failure_count`。任意一次运行时成功会清空该计数。模型不支持、鉴权、额度、限流和真实形态确认不兼容仍会立即冷却。
 
 当前默认冷却策略：
 

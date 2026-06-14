@@ -222,6 +222,15 @@ below `PROBE_MIN_QUALITY_SCORE`. This check is only for synthetic health
 probes; real user requests can still legitimately ask for terse output without
 poisoning provider health.
 
+Runtime `server_unavailable`, `empty_stream`, `all_endpoints_failed`, and
+`exception:*` are treated as transient by default. A healthy item is not removed
+from routing after the first such runtime failure; Smart Gateway records a
+pending `runtime_failure_count` and only marks it unhealthy after
+`RUNTIME_TRANSIENT_FAILURE_CONFIRMATIONS` consecutive transient failures
+(default `2`). Any runtime success clears the pending counter. Non-transient
+failures such as unsupported model, auth, quota, rate limit, and confirmed real
+shape invalid still enter cooldown immediately.
+
 `HEALTH_FRESH_TTL_SECONDS` is an operations-facing freshness window. A healthy
 item checked inside this window is shown as fresh; a healthy item older than
 this window but still inside the success cache is shown as cached/stale health.

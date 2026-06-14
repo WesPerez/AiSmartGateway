@@ -2032,7 +2032,7 @@ async def test_probe_keeps_declared_models_when_probe_budget_is_exhausted(gatewa
 
 
 @pytest.mark.asyncio()
-async def test_non_stream_failover_marks_failed_provider(gateway, monkeypatch):
+async def test_non_stream_failover_records_transient_failure(gateway, monkeypatch):
     gateway.PROVIDERS = [
         {"id": "p1", "base_url": "https://p1.example/v1", "api_key": "sk-p1", "timeout_seconds": 3, "headers": {}},
         {"id": "p2", "base_url": "https://p2.example/v1", "api_key": "sk-p2", "timeout_seconds": 3, "headers": {}},
@@ -2060,7 +2060,9 @@ async def test_non_stream_failover_marks_failed_provider(gateway, monkeypatch):
         assert response.status_code == 200
         assert json.loads(response.body.decode())["id"] == "ok"
 
-    assert gateway.HEALTH["chat"]["good-model"]["p1"]["healthy"] is False
+    assert gateway.HEALTH["chat"]["good-model"]["p1"]["healthy"] is True
+    assert gateway.HEALTH["chat"]["good-model"]["p1"]["runtime_failure_count"] == 1
+    assert gateway.HEALTH["chat"]["good-model"]["p1"]["runtime_failure_reason"] == "server_unavailable"
     assert gateway.HEALTH["chat"]["good-model"]["p2"]["healthy"] is True
     assert p2_route.calls.last.request.headers["Authorization"] == "Bearer sk-p2"
     assert p2_route.calls.last.request.headers["openai-beta"] == "responses=v1"
@@ -2735,6 +2737,49 @@ async def test_runtime_failure_sets_probe_cooldown(gateway):
     item = next(item for item in gateway.HEALTH["chat"]["good-model"].values() if item["provider_id"] == "p1")
     assert item["healthy"] is False
     assert item["reason"] == "runtime_failure:model_unsupported"
+    assert item["next_probe_at"] > gateway.now()
+
+
+@pytest.mark.asyncio()
+async def test_transient_runtime_failure_requires_confirmation(gateway, monkeypatch):
+    monkeypatch.setattr(gateway, "RUNTIME_TRANSIENT_FAILURE_CONFIRMATIONS", 2)
+    gateway.HEALTH = {
+        "responses": {
+            "good-model": {
+                "p1": {
+                    "provider_id": "p1",
+                    "actual_model": "good-model",
+                    "healthy": True,
+                    "reason": "ok",
+                    "priority": 100,
+                    "weight": 1,
+                },
+            }
+        },
+        "chat": {},
+    }
+
+    await gateway.mark_runtime_failure("responses", "good-model", "p1", "server_unavailable")
+
+    item = next(item for item in gateway.HEALTH["responses"]["good-model"].values() if item["provider_id"] == "p1")
+    assert item["healthy"] is True
+    assert item["reason"] == "ok"
+    assert item["runtime_failure_count"] == 1
+    assert item["runtime_failure_reason"] == "server_unavailable"
+    assert item["runtime_failure_required"] == 2
+
+    await gateway.mark_runtime_success("responses", "good-model", "p1", 123)
+
+    assert item["healthy"] is True
+    assert "runtime_failure_count" not in item
+    assert "runtime_failure_reason" not in item
+
+    await gateway.mark_runtime_failure("responses", "good-model", "p1", "server_unavailable")
+    await gateway.mark_runtime_failure("responses", "good-model", "p1", "server_unavailable")
+
+    assert item["healthy"] is False
+    assert item["reason"] == "runtime_failure:server_unavailable"
+    assert item["runtime_failure_count"] == 2
     assert item["next_probe_at"] > gateway.now()
 
 

@@ -59,6 +59,7 @@ HEALTH_FRESH_TTL_SECONDS = int(os.getenv("HEALTH_FRESH_TTL_SECONDS", "300"))
 RESPONSES_INVALID_REQUEST_CONFIRMATIONS = max(1, int(os.getenv("RESPONSES_INVALID_REQUEST_CONFIRMATIONS", "3")))
 RESPONSES_INVALID_REQUEST_RETRY_SECONDS = int(os.getenv("RESPONSES_INVALID_REQUEST_RETRY_SECONDS", "60"))
 RESPONSES_INVALID_REQUEST_COOLDOWN_SECONDS = int(os.getenv("RESPONSES_INVALID_REQUEST_COOLDOWN_SECONDS", "1800"))
+RUNTIME_TRANSIENT_FAILURE_CONFIRMATIONS = max(1, int(os.getenv("RUNTIME_TRANSIENT_FAILURE_CONFIRMATIONS", "2")))
 ADAPTIVE_FORMAT_ROUTING = os.getenv("ADAPTIVE_FORMAT_ROUTING", "true").lower() == "true"
 ADAPTER_LATENCY_PENALTY_MS = int(os.getenv("ADAPTER_LATENCY_PENALTY_MS", "250"))
 ADAPTER_SYNTHESIZE_USAGE = os.getenv("ADAPTER_SYNTHESIZE_USAGE", "true").lower() == "true"
@@ -795,6 +796,7 @@ def health_policy_summary() -> dict[str, Any]:
         "probe_content_quality_check": PROBE_CONTENT_QUALITY_CHECK,
         "probe_min_quality_score": PROBE_MIN_QUALITY_SCORE,
         "probe_strategy_version": PROBE_STRATEGY_VERSION,
+        "runtime_transient_failure_confirmations": RUNTIME_TRANSIENT_FAILURE_CONFIRMATIONS,
         "probe_chat_profiles": ["openai/default", "openai/codex", "anthropic/default", "anthropic/claude-cli", "anthropic/claude-code"],
         "probe_responses_profiles": ["openai/default", "openai/codex", "codex/diagnostic"],
         "adaptive_format_routing": ADAPTIVE_FORMAT_ROUTING,
@@ -4343,6 +4345,10 @@ def runtime_failure_reason_for_endpoint_failures(kind: str, endpoint_reasons: li
     return "all_endpoints_failed"
 
 
+def transient_runtime_failure_reason(reason: str) -> bool:
+    return reason in {"server_unavailable", "empty_stream", "all_endpoints_failed"} or reason.startswith("exception:")
+
+
 def exploration_enabled(controls: dict[str, Any]) -> bool:
     if ROUTE_EXPLORATION_MAX_CANDIDATES <= 0 or ROUTE_EXPLORATION_RATE <= 0:
         return False
@@ -4577,11 +4583,34 @@ async def mark_runtime_failure(kind: str, model: str, provider_id: str, reason: 
         expire_model_cache = reason in {"model_unsupported", "not_found"} and any(
             item.get("source") == "upstream_models" for item in matched
         )
+        now_int = int(now())
         for item in matched:
+            previous_count = (
+                int(item.get("runtime_failure_count") or 0)
+                if item.get("runtime_failure_reason") == reason
+                else 0
+            )
+            failure_count = previous_count + 1
+            if (
+                item.get("healthy")
+                and transient_runtime_failure_reason(reason)
+                and failure_count < RUNTIME_TRANSIENT_FAILURE_CONFIRMATIONS
+            ):
+                item["runtime_failure_count"] = failure_count
+                item["runtime_failure_required"] = RUNTIME_TRANSIENT_FAILURE_CONFIRMATIONS
+                item["runtime_failure_reason"] = reason
+                item["runtime_failure_last_at"] = now_int
+                item["last_runtime_error"] = reason
+                continue
             item["healthy"] = False
             item["reason"] = f"runtime_failure:{reason}"
-            item["checked_at"] = int(now())
-            item["next_probe_at"] = int(now()) + probe_cooldown_seconds(reason, False)
+            item["checked_at"] = now_int
+            item["next_probe_at"] = now_int + probe_cooldown_seconds(reason, False)
+            item["runtime_failure_count"] = failure_count
+            item["runtime_failure_required"] = RUNTIME_TRANSIENT_FAILURE_CONFIRMATIONS
+            item["runtime_failure_reason"] = reason
+            item["runtime_failure_last_at"] = now_int
+            item["last_runtime_error"] = reason
         if expire_model_cache and provider_id in MODEL_CACHE:
             MODEL_CACHE[provider_id]["next_refresh_at"] = 0
             MODEL_CACHE[provider_id]["reason"] = f"runtime_{reason}"
@@ -4653,6 +4682,11 @@ async def mark_runtime_success(
             item["sample"] = ""
             item["skip_reason"] = ""
             item["skipped"] = False
+            item.pop("runtime_failure_count", None)
+            item.pop("runtime_failure_required", None)
+            item.pop("runtime_failure_reason", None)
+            item.pop("runtime_failure_last_at", None)
+            item.pop("last_runtime_error", None)
             if kind == "responses":
                 if codex_compat:
                     item["shape_status"] = "codex_shape_verified"
