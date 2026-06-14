@@ -96,6 +96,13 @@ It must not destructively rewrite source channel model declarations just because
 runtime health is currently bad. Runtime health belongs in Smart Gateway state;
 operator declarations belong in New API channels.
 
+For known upstreams where credentials are also present in `.env`, the sync
+script lets `.env` override the New API channel key for the generated Gateway
+provider. This keeps emergency credential rotation simple without editing the
+New API source channel first. Current recognized variables are
+`UPSTREAM_X666_KEY`, `UPSTREAM_ANYROUTER_KEY`, `UPSTREAM_SHAREDCHAT_KEY`,
+`UPSTREAM_MUYUAN_KEY`, `UPSTREAM_EQING_KEY`, and `UPSTREAM_VOLCES_KEY`.
+
 ## Source Pool Policy
 
 Provider route groups:
@@ -165,6 +172,12 @@ The full probe and router sync on 2026-06-14 exposed
 variants stayed hidden because the currently reachable upstreams returned
 non-healthy probe results such as rate limiting.
 
+After the runtime empty-output gate was deployed and a forced full probe was
+run on 2026-06-14, the effective public list contained 10 models:
+`claude-opus-4-6`, `claude-opus-4-7`, `claude-opus-4-8`,
+`claude-sonnet-4-6`, `deepseek-v4-flash`, `deepseek-v4-pro`, `glm-5.1`,
+`gpt-5.5`, `grok-4.20-fast`, and `grok-4.20-0309-non-reasoning`.
+
 ## Health Detection Strategy
 
 Health is tracked by:
@@ -223,6 +236,14 @@ response still fails health if the extracted Chat/Responses text is empty or
 below `PROBE_MIN_QUALITY_SCORE`. This check is only for synthetic health
 probes; real user requests can still legitimately ask for terse output without
 poisoning provider health.
+
+Runtime success also requires observable model output. Smart Gateway no longer
+marks a 2xx non-streamed response, an SSE `response.completed`, or a streamed
+Chat/Responses request as successful until it has seen text or a tool call. If
+the upstream sends only an empty completion, the runtime result is
+`empty_response`, the request log is failed, and the provider/model/kind is
+cooled down. This prevents clients such as Claude Desktop from seeing a silent
+successful completion with no assistant content.
 
 Runtime `server_unavailable`, `empty_stream`, `all_endpoints_failed`, and
 `exception:*` are treated as transient by default. A healthy item is not removed
@@ -292,6 +313,14 @@ used to force a compatible client identity. One Claude aggregation provider was
 observed returning a client-restricted error when probes looked like
 `python-httpx`; the sync script now preserves a provider-specific
 Claude Code identity override for that source.
+
+Providers may also set `proxy_url` for upstream-only egress routing. The sync
+script injects `proxy_url` for sharedchat from
+`GATEWAY_SHAREDCHAT_PROXY_URL`, `SHAREDCHAT_PROXY_URL`,
+`GATEWAY_CN_PROXY_URL`, or `CN_PROXY_URL`. This is intentionally provider
+scoped: it sends only that upstream's traffic through the proxy and does not
+change New API, admin UI, or other provider traffic. The provider signature
+includes `proxy_url`, so changing it causes config reloads and fresh probes.
 
 Current Muyuan behavior is stricter than the earlier UA-only workaround. Plain
 OpenAI Chat bodies are rejected even with a Claude Code-like UA. The working

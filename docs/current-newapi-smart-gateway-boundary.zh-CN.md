@@ -127,6 +127,7 @@ Smart Gateway 后台是路由运维视图，不是第二套用户/令牌/订阅�
 5. 多 Base URL 的同一逻辑上游，应逐个 base URL 验证，但仍归并为一个 provider。
 6. 运行时 `server_unavailable`、`empty_stream`、`all_endpoints_failed`、`exception:*` 属于瞬时失败；默认连续 2 次才把刚健康的候选打入冷却，单次失败只记录 `runtime_failure_count`。任意一次运行时成功会清空该计数。模型不支持、鉴权、额度、限流和真实形态确认不兼容仍会立即冷却。
 7. 带 `tools` 的 Responses 请求还有工具能力子状态：HTTP 200 但只输出“正确工具调用格式/让我重试工具调用”这类循环文本、不产生 `function_call` 时，记录 `tool_call_support=unsupported`；后续带相同循环历史的请求会跳过未验证或已判不支持的 native Responses 候选，改试可安全映射的 Chat adapter 候选。真实产出 `function_call` 时记录 `tool_call_support=verified`。
+8. 运行时 HTTP 2xx 不再直接等于成功。非流式 JSON、Chat SSE、Responses SSE 都必须观察到文本输出或工具调用后才反写 `ok`；只有空 `response.completed` 或空 Chat completion 时标记 `empty_response`，避免 Claude Desktop 这类客户端收到“成功但没有内容”的静默结果。
 
 当前默认冷却策略：
 
@@ -146,6 +147,8 @@ Smart Gateway 后台是路由运维视图，不是第二套用户/令牌/订阅�
 Muyuan 这类 Claude 聚合上游当前不能再只靠 `User-Agent` 伪装。它要求 `/chat/completions` 使用 Anthropic/Claude Code 风格 body，并带当前 Claude Code 客户端身份 header；Smart Gateway 用 provider 级 `chat_request_format: anthropic` 表达这类兼容策略。
 
 远端 New API 如果返回 `price not configured` / `价格未配置`，这不是客户端请求格式问题，而是上游 provider 的运营配置缺失。Smart Gateway 将其归类为 `provider_config_error` 并冷却对应 provider/model/kind；本地 Router channel 的 `ModelRatio` 仍由同步脚本维护。
+
+provider 可配置 `proxy_url`，只影响该上游的出站请求。`https://new.sharedchat.cc/codex` 这类要求中国大陆出口的源，使用 `.env` 中的 `GATEWAY_SHAREDCHAT_PROXY_URL`（或 `SHAREDCHAT_PROXY_URL`、`GATEWAY_CN_PROXY_URL`、`CN_PROXY_URL`）注入，不改全局代理。
 
 ## 自适应格式路由
 

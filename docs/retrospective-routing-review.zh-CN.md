@@ -907,6 +907,10 @@ upstream_kind: 网关实际选择的上游接口格式
 25. 2026-06-14 根据 `mimo-v2.5-pro` Responses 日志继续修运行时健康反写：Fufu 连续三次 native Responses 成功后，一次 `503 Gateway Error: 没有可用的内网节点` 被立即写成 `runtime_failure:server_unavailable`，导致后续请求全部 `no_healthy_upstream`。修复为通用瞬时失败确认：`server_unavailable`、`empty_stream`、`all_endpoints_failed`、`exception:*` 默认连续 2 次才把刚健康候选打入冷却；单次失败只记录 pending 计数，任意成功清零。
 26. 2026-06-14 继续排查 `mimo-v2.5-pro` “循环卡住”：请求已是 HTTP 200 / native Responses，但带 51 个 tools 时上游连续输出“correct tool invocations / XML invocation format”等普通文本，没有真实 `function_call`，客户端不断把这些文本带回去导致循环。修复为工具能力子状态：带 tools 的 native Responses stream 会观察是否出现 function_call；出现工具调用循环文本且没有 function_call 时记录 `tool_call_support=unsupported`。后续带相同循环历史的请求跳过未验证/不支持的 native Responses，并允许低信号 Chat 探测项作为 `chat_to_responses` shadow fallback。
 27. 2026-06-14 排查 CC Switch 报错 `https://cooai.cc.cd grok-4.20-fast`：远端返回 `模型 ... 的价格未配置 / price not configured`。本地 New API `ModelRatio` 已包含 `grok-4.20-fast`，因此这是远端上游 New API 的运营配置错误。Gateway 新增 `provider_config_error` 分类，遇到此类 400 会冷却对应 provider/model/kind，而不是误判为客户端 `invalid_request`。
+28. 2026-06-14 继续排查 `grok-4.20-fast` 在 Claude Desktop 无返回也无报错：请求链路会把 Responses 客户端请求经 `chat_to_responses` 转到 Chat 上游。旧逻辑只要上游返回 2xx 或 stream 首块就记成功，即使最终没有任何 `output_text` / Chat content，也会让客户端静默结束。修复为运行时必须观察到文本或工具调用才算成功；空 JSON、空 `response.completed`、空 Chat SSE 都标记为 `empty_response` 并写失败日志。
+29. 2026-06-14 重新直连验证 anyrouter Claude 系列：`/models` 声明 Claude 模型，但 `/chat/completions` 对 Claude 返回模型不支持，`/responses` 当前可证明的是 `gpt-5.5` Codex-compatible；Anthropic `/v1/messages` 对 Claude 至少进入了更深的网关逻辑，但当前返回 1m context/beta 或 503，不能判健康。结论：anyrouter 现在不能仅因模型列表声明就暴露 Claude，Gateway 只能保留已验证的 `gpt-5.5` Codex Responses 能力。
+30. 2026-06-14 重新直连验证 x666：`/models`、`/chat/completions`、`/responses`、`/messages` 都返回 `401 Invalid token`。同步脚本已改为对 x666 这类已知上游优先采用 `.env` 的 `UPSTREAM_X666_KEY`，但当前可用性仍取决于实际 token 是否正确。
+31. 2026-06-14 处理 `https://new.sharedchat.cc/codex` 出口问题：当前机器直连返回 Cloudflare/HTML 403，符合非中国大陆出口被挡的表现。Gateway 增加 provider 级 `proxy_url`，同步脚本对 sharedchat 从 `GATEWAY_SHAREDCHAT_PROXY_URL` / `SHAREDCHAT_PROXY_URL` / `GATEWAY_CN_PROXY_URL` / `CN_PROXY_URL` 注入代理，只让 sharedchat 走大陆出口，不影响其它上游。
 
 ### 当前健康含义
 
@@ -937,6 +941,10 @@ upstream_kind: 网关实际选择的上游接口格式
 - Chat -> Responses 适配会保留/规范化 usage；上游缺 usage 时会合成带 `estimated:true` 的 Responses usage，覆盖非流式和流式。
 - Chat -> Responses 流式 completed 事件会带完整 `response.output` / `response.output_text`，覆盖文本和工具调用，避免 New API Claude/Anthropic 转换时报 `NO OUTPUT IN RESPONSE`。
 - 远端 New API distributor 返回 `No available channel` 时按 `model_unsupported` 展示；上游自动发现模型遇到运行时模型不可用会让模型缓存过期并重新发现。
+- Cloudflare/HTML 403 优先归类为 `html_or_cloudflare`，避免误判为普通鉴权失败。
+- provider 级 `proxy_url` 会进入 httpx client 参数和 provider signature；管理接口只显示是否设置并脱敏 URL 凭据。
+- sync 脚本对已知上游使用 `.env` key 覆盖 New API channel key，并为 sharedchat 注入 provider 级代理。
+- Responses stream 只有 completed 事件但带 `output_text` 时可转成 Chat delta；完全空输出会被识别为 `empty_response`。
 
 真实请求回归：
 
@@ -944,9 +952,15 @@ upstream_kind: 网关实际选择的上游接口格式
 - Fufu `mimo-v2-flash`：Chat 原生成功，Responses 原生成功。
 - Muyuan `claude-opus-4-8`：Responses 客户端请求非流式和流式均成功降级到 Chat 上游，再转回 Responses；该源现在需要 provider 级 `chat_request_format: anthropic`、`User-Agent: claude-cli/2.1.133` 和 Claude Code Anthropic headers，旧的 `User-Agent: Claude-Code/1.0.0` 已不够。
 - Anyrouter `gpt-5.5`：普通 Responses 小 JSON 仍返回 `invalid codex request`；Codex-compatible Chat -> Responses 转换已通过。自动路由不是按 Anyrouter 或模型强制，而是根据该 Responses health item 的 `responses_compat_mode=codex` / Codex shape 验证证据选择 `chat -> responses / codex_responses_to_chat`，成功后 health 保留 `responses_compat_mode=codex`。2026-06-14 真实回归中，带 tools 的 Chat stream 返回文本成功；强制 `tool_choice` 调用 `noop` 时，Anyrouter `/responses` 返回的 function_call 流事件已转成 Chat `tool_calls` delta。
+- Grok `grok-4.20-fast`：Codex/Chat 原生路径可成功；Claude Desktop 的静默空输出路径已通过 `empty_response` 判定防止被误记成功。另一个远端 `price not configured` 是上游 New API 价格配置问题，不是本地 `ModelRatio` 问题。
+- Anyrouter Claude 系列：当前直连不能证明可用，不能作为 Claude Code 健康候选暴露。
+- x666 Claude 系列：当前失败原因为 token 无效；修复 token 后再进入 Claude Code/Anthropic 形态探测。
+- sharedchat `/codex`：当前直连受出口限制；设置大陆代理后再做健康探测。
 - 管理 API 暴露健康新鲜度字段。
 
-完整验证结果更新：`107 passed`。
+部署后强制全量 probe 结果：Chat 健康 10，Responses 健康 5，公开模型 10 个，分别是 `claude-opus-4-6`、`claude-opus-4-7`、`claude-opus-4-8`、`claude-sonnet-4-6`、`deepseek-v4-flash`、`deepseek-v4-pro`、`glm-5.1`、`gpt-5.5`、`grok-4.20-fast`、`grok-4.20-0309-non-reasoning`。Router channel 已按这 10 个模型同步到 `default,vip` 两组，共 20 条能力。
+
+完整验证结果更新：`111 passed`，sync 脚本测试 `9 passed`。
 
 ## 2026-06-14 AI Key Vault 借鉴判断
 

@@ -134,6 +134,44 @@ def test_provider_from_channel_adds_muyuan_client_headers(tmp_path):
     assert provider["chat_request_format"] == "anthropic"
 
 
+def test_provider_from_channel_prefers_env_key_for_known_upstreams(tmp_path):
+    sync = load_sync_module()
+    sync.LOADED_ENV = {"UPSTREAM_X666_KEY": "sk-from-env"}
+    con = make_db(tmp_path / "one-api.db")
+    con.execute(
+        """
+        insert into channels (
+            id, name, status, base_url, models, tag, "group", priority, weight, key
+        ) values (6, 'x666', 1, 'https://x666.example', 'claude-opus-4-8', 'gateway-source', 'default', 90, 100, 'sk-from-channel')
+        """
+    )
+    row = con.execute("select * from channels where id = 6").fetchone()
+
+    provider = sync.provider_from_channel(row)
+
+    assert provider["api_key"] == "sk-from-env"
+
+
+def test_provider_from_channel_adds_sharedchat_proxy_from_env(tmp_path):
+    sync = load_sync_module()
+    sync.LOADED_ENV = {"GATEWAY_SHAREDCHAT_PROXY_URL": "socks5://127.0.0.1:1080"}
+    con = make_db(tmp_path / "one-api.db")
+    con.execute(
+        """
+        insert into channels (
+            id, name, status, base_url, models, tag, "group", priority, weight, key
+        ) values (7, 'sharedchat', 1, 'https://new.sharedchat.cc/codex', 'gpt-5.5', 'gateway-source', 'default', 90, 100, 'sk-shared')
+        """
+    )
+    row = con.execute("select * from channels where id = 7").fetchone()
+
+    provider = sync.provider_from_channel(row)
+
+    assert provider["base_url"] == "https://new.sharedchat.cc/codex"
+    assert provider["base_url_exact"] is True
+    assert provider["proxy_url"] == "socks5://127.0.0.1:1080"
+
+
 def test_sync_models_table_auto_hides_and_restores_gateway_models(tmp_path):
     sync = load_sync_module()
     con = make_db(tmp_path / "one-api.db")

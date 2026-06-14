@@ -84,6 +84,7 @@ MUYUAN_CLIENT_HEADERS = {
     "anthropic-version": "2023-06-01",
     "anthropic-beta": "claude-code-20250219,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14",
 }
+LOADED_ENV: dict[str, str] = {}
 
 
 def resolve_path(path: str, alternates: list[str]) -> Path:
@@ -207,6 +208,38 @@ def compatible_base_urls(name: str, base_url: str) -> list[str]:
     return list(dict.fromkeys(candidates))
 
 
+def env_value(*keys: str) -> str:
+    for key in keys:
+        value = os.getenv(key) or LOADED_ENV.get(key) or ""
+        if value.strip():
+            return value.strip()
+    return ""
+
+
+def provider_api_key(name: str, base_url: str, channel_key: str | None) -> str:
+    text = f"{name} {base_url}".lower()
+    if "x666" in text:
+        return env_value("UPSTREAM_X666_KEY") or str(channel_key or "")
+    if "anyrouter" in text:
+        return env_value("UPSTREAM_ANYROUTER_KEY") or str(channel_key or "")
+    if "sharedchat" in text:
+        return env_value("UPSTREAM_SHAREDCHAT_KEY") or str(channel_key or "")
+    if "muyuan" in text:
+        return env_value("UPSTREAM_MUYUAN_KEY") or str(channel_key or "")
+    if "eqing" in text or "sub2api" in text:
+        return env_value("UPSTREAM_EQING_KEY") or str(channel_key or "")
+    if "volces" in text or "ark.cn-beijing.volces" in text:
+        return env_value("UPSTREAM_VOLCES_KEY") or str(channel_key or "")
+    return str(channel_key or "")
+
+
+def provider_proxy_url(name: str, base_url: str) -> str:
+    text = f"{name} {base_url}".lower()
+    if "sharedchat" in text:
+        return env_value("GATEWAY_SHAREDCHAT_PROXY_URL", "SHAREDCHAT_PROXY_URL", "GATEWAY_CN_PROXY_URL", "CN_PROXY_URL")
+    return ""
+
+
 def provider_client_headers(name: str, base_url: str) -> dict[str, str]:
     text = f"{name} {base_url}".lower()
     if "muyuan.do" in text:
@@ -230,7 +263,7 @@ def provider_from_channel(row: sqlite3.Row) -> dict[str, Any]:
         "name": name,
         "enabled": row["status"] == 1,
         "base_url": base_url,
-        "api_key": row["key"],
+        "api_key": provider_api_key(name, base_url, row["key"]),
         "priority": policy["priority"],
         "weight": int(row["weight"] or policy["weight"] or 100),
         "timeout_seconds": 60.0,
@@ -247,6 +280,9 @@ def provider_from_channel(row: sqlite3.Row) -> dict[str, Any]:
         provider["chat_request_format"] = chat_format
     if exact:
         provider["base_url_exact"] = True
+    proxy_url = provider_proxy_url(name, base_url)
+    if proxy_url:
+        provider["proxy_url"] = proxy_url
     base_urls = compatible_base_urls(name, base_url)
     if base_urls:
         provider["base_urls"] = base_urls
@@ -552,9 +588,11 @@ def connect_network() -> None:
 
 
 def sync(args: argparse.Namespace) -> None:
+    global LOADED_ENV
     providers_path = resolve_path(args.providers, ["/workspace/config/providers.yaml", "/app/config/providers.yaml"])
     env_path = resolve_path(args.env, ["/workspace/.env"])
     env = load_env(env_path)
+    LOADED_ENV = env
     db_path = resolve_newapi_db(args.db, env)
     health_state_path = resolve_path(getattr(args, "health_state", DEFAULT_HEALTH_STATE), ["/data/health_state.json"])
     master_key = env.get("MASTER_API_KEY", "")

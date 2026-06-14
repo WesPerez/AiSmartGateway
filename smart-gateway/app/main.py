@@ -111,6 +111,13 @@ def redact_text(value: Any, limit: int = 500) -> str:
     return text.replace("\n", "\\n")[:limit]
 
 
+def redact_url_credentials(value: Any) -> str:
+    text = str(value or "")
+    if not text:
+        return ""
+    return re.sub(r"//([^/@:\s]+):([^/@\s]+)@", r"//\1:<redacted>@", text)
+
+
 def extract_usage(data: Any) -> dict[str, Any]:
     if isinstance(data, dict) and isinstance(data.get("usage"), dict):
         usage = data["usage"]
@@ -370,6 +377,7 @@ def provider_signature(provider: dict[str, Any]) -> str:
         "api_key": provider.get("api_key"),
         "headers": provider.get("headers") or {},
         "chat_request_format": provider.get("chat_request_format") or "",
+        "proxy_url": provider.get("proxy_url") or provider.get("proxy") or "",
         "probe_strategy_version": PROBE_STRATEGY_VERSION,
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
@@ -571,6 +579,7 @@ async def reload_config() -> None:
             provider["weight"] = max(1, int(provider.get("weight", 1)))
             provider["timeout_seconds"] = float(provider.get("timeout_seconds", REQUEST_TIMEOUT_SECONDS))
             provider["headers"] = provider.get("headers") or {}
+            provider["proxy_url"] = str(provider.get("proxy_url") or provider.get("proxy") or "").strip()
             provider["route_group"] = str(provider.get("route_group") or "primary")
             provider["cost_tier"] = str(provider.get("cost_tier") or "free")
             provider["fallback_only"] = bool(provider.get("fallback_only", False))
@@ -586,6 +595,9 @@ def redact_provider(provider: dict[str, Any], expanded: dict[str, Any] | None = 
     if isinstance(item.get("api_key"), str) and item["api_key"].startswith("${"):
         item["api_key_env"] = item["api_key"][2:-1]
     item["api_key"] = ""
+    if item.get("proxy_url") or item.get("proxy"):
+        item["proxy_url_set"] = bool((expanded or item).get("proxy_url") or (expanded or item).get("proxy"))
+        item["proxy_url"] = redact_url_credentials((expanded or item).get("proxy_url") or (expanded or item).get("proxy"))
     return item
 
 
@@ -914,6 +926,7 @@ def validate_provider_item(item: dict[str, Any], index: int) -> dict[str, Any]:
         "models_from_declared_only": bool(item.get("models_from_declared_only", False)),
         "headers": item.get("headers") if isinstance(item.get("headers"), dict) else {},
         "chat_request_format": str(item.get("chat_request_format") or "openai").strip(),
+        "proxy_url": str(item.get("proxy_url") or item.get("proxy") or "").strip(),
     }
     return normalized
 
@@ -991,6 +1004,34 @@ def provider_headers(
             set_header(headers, str(key), str(value))
     set_header(headers, "Authorization", f"Bearer {provider['api_key']}")
     return headers
+
+
+def provider_proxy_url(provider: dict[str, Any] | None) -> str | None:
+    value = str((provider or {}).get("proxy_url") or (provider or {}).get("proxy") or "").strip()
+    return value or None
+
+
+def http_client_kwargs(
+    provider: dict[str, Any] | None,
+    timeout_seconds: float,
+    follow_redirects: bool = True,
+) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "timeout": httpx.Timeout(timeout_seconds),
+        "follow_redirects": follow_redirects,
+    }
+    proxy_url = provider_proxy_url(provider)
+    if proxy_url:
+        kwargs["proxy"] = proxy_url
+    return kwargs
+
+
+def provider_http_client(
+    provider: dict[str, Any] | None,
+    timeout_seconds: float,
+    follow_redirects: bool = True,
+) -> httpx.AsyncClient:
+    return httpx.AsyncClient(**http_client_kwargs(provider, timeout_seconds, follow_redirects))
 
 
 def chat_request_format(item: dict[str, Any] | None) -> str:
@@ -1313,6 +1354,8 @@ def classify_error(status_code: int, text: str) -> str:
     )
     if status_code == 400 and any(word in sample for word in invalid_request):
         return "invalid_request"
+    if "<html" in sample or "<!doctype html" in sample or "cloudflare" in sample:
+        return "html_or_cloudflare"
     if status_code in (401, 403):
         return "auth_or_forbidden"
     if status_code == 404:
@@ -1321,8 +1364,6 @@ def classify_error(status_code: int, text: str) -> str:
         return "rate_limited"
     if status_code in (500, 502, 503, 504):
         return "server_unavailable"
-    if "<html" in sample or "<!doctype html" in sample or "cloudflare" in sample:
-        return "html_or_cloudflare"
     return f"http_{status_code}"
 
 
@@ -2791,6 +2832,10 @@ def response_data_has_tool_call(data: Any, kind: str) -> bool:
     return False
 
 
+def response_data_has_output(data: Any, kind: str) -> bool:
+    return bool(str(probe_response_text(data, kind) or "").strip()) or response_data_has_tool_call(data, kind)
+
+
 def convert_responses_response_to_chat(data: Any, request_id: str, model: str | None) -> dict[str, Any]:
     text = extract_responses_output_text(data)
     tool_calls = extract_responses_function_calls(data)
@@ -3103,11 +3148,17 @@ def responses_stream_chunk_to_chat(
         elif not event_type and data.get("delta"):
             delta = data.get("delta")
         if delta:
+            state.setdefault("response_output_parts", []).append(str(delta))
             out.extend(chat_completion_stream_chunk(request_id, model, {"content": delta}))
             continue
         if event_type in {"response.output_item.added", "response.output_item.done"}:
             item = data.get("item") if isinstance(data.get("item"), dict) else {}
             if str(item.get("type") or "") != "function_call":
+                fragments = [fragment for fragment in iter_text_fragments(item.get("content")) if str(fragment).strip()]
+                if fragments and not state.get("response_output_parts"):
+                    text = "".join(str(fragment) for fragment in fragments)
+                    state.setdefault("response_output_parts", []).append(text)
+                    out.extend(chat_completion_stream_chunk(request_id, model, {"content": text}))
                 continue
             key = response_stream_tool_call_key(data, item)
             index = response_stream_tool_call_index(state, key)
@@ -3160,6 +3211,11 @@ def responses_stream_chunk_to_chat(
             )
             continue
         if event_type in {"response.completed", "response.failed", "response.incomplete"}:
+            response_obj = data.get("response") if isinstance(data.get("response"), dict) else {}
+            completed_text = extract_responses_output_text(response_obj)
+            if completed_text and not state.get("response_output_parts"):
+                state.setdefault("response_output_parts", []).append(completed_text)
+                out.extend(chat_completion_stream_chunk(request_id, model, {"content": completed_text}))
             finish_reason = "tool_calls" if state.get("tool_calls_seen") else "stop"
             out.extend(chat_completion_stream_chunk(request_id, model, {}, finish_reason, response_stream_usage(data)))
             continue
@@ -3220,7 +3276,7 @@ class StreamFormatAdapter:
         return response_completed_event(self.request_id, self.model)
 
     def observe_native_chunk(self, chunk: bytes) -> None:
-        if self.client_kind != "responses":
+        if self.client_kind not in {"chat", "responses"}:
             return
         self.observe_buffer += chunk
         complete, self.observe_buffer = pop_complete_sse_events(self.observe_buffer)
@@ -3228,6 +3284,9 @@ class StreamFormatAdapter:
             self.observe_native_events(complete)
 
     def observe_native_events(self, chunk: bytes) -> None:
+        if self.client_kind == "chat":
+            self.observe_native_chat_events(chunk)
+            return
         for payload in iter_sse_data_payloads(chunk.decode("utf-8", "ignore")):
             if payload == "[DONE]":
                 continue
@@ -3246,17 +3305,54 @@ class StreamFormatAdapter:
                 content = item.get("content") if isinstance(item, dict) else None
                 for fragment in iter_text_fragments(content):
                     self.state.setdefault("native_response_text_parts", []).append(fragment)
+            elif event_type == "response.completed":
+                response_obj = data.get("response") if isinstance(data.get("response"), dict) else {}
+                completed_text = extract_responses_output_text(response_obj)
+                if completed_text:
+                    self.state.setdefault("native_response_text_parts", []).append(completed_text)
+                output = response_obj.get("output") if isinstance(response_obj, dict) else None
+                if isinstance(output, list):
+                    for output_item in output:
+                        if isinstance(output_item, dict) and str(output_item.get("type") or "") == "function_call":
+                            self.state["native_tool_calls_seen"] = True
             if delta:
                 self.state.setdefault("native_response_text_parts", []).append(str(delta))
+
+    def observe_native_chat_events(self, chunk: bytes) -> None:
+        for payload in iter_sse_data_payloads(chunk.decode("utf-8", "ignore")):
+            if payload == "[DONE]":
+                continue
+            try:
+                data = json.loads(payload)
+            except Exception:
+                continue
+            for choice in data.get("choices") or []:
+                if not isinstance(choice, dict):
+                    continue
+                delta_obj = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+                message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+                content = delta_obj.get("content") if "content" in delta_obj else message.get("content")
+                if content:
+                    self.state.setdefault("native_response_text_parts", []).append(str(content))
+                if delta_obj.get("tool_calls") or message.get("tool_calls"):
+                    self.state["native_tool_calls_seen"] = True
 
     def tool_call_observed(self) -> bool:
         if self.state.get("native_tool_calls_seen"):
             return True
+        if self.state.get("tool_calls_seen"):
+            return True
         tool_calls = self.state.get("response_tool_calls")
         return isinstance(tool_calls, dict) and bool(tool_calls)
 
+    def output_observed(self) -> bool:
+        for key in ("native_response_text_parts", "response_output_parts"):
+            if any(str(part).strip() for part in (self.state.get(key) or [])):
+                return True
+        return self.tool_call_observed()
+
     def tool_loop_detected(self) -> bool:
-        text = " ".join(self.state.get("native_response_text_parts") or [])
+        text = " ".join((self.state.get("native_response_text_parts") or []) + (self.state.get("response_output_parts") or []))
         return tool_loop_text_detected(text)
 
 
@@ -3287,7 +3383,7 @@ def model_fetch_client_profiles(provider: dict[str, Any]) -> list[str]:
 async def fetch_models(provider: dict[str, Any]) -> list[str]:
     last_error: Exception | None = None
     empty_success = False
-    async with httpx.AsyncClient(timeout=httpx.Timeout(PROBE_TIMEOUT_SECONDS), follow_redirects=True) as client:
+    async with provider_http_client(provider, PROBE_TIMEOUT_SECONDS) as client:
         for url in upstream_urls(provider, "/models"):
             for profile in model_fetch_client_profiles(provider):
                 try:
@@ -3595,6 +3691,51 @@ def response_probe_failure_result(
     }
 
 
+def responses_stream_probe_signal(text: str) -> dict[str, Any]:
+    result: dict[str, Any] = {"event_stream": False, "output_seen": False, "completed_seen": False, "error_seen": False, "sample": ""}
+    for payload in iter_sse_data_payloads(text or ""):
+        result["event_stream"] = True
+        if payload == "[DONE]":
+            result["completed_seen"] = True
+            continue
+        try:
+            data = json.loads(payload)
+        except Exception:
+            continue
+        event_type = str(data.get("type") or "")
+        if event_type in {"response.failed", "response.incomplete"} or response_has_error_json(data):
+            result["error_seen"] = True
+        item = data.get("item") if isinstance(data.get("item"), dict) else {}
+        if event_type.startswith("response.function_call") or str(item.get("type") or "") == "function_call":
+            result["output_seen"] = True
+            result["sample"] = result.get("sample") or str(item.get("name") or "function_call")
+        delta = None
+        if event_type in {"response.output_text.delta", "response.output_text.annotation.added"}:
+            delta = data.get("delta") or data.get("text") or data.get("content")
+        if delta:
+            result["output_seen"] = True
+            result["sample"] = (str(result.get("sample") or "") + str(delta))[:300]
+        if event_type == "response.output_item.done":
+            for fragment in iter_text_fragments(item.get("content")):
+                if str(fragment).strip():
+                    result["output_seen"] = True
+                    result["sample"] = (str(result.get("sample") or "") + str(fragment))[:300]
+        if event_type == "response.completed":
+            result["completed_seen"] = True
+            response_obj = data.get("response") if isinstance(data.get("response"), dict) else {}
+            completed_text = extract_responses_output_text(response_obj)
+            if completed_text.strip():
+                result["output_seen"] = True
+                result["sample"] = (str(result.get("sample") or "") + completed_text)[:300]
+            output = response_obj.get("output") if isinstance(response_obj, dict) else None
+            if isinstance(output, list):
+                for output_item in output:
+                    if isinstance(output_item, dict) and str(output_item.get("type") or "") == "function_call":
+                        result["output_seen"] = True
+                        result["sample"] = result.get("sample") or str(output_item.get("name") or "function_call")
+    return result
+
+
 async def probe_standard_http_attempt(
     client: httpx.AsyncClient,
     provider: dict[str, Any],
@@ -3682,7 +3823,8 @@ async def probe_codex_responses_shape(
     headers["Accept"] = "text/event-stream"
     body = apply_responses_provider_defaults(codex_shape_diagnostic_body(actual_model), provider)
     response = None
-    first = b""
+    text = ""
+    latency_ms = 0
     for _ in range(2):
         async with client.stream("POST", url, headers=headers, json=body) as response:
             latency_ms = int((now() - start) * 1000)
@@ -3706,12 +3848,16 @@ async def probe_codex_responses_shape(
                     "sample": text[:300],
                     "endpoint_url": url,
                 }
-            first = b""
+            chunks: list[str] = []
             async for chunk in response.aiter_raw():
                 if chunk:
-                    first = chunk
-                    break
-            text = first.decode("utf-8", "ignore")[:2000] if first else ""
+                    chunks.append(chunk.decode("utf-8", "ignore"))
+                    text = "".join(chunks)
+                    signal = responses_stream_probe_signal(text)
+                    if signal.get("error_seen") or signal.get("output_seen") or signal.get("completed_seen"):
+                        break
+                    if len(text) > 6000:
+                        break
             break
     if not text:
         return {
@@ -3721,6 +3867,44 @@ async def probe_codex_responses_shape(
             "latency_ms": latency_ms,
             "sample": "",
             "endpoint_url": url,
+        }
+    signal = responses_stream_probe_signal(text)
+    if signal.get("event_stream"):
+        if signal.get("error_seen") or event_stream_probe_has_error(text):
+            reason = classify_error(response.status_code, text[:1000])
+            if reason == "invalid_request":
+                reason = "responses_request_shape_unverified"
+            return {
+                "healthy": False,
+                "reason": reason,
+                "shape_status": "probe_unverified" if reason == "responses_request_shape_unverified" else "codex_shape_verified",
+                "shape_invalid_required": RESPONSES_INVALID_REQUEST_CONFIRMATIONS if reason == "responses_request_shape_unverified" else None,
+                "status_code": response.status_code,
+                "latency_ms": latency_ms,
+                "sample": text[:300],
+                "endpoint_url": url,
+                "shape_verification_source": "diagnostic_codex_shape",
+            }
+        if not signal.get("output_seen"):
+            return {
+                "healthy": False,
+                "reason": "empty_response",
+                "status_code": response.status_code,
+                "latency_ms": latency_ms,
+                "sample": text[:300],
+                "endpoint_url": url,
+                "shape_status": "codex_shape_verified",
+                "shape_verification_source": "diagnostic_codex_shape",
+            }
+        return {
+            "healthy": True,
+            "reason": "ok",
+            "status_code": response.status_code,
+            "latency_ms": latency_ms,
+            "endpoint_url": url,
+            "sample": signal.get("sample", ""),
+            "shape_status": "codex_shape_verified",
+            "shape_verification_source": "diagnostic_codex_shape",
         }
     try:
         data = json.loads(text)
@@ -3787,7 +3971,7 @@ async def probe_one(provider: dict[str, Any], local_model: str, actual_model: st
     attempt_records: list[dict[str, Any]] = []
     last_result: dict[str, Any] | None = None
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(PROBE_TIMEOUT_SECONDS), follow_redirects=True) as client:
+        async with provider_http_client(provider, PROBE_TIMEOUT_SECONDS) as client:
             for attempt in attempts:
                 urls = upstream_urls(provider, attempt.get("path") or probe_cfg.get("path") or f"/{kind}")
                 if not urls:
@@ -4975,10 +5159,7 @@ async def relay_non_stream(
         start = now()
         endpoint_reasons: list[str] = []
         try:
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(provider.get("timeout_seconds") or REQUEST_TIMEOUT_SECONDS),
-                follow_redirects=True,
-            ) as client:
+            async with provider_http_client(provider, provider.get("timeout_seconds") or REQUEST_TIMEOUT_SECONDS) as client:
                 response = None
                 endpoint_url = ""
                 codex_compat_retry_used = False
@@ -5010,7 +5191,7 @@ async def relay_non_stream(
                 data = response.json()
             except Exception:
                 data = None
-            if 200 <= response.status_code < 300 and not response_has_error_json(data):
+            if 200 <= response.status_code < 300 and not response_has_error_json(data) and response_data_has_output(data, upstream_kind):
                 tool_call_observed = request_has_tools(body) and response_data_has_tool_call(data, upstream_kind)
                 await mark_runtime_success(
                     upstream_kind,
@@ -5045,7 +5226,7 @@ async def relay_non_stream(
                 if client_data is not None:
                     return JSONResponse(client_data, status_code=response.status_code)
                 return JSONResponse({"raw": text}, status_code=response.status_code)
-            reason = classify_error(response.status_code, text[:1000])
+            reason = "empty_response" if 200 <= response.status_code < 300 and not response_has_error_json(data) else classify_error(response.status_code, text[:1000])
             if not endpoint_reasons or endpoint_reasons[-1] != reason:
                 endpoint_reasons.append(reason)
             if should_verify_responses_request_shape(upstream_kind, endpoint_reasons):
@@ -5185,10 +5366,7 @@ async def relay_stream(
         endpoint_reasons: list[str] = []
 
         try:
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(provider.get("timeout_seconds") or REQUEST_TIMEOUT_SECONDS),
-                follow_redirects=True,
-            ) as client:
+            async with provider_http_client(provider, provider.get("timeout_seconds") or REQUEST_TIMEOUT_SECONDS) as client:
                 codex_compat_retry_used = False
                 for endpoint_url in upstream_urls(provider, upstream_path):
                     partial_retry_used = False
@@ -5262,26 +5440,6 @@ async def relay_stream(
                                 endpoint_reasons.append("empty_stream")
                                 break
 
-                            latency_ms = int((now() - start) * 1000)
-                            await mark_runtime_success(upstream_kind, model, chosen["provider_id"], latency_ms, bool(chosen.get("_codex_compat_adapter")))
-                            await append_request_log(
-                                {
-                                    "request_id": request_id,
-                                    "kind": kind,
-                                    "stream": True,
-                                    "requested_model": model,
-                                    "actual_model": chosen["actual_model"],
-                                    "provider_id": chosen["provider_id"],
-                                    "path": upstream_path,
-                                    "endpoint_url": endpoint_url,
-                                    "status_code": response.status_code,
-                                    "latency_ms": latency_ms,
-                                    "success": True,
-                                    "route_controls": controls,
-                                    "request_shape": request_shape(body, incoming_headers),
-                                    **route_fields,
-                                }
-                            )
                             stream_started = True
                             converted = stream_adapter.feed(first)
                             if converted:
@@ -5307,6 +5465,66 @@ async def relay_stream(
                                 if b"response.completed" in converted:
                                     response_completed = True
                                 yield converted
+                            latency_ms = int((now() - start) * 1000)
+                            if not stream_adapter.output_observed():
+                                await mark_runtime_failure(upstream_kind, model, chosen["provider_id"], "empty_response")
+                                await append_request_log(
+                                    {
+                                        "request_id": request_id,
+                                        "kind": kind,
+                                        "stream": True,
+                                        "requested_model": model,
+                                        "actual_model": chosen["actual_model"],
+                                        "provider_id": chosen["provider_id"],
+                                        "path": upstream_path,
+                                        "endpoint_url": endpoint_url,
+                                        "status_code": response.status_code,
+                                        "latency_ms": latency_ms,
+                                        "success": False,
+                                        "error_type": "empty_response",
+                                        "route_controls": controls,
+                                        "request_shape": request_shape(body, incoming_headers),
+                                        **route_fields,
+                                    }
+                                )
+                                if kind == "responses":
+                                    yield response_failed_event(
+                                        request_id,
+                                        model,
+                                        "empty_response",
+                                        "Upstream stream completed without output",
+                                    )
+                                elif kind == "chat":
+                                    yield b'data: {"error":{"message":"Upstream stream completed without output","type":"empty_response"}}\n\n'
+                                if not done_sent:
+                                    yield b"data: [DONE]\n\n"
+                                return
+                            await mark_runtime_success(
+                                upstream_kind,
+                                model,
+                                chosen["provider_id"],
+                                latency_ms,
+                                bool(chosen.get("_codex_compat_adapter")),
+                                stream_adapter.tool_call_observed(),
+                            )
+                            await append_request_log(
+                                {
+                                    "request_id": request_id,
+                                    "kind": kind,
+                                    "stream": True,
+                                    "requested_model": model,
+                                    "actual_model": chosen["actual_model"],
+                                    "provider_id": chosen["provider_id"],
+                                    "path": upstream_path,
+                                    "endpoint_url": endpoint_url,
+                                    "status_code": response.status_code,
+                                    "latency_ms": latency_ms,
+                                    "success": True,
+                                    "route_controls": controls,
+                                    "request_shape": request_shape(body, incoming_headers),
+                                    **route_fields,
+                                }
+                            )
                             if kind == "responses" and not response_completed:
                                 completion = stream_adapter.completion_event()
                                 if completion:

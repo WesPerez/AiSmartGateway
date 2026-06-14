@@ -211,6 +211,7 @@ def test_classify_error_prefers_semantic_reason(gateway):
         )
         == "provider_config_error"
     )
+    assert gateway.classify_error(403, "<!DOCTYPE html><title>Cloudflare blocked</title>") == "html_or_cloudflare"
 
 
 def test_with_channel_fields_treats_only_status_one_as_enabled(gateway):
@@ -245,6 +246,12 @@ def test_provider_headers_adds_responses_beta(gateway):
 
     assert headers["Authorization"] == "Bearer sk-upstream"
     assert headers["OpenAI-Beta"] == "responses=v1"
+
+
+def test_http_client_kwargs_includes_provider_proxy(gateway):
+    kwargs = gateway.http_client_kwargs({"proxy_url": "http://127.0.0.1:7890"}, 3)
+
+    assert kwargs["proxy"] == "http://127.0.0.1:7890"
 
 
 def test_anthropic_chat_body_from_openai_chat_body(gateway):
@@ -356,6 +363,44 @@ def test_upstream_request_headers_uses_discovered_client_profile_over_provider_h
     assert headers["Authorization"] == "Bearer sk-upstream"
     assert headers["User-Agent"] == "claude-cli/2.1.133"
     assert headers["anthropic-version"] == "2023-06-01"
+
+
+def test_responses_stream_completed_text_converts_to_chat_delta(gateway):
+    chunk = gateway.raw_response_sse_event(
+        "response.completed",
+        {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_1",
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                "output_text": "hello",
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "hello"}],
+                    }
+                ],
+            },
+        },
+    )
+
+    converted = gateway.responses_stream_chunk_to_chat(chunk, "gw_req", "good-model", {})
+
+    assert b'"content":"hello"' in converted
+    assert b'"finish_reason":"stop"' in converted
+
+
+def test_stream_adapter_detects_empty_native_responses(gateway):
+    adapter = gateway.StreamFormatAdapter({"kind": "responses"}, "responses", "gw_req", "good-model")
+
+    adapter.feed(
+        gateway.raw_response_sse_event(
+            "response.completed",
+            {"type": "response.completed", "response": {"id": "resp_1", "output": [], "output_text": ""}},
+        )
+    )
+
+    assert adapter.output_observed() is False
 
 
 def test_probe_cooldown_retries_responses_shape_quickly(gateway):
@@ -1979,7 +2024,11 @@ async def test_responses_probe_verifies_codex_shape_after_simple_probe_rejection
         return httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
-            text='event: response.completed\ndata: {"type":"response.completed","response":{"error":null}}\n\ndata: [DONE]\n\n',
+            text=(
+                'event: response.completed\n'
+                'data: {"type":"response.completed","response":{"error":null,"output_text":"ok","output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}]}}\n\n'
+                "data: [DONE]\n\n"
+            ),
         )
 
     respx.get("https://p1.example/v1/models").mock(return_value=httpx.Response(200, json={"data": [{"id": "good-model"}]}))
@@ -2107,7 +2156,7 @@ async def test_non_stream_failover_records_transient_failure(gateway, monkeypatc
 
     with respx.mock:
         respx.post("https://p1.example/v1/chat/completions").mock(return_value=httpx.Response(500, json={"error": "down"}))
-        p2_route = respx.post("https://p2.example/v1/chat/completions").mock(return_value=httpx.Response(200, json={"id": "ok"}))
+        p2_route = respx.post("https://p2.example/v1/chat/completions").mock(return_value=httpx.Response(200, json=chat_probe_response()))
         response = await gateway.relay_non_stream(
             "/chat/completions",
             {"model": "good-model", "messages": [{"role": "user", "content": "ping"}]},
@@ -2170,7 +2219,7 @@ async def test_non_stream_uses_paid_fallback_only_after_primary_fails(gateway, m
             return_value=httpx.Response(500, json={"error": "down"})
         )
         paid_route = respx.post("https://paid.example/v1/chat/completions").mock(
-            return_value=httpx.Response(200, json={"id": "ok"})
+            return_value=httpx.Response(200, json=chat_probe_response())
         )
         response = await gateway.relay_non_stream(
             "/chat/completions",
@@ -2234,7 +2283,16 @@ async def test_non_stream_uses_paid_fallback_after_responses_invalid_request(gat
         respx.post("https://primary-alt.example/v1/responses").mock(
             return_value=httpx.Response(400, json={"error": {"message": "invalid codex request", "code": "invalid_responses_request"}})
         )
-        paid_route = respx.post("https://paid.example/v1/responses").mock(return_value=httpx.Response(200, json={"id": "paid-ok"}))
+        paid_route = respx.post("https://paid.example/v1/responses").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "id": "paid-ok",
+                    "output_text": "ok",
+                    "output": [{"type": "message", "content": [{"type": "output_text", "text": "ok"}]}],
+                },
+            )
+        )
         response = await gateway.relay_non_stream(
             "/responses",
             {"model": "good-model", "input": "ping", "stream": False},
@@ -2291,10 +2349,22 @@ async def test_non_stream_respects_forced_provider_and_no_paid(gateway, monkeypa
 
     with respx.mock:
         primary_route = respx.post("https://primary.example/v1/chat/completions").mock(
-            return_value=httpx.Response(200, json={"id": "primary-ok"})
+            return_value=httpx.Response(
+                200,
+                json={
+                    "id": "primary-ok",
+                    "choices": [{"message": {"role": "assistant", "content": "primary ok"}, "finish_reason": "stop"}],
+                },
+            )
         )
         paid_route = respx.post("https://paid.example/v1/chat/completions").mock(
-            return_value=httpx.Response(200, json={"id": "paid-ok"})
+            return_value=httpx.Response(
+                200,
+                json={
+                    "id": "paid-ok",
+                    "choices": [{"message": {"role": "assistant", "content": "paid ok"}, "finish_reason": "stop"}],
+                },
+            )
         )
         response = await gateway.relay_non_stream(
             "/chat/completions",
@@ -3035,8 +3105,8 @@ async def test_stream_forwards_chunks_after_first_chunk(gateway, monkeypatch):
         status_code = 200
 
         async def aiter_raw(self):
-            yield b"data: role\n\n"
-            yield b"data: content\n\n"
+            yield b'data: {"id":"chatcmpl_test","choices":[{"delta":{"role":"assistant"}}]}\n\n'
+            yield b'data: {"id":"chatcmpl_test","choices":[{"delta":{"content":"content"}}]}\n\n'
             yield b"data: [DONE]\n\n"
 
     class MultiChunkContext:
@@ -3070,7 +3140,11 @@ async def test_stream_forwards_chunks_after_first_chunk(gateway, monkeypatch):
         )
     ]
 
-    assert chunks == [b"data: role\n\n", b"data: content\n\n", b"data: [DONE]\n\n"]
+    assert chunks == [
+        b'data: {"id":"chatcmpl_test","choices":[{"delta":{"role":"assistant"}}]}\n\n',
+        b'data: {"id":"chatcmpl_test","choices":[{"delta":{"content":"content"}}]}\n\n',
+        b"data: [DONE]\n\n",
+    ]
 
 
 @pytest.mark.asyncio()
