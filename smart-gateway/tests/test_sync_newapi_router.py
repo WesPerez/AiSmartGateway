@@ -128,7 +128,10 @@ def test_provider_from_channel_adds_muyuan_client_headers(tmp_path):
     provider = sync.provider_from_channel(row)
 
     assert provider["base_url"] == "https://muyuan.do/v1"
-    assert provider["headers"] == {"User-Agent": "Claude-Code/1.0.0"}
+    assert provider["headers"]["User-Agent"] == "claude-cli/2.1.133"
+    assert provider["headers"]["anthropic-version"] == "2023-06-01"
+    assert "claude-code-20250219" in provider["headers"]["anthropic-beta"]
+    assert provider["chat_request_format"] == "anthropic"
 
 
 def test_sync_models_table_auto_hides_and_restores_gateway_models(tmp_path):

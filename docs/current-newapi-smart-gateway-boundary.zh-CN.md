@@ -42,6 +42,19 @@ Smart Gateway 的 `/v1/models` 不是所有上游 `/models` 的并集。当前�
 3. 至少一个 `chat` 或 `responses` 健康上游达到 `MIN_HEALTHY_PROVIDERS`，且探测返回内容不是空回复或 `ok` / `pong` 这类低信号文本。
 4. 同步到 New API Router channel 后未被 New API 模型管理手动禁用。
 
+当前 `model_include` 允许：
+
+```yaml
+model_include:
+  - deepseek-*
+  - gpt-*
+  - claude-*
+  - doubao-*
+  - glm-*
+  - grok-*
+  - mimo-*
+```
+
 当前运营屏蔽包含：
 
 ```yaml
@@ -51,6 +64,9 @@ model_exclude:
 ```
 
 这会隐藏 `gpt-5.4`、`gpt-5.4-mini` 以及 `claude-haiku-4-5-20251001` 这类长日期后缀模型。后续如果要恢复这些模型，需要删除对应规则、reload Smart Gateway，并重新同步 New API Router channel。
+
+2026-06-14 已放开 `grok-*`。放开只表示进入候选；最终是否公开仍取决于全量健康探测和 New API Router channel 同步结果。
+本次全量探测和同步后的实际公开 Grok 为 `grok-4.20-fast`、`grok-4.20-0309-non-reasoning`；其他已发现 Grok 变体因当前上游探测返回限流等非健康结果，仍不进入公开列表。
 
 ## 运维入口
 
@@ -124,6 +140,8 @@ Smart Gateway 后台是路由运维视图，不是第二套用户/令牌/订阅�
 当前默认探测不再使用 `ping`，而是要求上游回复一句短句。普通 Chat/Responses 探测即使 HTTP 2xx 且没有 error，也会提取模型输出文本并打质量分；低于 `PROBE_MIN_QUALITY_SCORE` 时标记为 `low_signal_response` 或 `empty_response`，不进入健康候选。这个判断只应用于合成探测，不会因为真实用户请求要求“只回答 ok”而污染健康状态。
 
 如果某上游只支持 Claude Code / Anthropic Messages / Chat 形态，但 `/responses` 返回 `not implemented`，不能因为加了客户端 header 就把 Responses 标健康。该上游应按实际可用接口展示。
+
+Muyuan 这类 Claude 聚合上游当前不能再只靠 `User-Agent` 伪装。它要求 `/chat/completions` 使用 Anthropic/Claude Code 风格 body，并带当前 Claude Code 客户端身份 header；Smart Gateway 用 provider 级 `chat_request_format: anthropic` 表达这类兼容策略。
 
 ## 自适应格式路由
 

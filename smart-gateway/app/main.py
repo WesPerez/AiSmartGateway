@@ -36,6 +36,7 @@ MASTER_API_KEY = os.getenv("MASTER_API_KEY", "")
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 PROBE_INTERVAL_SECONDS = int(os.getenv("PROBE_INTERVAL_SECONDS", "60"))
 PROBE_TIMEOUT_SECONDS = float(os.getenv("PROBE_TIMEOUT_SECONDS", "12"))
+PROBE_CONCURRENCY = max(1, int(os.getenv("PROBE_CONCURRENCY", "6")))
 REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "120"))
 MAX_RETRIES_PER_REQUEST = int(os.getenv("MAX_RETRIES_PER_REQUEST", "8"))
 MIN_HEALTHY_PROVIDERS = int(os.getenv("MIN_HEALTHY_PROVIDERS", "1"))
@@ -66,10 +67,12 @@ ROUTE_EXPLORATION_MAX_CANDIDATES = max(0, int(os.getenv("ROUTE_EXPLORATION_MAX_C
 ALLOW_GATEWAY_PROVIDER_WRITE = os.getenv("ALLOW_GATEWAY_PROVIDER_WRITE", "false").lower() == "true"
 DECLARED_ROUTE_SOURCES = {"declared", "upstream_models+declared", "model_map", "canonical_alias_from_declared"}
 SHADOW_ROUTE_SOURCES = {"upstream_models", *DECLARED_ROUTE_SOURCES}
+PROBE_STRATEGY_VERSION = "multi-profile-v1"
 
 CONFIG_LOCK = asyncio.Lock()
 STATE_LOCK = asyncio.Lock()
 REQUEST_LOG_LOCK = asyncio.Lock()
+PROBE_RUN_LOCK = asyncio.Lock()
 NEWAPI_DB = Path(os.getenv("NEWAPI_DB", "/newapi-data/one-api.db"))
 
 CONFIG: dict[str, Any] = {}
@@ -365,6 +368,8 @@ def provider_signature(provider: dict[str, Any]) -> str:
         "base_urls": provider.get("base_urls") or [],
         "api_key": provider.get("api_key"),
         "headers": provider.get("headers") or {},
+        "chat_request_format": provider.get("chat_request_format") or "",
+        "probe_strategy_version": PROBE_STRATEGY_VERSION,
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
 
@@ -440,7 +445,7 @@ def probe_cooldown_seconds(reason: str | None, healthy: bool) -> int:
         return RESPONSES_INVALID_REQUEST_COOLDOWN_SECONDS
     if reason in {"not_found", "model_unsupported"}:
         return PROBE_UNSUPPORTED_TTL_SECONDS
-    if reason == "auth_or_forbidden":
+    if reason in {"auth_or_forbidden", "client_restricted"}:
         return PROBE_AUTH_TTL_SECONDS
     if reason == "quota":
         return PROBE_QUOTA_TTL_SECONDS
@@ -494,8 +499,9 @@ def preserve_probe_state(new_item: dict[str, Any], previous: dict[str, Any] | No
             "actual_model": new_item["actual_model"],
             "source": new_item.get("source"),
             "kind": new_item["kind"],
-            "request_format": new_item["request_format"],
-            "probe_path": new_item["probe_path"],
+            "request_format": preserved.get("request_format") or new_item["request_format"],
+            "client_profile": preserved.get("client_profile") or new_item.get("client_profile") or "default",
+            "probe_path": preserved.get("probe_path") or new_item["probe_path"],
             "priority": new_item["priority"],
             "weight": new_item["weight"],
             "route_group": new_item.get("route_group", "primary"),
@@ -779,6 +785,7 @@ def health_policy_summary() -> dict[str, Any]:
     return {
         "probe_interval_seconds": PROBE_INTERVAL_SECONDS,
         "probe_timeout_seconds": PROBE_TIMEOUT_SECONDS,
+        "probe_concurrency": PROBE_CONCURRENCY,
         "probe_max_per_cycle": PROBE_MAX_PER_CYCLE,
         "probe_on_startup": PROBE_ON_STARTUP,
         "models_refresh_seconds": MODELS_REFRESH_SECONDS,
@@ -787,6 +794,9 @@ def health_policy_summary() -> dict[str, Any]:
         "health_fresh_ttl_seconds": HEALTH_FRESH_TTL_SECONDS,
         "probe_content_quality_check": PROBE_CONTENT_QUALITY_CHECK,
         "probe_min_quality_score": PROBE_MIN_QUALITY_SCORE,
+        "probe_strategy_version": PROBE_STRATEGY_VERSION,
+        "probe_chat_profiles": ["openai/default", "openai/codex", "anthropic/default", "anthropic/claude-cli", "anthropic/claude-code"],
+        "probe_responses_profiles": ["openai/default", "openai/codex", "codex/diagnostic"],
         "adaptive_format_routing": ADAPTIVE_FORMAT_ROUTING,
         "adapter_latency_penalty_ms": ADAPTER_LATENCY_PENALTY_MS,
         "chat_path": chat_probe.get("path") or "/chat/completions",
@@ -900,6 +910,7 @@ def validate_provider_item(item: dict[str, Any], index: int) -> dict[str, Any]:
         "model_filters": item.get("model_filters") if isinstance(item.get("model_filters"), list) else [],
         "models_from_declared_only": bool(item.get("models_from_declared_only", False)),
         "headers": item.get("headers") if isinstance(item.get("headers"), dict) else {},
+        "chat_request_format": str(item.get("chat_request_format") or "openai").strip(),
     }
     return normalized
 
@@ -951,6 +962,7 @@ def provider_headers(
     incoming_headers: dict[str, str] | None = None,
     kind: str | None = None,
     extra_headers: dict[str, str] | None = None,
+    extra_headers_override: bool = False,
 ) -> dict[str, str]:
     headers = {
         "Authorization": f"Bearer {provider['api_key']}",
@@ -962,13 +974,75 @@ def provider_headers(
             set_header(headers, key, value)
     if kind == "responses" and not any(key.lower() == "openai-beta" for key in headers):
         set_header(headers, "OpenAI-Beta", "responses=v1")
-    for key, value in (extra_headers or {}).items():
-        if value:
+    if extra_headers_override:
+        for key, value in (provider.get("headers") or {}).items():
             set_header(headers, str(key), str(value))
-    for key, value in (provider.get("headers") or {}).items():
-        set_header(headers, str(key), str(value))
+        for key, value in (extra_headers or {}).items():
+            if value:
+                set_header(headers, str(key), str(value))
+    else:
+        for key, value in (extra_headers or {}).items():
+            if value:
+                set_header(headers, str(key), str(value))
+        for key, value in (provider.get("headers") or {}).items():
+            set_header(headers, str(key), str(value))
     set_header(headers, "Authorization", f"Bearer {provider['api_key']}")
     return headers
+
+
+def chat_request_format(item: dict[str, Any] | None) -> str:
+    value = str((item or {}).get("chat_request_format") or (item or {}).get("request_format") or "openai").strip().lower()
+    if value in {"anthropic", "anthropic-chat", "claude", "claude-code"}:
+        return "anthropic"
+    return "openai"
+
+
+def request_format_label(provider: dict[str, Any], kind: str) -> str:
+    if kind == "chat" and chat_request_format(provider) == "anthropic":
+        return "anthropic-chat"
+    if kind == "responses":
+        return "openai-responses"
+    return "openai-compatible"
+
+
+def anthropic_chat_default_headers() -> dict[str, str]:
+    return {
+        "anthropic-version": "2023-06-01",
+        "anthropic-beta": "claude-code-20250219,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14",
+    }
+
+
+def normalize_client_profile(profile: Any) -> str:
+    value = str(profile or "default").strip().lower().replace("_", "-")
+    aliases = {
+        "": "default",
+        "none": "default",
+        "provider": "default",
+        "configured": "default",
+        "claudecode": "claude-code",
+        "claude-code-cli": "claude-code",
+        "claudecli": "claude-cli",
+        "codex-cli": "codex",
+        "codex-exec": "codex",
+    }
+    return aliases.get(value, value)
+
+
+def client_profile_headers(profile: Any, request_id: str | None = None, stream: bool = False) -> dict[str, str]:
+    normalized = normalize_client_profile(profile)
+    if normalized == "codex":
+        return codex_compat_adapter_headers(request_id or f"gw_probe_{uuid.uuid4().hex[:12]}", stream)
+    if normalized == "claude-cli":
+        return {"User-Agent": "claude-cli/2.1.133", **anthropic_chat_default_headers()}
+    if normalized == "claude-code":
+        return {"User-Agent": "Claude-Code/1.0.0", **anthropic_chat_default_headers()}
+    if normalized == "anthropic":
+        return anthropic_chat_default_headers()
+    return {}
+
+
+def client_profile_overrides_provider_headers(profile: Any) -> bool:
+    return normalize_client_profile(profile) not in {"default", "anthropic"}
 
 
 def request_shape(body: dict[str, Any], incoming_headers: dict[str, str] | None = None) -> dict[str, Any]:
@@ -1190,6 +1264,20 @@ def classify_error(status_code: int, text: str) -> str:
     sample = (text or "").lower()
     if "quota" in sample or "balance" in sample or "insufficient" in sample or "额度" in sample or "余额" in sample:
         return "quota"
+    client_restricted = (
+        "client_restricted",
+        "client restricted",
+        "unsupported client",
+        "only support codex",
+        "only supports codex",
+        "only support claude",
+        "only supports claude",
+        "仅支持 codex",
+        "仅支持 claude",
+        "客户端受限",
+    )
+    if any(word in sample for word in client_restricted):
+        return "client_restricted"
     unsupported = (
         "not support",
         "unsupported",
@@ -1888,6 +1976,42 @@ def chat_tool_choice_from_any_tool_choice(tool_choice: Any) -> Any:
     return choice
 
 
+def anthropic_tools_from_any_tools(tools: Any) -> list[dict[str, Any]] | None:
+    response_tools = responses_tools_from_chat_tools(tools)
+    if response_tools is None:
+        return None
+    converted: list[dict[str, Any]] = []
+    for tool in response_tools:
+        if not isinstance(tool, dict) or str(tool.get("type") or "") != "function":
+            return None
+        name = str(tool.get("name") or "").strip()
+        if not name:
+            return None
+        converted.append(
+            {
+                "name": name,
+                "description": str(tool.get("description") or ""),
+                "input_schema": tool.get("parameters") if isinstance(tool.get("parameters"), dict) else {"type": "object", "properties": {}},
+            }
+        )
+    return converted
+
+
+def anthropic_tool_choice_from_any_tool_choice(tool_choice: Any) -> Any:
+    choice = responses_tool_choice_from_chat_tool_choice(tool_choice)
+    if choice is None:
+        return None
+    if isinstance(choice, str):
+        if choice == "required":
+            return {"type": "any"}
+        return {"type": choice}
+    if isinstance(choice, dict) and choice.get("type") == "function":
+        name = str(choice.get("name") or "").strip()
+        if name:
+            return {"type": "tool", "name": name}
+    return None
+
+
 def chat_image_url_part(part: dict[str, Any]) -> dict[str, Any] | None:
     part_type = str(part.get("type") or "")
     if part_type == "image_url":
@@ -1921,6 +2045,133 @@ def chat_image_url_part(part: dict[str, Any]) -> dict[str, Any] | None:
             item["image_url"]["detail"] = str(part.get("detail"))
         return item
     return None
+
+
+def anthropic_image_part_from_chat_image(part: dict[str, Any]) -> dict[str, Any] | None:
+    image_part = chat_image_url_part(part)
+    if image_part is None:
+        return None
+    image_url = image_part.get("image_url") if isinstance(image_part.get("image_url"), dict) else {}
+    url = str(image_url.get("url") or "").strip()
+    if not url:
+        return None
+    source: dict[str, Any]
+    if url.startswith("data:") and ";base64," in url:
+        header, data = url.split(";base64,", 1)
+        media_type = header.removeprefix("data:") or "image/png"
+        source = {"type": "base64", "media_type": media_type, "data": data}
+    else:
+        source = {"type": "url", "url": url}
+    item = {"type": "image", "source": source}
+    if isinstance(image_url, dict) and image_url.get("detail"):
+        item["detail"] = str(image_url.get("detail"))
+    return item
+
+
+def anthropic_content_from_chat_content(content: Any) -> list[dict[str, Any]] | None:
+    if content is None:
+        return []
+    items = content if isinstance(content, list) else [content]
+    parts: list[dict[str, Any]] = []
+    for item in items:
+        if item is None:
+            continue
+        if isinstance(item, str):
+            parts.append({"type": "text", "text": item})
+            continue
+        if not isinstance(item, dict):
+            return None
+        content_type = str(item.get("type") or "")
+        if content_type in {"text", "input_text", "output_text"}:
+            parts.append({"type": "text", "text": str(item.get("text") or "")})
+            continue
+        if content_type in {"image_url", "input_image", "image"}:
+            image_part = anthropic_image_part_from_chat_image(item)
+            if image_part is None:
+                return None
+            parts.append(image_part)
+            continue
+        if content_type == "tool_result":
+            call_id = str(item.get("tool_use_id") or item.get("tool_call_id") or item.get("id") or "").strip()
+            output = tool_output_text(item.get("content"))
+            if not call_id or output is None:
+                return None
+            parts.append({"type": "tool_result", "tool_use_id": call_id, "content": output})
+            continue
+        return None
+    return parts
+
+
+def anthropic_chat_body_from_openai_chat_body(body: dict[str, Any], chosen: dict[str, Any]) -> dict[str, Any]:
+    messages = chat_messages_from_mixed_chat_messages(body.get("messages"), body)
+    if messages is None:
+        raise ValueError("chat body cannot be safely normalized for anthropic chat upstream")
+    tools = anthropic_tools_from_any_tools(body.get("tools"))
+    if tools is None:
+        raise ValueError("chat tools cannot be safely normalized for anthropic chat upstream")
+    req_body: dict[str, Any] = {"model": chosen["actual_model"], "messages": []}
+    system_parts: list[dict[str, Any]] = []
+    for message in messages:
+        role = str(message.get("role") or "user")
+        if role == "system":
+            text = safe_instruction_text(message.get("content"))
+            if text is None:
+                raise ValueError("chat system content cannot be safely normalized for anthropic chat upstream")
+            if text:
+                system_parts.append({"type": "text", "text": text})
+            continue
+        if role == "tool":
+            call_id = str(message.get("tool_call_id") or message.get("call_id") or "").strip()
+            output = tool_output_text(message.get("content"))
+            if not call_id or output is None:
+                raise ValueError("chat tool result cannot be safely normalized for anthropic chat upstream")
+            req_body["messages"].append({"role": "user", "content": [{"type": "tool_result", "tool_use_id": call_id, "content": output}]})
+            continue
+        if role not in {"user", "assistant"}:
+            raise ValueError("chat role cannot be safely normalized for anthropic chat upstream")
+        content_parts = anthropic_content_from_chat_content(message.get("content"))
+        if content_parts is None:
+            raise ValueError("chat content cannot be safely normalized for anthropic chat upstream")
+        if role == "assistant":
+            for call in message.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    raise ValueError("chat tool call cannot be safely normalized for anthropic chat upstream")
+                function = call.get("function") if isinstance(call.get("function"), dict) else {}
+                name = str(function.get("name") or "").strip()
+                if not name:
+                    raise ValueError("chat tool call name is required for anthropic chat upstream")
+                arguments = function.get("arguments")
+                if isinstance(arguments, str):
+                    try:
+                        arguments = json.loads(arguments) if arguments else {}
+                    except Exception:
+                        arguments = {"arguments": arguments}
+                if not isinstance(arguments, dict):
+                    arguments = {"value": arguments}
+                content_parts.append(
+                    {
+                        "type": "tool_use",
+                        "id": str(call.get("id") or f"call_{uuid.uuid4().hex[:16]}"),
+                        "name": name,
+                        "input": arguments,
+                    }
+                )
+        req_body["messages"].append({"role": role, "content": content_parts or [{"type": "text", "text": ""}]})
+    if system_parts:
+        req_body["system"] = system_parts
+    if "max_tokens" in body:
+        req_body["max_tokens"] = body.get("max_tokens")
+    elif "max_output_tokens" in body:
+        req_body["max_tokens"] = body.get("max_output_tokens")
+    if tools:
+        req_body["tools"] = tools
+        tool_choice = anthropic_tool_choice_from_any_tool_choice(body.get("tool_choice"))
+        if tool_choice is not None:
+            req_body["tool_choice"] = tool_choice
+    for key in ("temperature", "top_p", "stream", "stop", "metadata"):
+        if key in body:
+            req_body[key] = body[key]
+    return req_body
 
 
 def append_chat_user_message(messages: list[dict[str, Any]], content_parts: list[dict[str, Any]]) -> None:
@@ -2263,9 +2514,14 @@ def prepare_upstream_body(body: dict[str, Any], chosen: dict[str, Any], client_k
         else:
             req_body = deepcopy(body)
         req_body["model"] = chosen["actual_model"]
+        if upstream_kind == "chat" and chat_request_format(chosen) == "anthropic":
+            req_body = anthropic_chat_body_from_openai_chat_body(req_body, chosen)
         return req_body
     if client_kind == "responses" and upstream_kind == "chat":
-        return responses_body_to_chat_body(body, chosen)
+        req_body = responses_body_to_chat_body(body, chosen)
+        if chat_request_format(chosen) == "anthropic":
+            req_body = anthropic_chat_body_from_openai_chat_body(req_body, chosen)
+        return req_body
     if client_kind == "chat" and upstream_kind == "responses":
         if chosen.get("_codex_compat_adapter"):
             return normalize_responses_upstream_body(chat_body_to_codex_compat_responses_body(body, chosen), chosen)
@@ -2281,8 +2537,20 @@ def upstream_request_headers(
     request_id: str,
     stream: bool,
 ) -> dict[str, str]:
-    extra_headers = codex_compat_adapter_headers(request_id, stream) if chosen.get("_codex_compat_adapter") else None
-    return provider_headers(provider, incoming_headers, upstream_kind, extra_headers)
+    extra_headers: dict[str, str] = {}
+    if upstream_kind == "chat" and chat_request_format(chosen) == "anthropic":
+        extra_headers.update(anthropic_chat_default_headers())
+    profile = normalize_client_profile(chosen.get("client_profile") or chosen.get("probe_client_profile"))
+    extra_headers.update(client_profile_headers(profile, request_id, stream))
+    if chosen.get("_codex_compat_adapter"):
+        extra_headers.update(codex_compat_adapter_headers(request_id, stream))
+    return provider_headers(
+        provider,
+        incoming_headers,
+        upstream_kind,
+        extra_headers,
+        extra_headers_override=client_profile_overrides_provider_headers(profile) or bool(chosen.get("_codex_compat_adapter")),
+    )
 
 
 def can_retry_with_codex_compat_adapter(
@@ -2878,18 +3146,41 @@ def convert_stream_chunk_for_client(
     return chunk
 
 
+def model_fetch_client_profiles(provider: dict[str, Any]) -> list[str]:
+    configured = [normalize_client_profile(item) for item in (provider.get("model_fetch_client_profiles") or []) if str(item).strip()]
+    profiles = [*configured, "default", "codex", "claude-cli", "claude-code"]
+    return list(dict.fromkeys(profiles))
+
+
 async def fetch_models(provider: dict[str, Any]) -> list[str]:
     last_error: Exception | None = None
+    empty_success = False
     async with httpx.AsyncClient(timeout=httpx.Timeout(PROBE_TIMEOUT_SECONDS), follow_redirects=True) as client:
         for url in upstream_urls(provider, "/models"):
-            try:
-                response = await client.get(url, headers=provider_headers(provider))
-                if response.status_code >= 400:
-                    raise RuntimeError(f"models_http_{response.status_code}:{response.text[:200]}")
-                return extract_models_from_response(response.json())
-            except Exception as exc:
-                last_error = exc
-                continue
+            for profile in model_fetch_client_profiles(provider):
+                try:
+                    extra_headers = client_profile_headers(profile, stream=False)
+                    response = await client.get(
+                        url,
+                        headers=provider_headers(
+                            provider,
+                            kind=None,
+                            extra_headers=extra_headers,
+                            extra_headers_override=client_profile_overrides_provider_headers(profile),
+                        ),
+                    )
+                    if response.status_code >= 400:
+                        raise RuntimeError(f"models_http_{response.status_code}:{response.text[:200]}")
+                    models = extract_models_from_response(response.json())
+                    if models:
+                        MODEL_CACHE.setdefault(provider["id"], {})["client_profile"] = profile
+                        return models
+                    empty_success = True
+                except Exception as exc:
+                    last_error = exc
+                    continue
+    if empty_success:
+        return []
     raise RuntimeError(str(last_error or "models_fetch_failed"))
 
 
@@ -2926,6 +3217,323 @@ async def get_models_for_provider(provider: dict[str, Any], force: bool = False)
         return previous_models
 
 
+def add_probe_attempt(attempts: list[dict[str, Any]], attempt: dict[str, Any]) -> None:
+    attempt["client_profile"] = normalize_client_profile(attempt.get("client_profile"))
+    key = (
+        str(attempt.get("path") or ""),
+        str(attempt.get("request_format") or ""),
+        str(attempt.get("body_format") or ""),
+        str(attempt.get("client_profile") or ""),
+    )
+    existing = {
+        (
+            str(item.get("path") or ""),
+            str(item.get("request_format") or ""),
+            str(item.get("body_format") or ""),
+            str(item.get("client_profile") or ""),
+        )
+        for item in attempts
+    }
+    if key not in existing:
+        attempts.append(attempt)
+
+
+def probe_attempts_for_kind(provider: dict[str, Any], kind: str, probe_cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    path = probe_cfg.get("path") or f"/{kind}"
+    attempts: list[dict[str, Any]] = []
+    configured_chat_format = chat_request_format(provider)
+    configured_profiles = [normalize_client_profile(item) for item in (provider.get("probe_client_profiles") or []) if str(item).strip()]
+    if kind == "chat":
+        if configured_chat_format == "anthropic":
+            add_probe_attempt(
+                attempts,
+                {
+                    "name": "chat/anthropic/configured",
+                    "path": path,
+                    "request_format": "anthropic-chat",
+                    "body_format": "anthropic-chat",
+                    "client_profile": "default",
+                },
+            )
+        else:
+            add_probe_attempt(
+                attempts,
+                {
+                    "name": "chat/openai/default",
+                    "path": path,
+                    "request_format": "openai-compatible",
+                    "body_format": "openai-chat",
+                    "client_profile": "default",
+                },
+            )
+        for profile in configured_profiles:
+            add_probe_attempt(
+                attempts,
+                {
+                    "name": f"chat/{configured_chat_format}/{profile}",
+                    "path": path,
+                    "request_format": "anthropic-chat" if configured_chat_format == "anthropic" else "openai-compatible",
+                    "body_format": "anthropic-chat" if configured_chat_format == "anthropic" else "openai-chat",
+                    "client_profile": profile,
+                },
+            )
+        add_probe_attempt(
+            attempts,
+            {
+                "name": "chat/openai/default",
+                "path": path,
+                "request_format": "openai-compatible",
+                "body_format": "openai-chat",
+                "client_profile": "default",
+            },
+        )
+        add_probe_attempt(
+            attempts,
+            {
+                "name": "chat/openai/codex",
+                "path": path,
+                "request_format": "openai-compatible",
+                "body_format": "openai-chat",
+                "client_profile": "codex",
+            },
+        )
+        add_probe_attempt(
+            attempts,
+            {
+                "name": "chat/anthropic/default",
+                "path": path,
+                "request_format": "anthropic-chat",
+                "body_format": "anthropic-chat",
+                "client_profile": "anthropic",
+            },
+        )
+        add_probe_attempt(
+            attempts,
+            {
+                "name": "chat/anthropic/claude-cli",
+                "path": path,
+                "request_format": "anthropic-chat",
+                "body_format": "anthropic-chat",
+                "client_profile": "claude-cli",
+            },
+        )
+        add_probe_attempt(
+            attempts,
+            {
+                "name": "chat/anthropic/claude-code",
+                "path": path,
+                "request_format": "anthropic-chat",
+                "body_format": "anthropic-chat",
+                "client_profile": "claude-code",
+            },
+        )
+        return attempts
+    if kind == "responses":
+        for profile in configured_profiles:
+            add_probe_attempt(
+                attempts,
+                {
+                    "name": f"responses/openai/{profile}",
+                    "path": path,
+                    "request_format": "openai-responses",
+                    "body_format": "openai-responses",
+                    "client_profile": profile,
+                },
+            )
+        add_probe_attempt(
+            attempts,
+            {
+                "name": "responses/openai/default",
+                "path": path,
+                "request_format": "openai-responses",
+                "body_format": "openai-responses",
+                "client_profile": "default",
+            },
+        )
+        add_probe_attempt(
+            attempts,
+            {
+                "name": "responses/openai/codex",
+                "path": path,
+                "request_format": "openai-responses",
+                "body_format": "openai-responses",
+                "client_profile": "codex",
+            },
+        )
+        add_probe_attempt(
+            attempts,
+            {
+                "name": "responses/codex/diagnostic",
+                "path": path,
+                "request_format": "codex-responses",
+                "body_format": "codex-responses",
+                "client_profile": "codex",
+            },
+        )
+    return attempts
+
+
+def probe_body_for_attempt(
+    kind: str,
+    probe_cfg: dict[str, Any],
+    provider: dict[str, Any],
+    actual_model: str,
+    attempt: dict[str, Any],
+) -> dict[str, Any]:
+    body_format = str(attempt.get("body_format") or "")
+    if kind == "responses" and body_format == "codex-responses":
+        return apply_responses_provider_defaults(codex_shape_diagnostic_body(actual_model), provider)
+    body = deepcopy(probe_cfg.get("body") or {})
+    body["model"] = actual_model
+    if kind == "responses":
+        return apply_responses_provider_defaults(body, provider)
+    if kind == "chat" and body_format == "anthropic-chat":
+        return anthropic_chat_body_from_openai_chat_body(body, {"actual_model": actual_model})
+    if kind == "chat":
+        return chat_body_to_chat_upstream_body(body, {"actual_model": actual_model})
+    return body
+
+
+def probe_headers_for_attempt(provider: dict[str, Any], kind: str, attempt: dict[str, Any], stream: bool = False) -> dict[str, str]:
+    extra_headers: dict[str, str] = {}
+    body_format = str(attempt.get("body_format") or "")
+    profile = normalize_client_profile(attempt.get("client_profile"))
+    if kind == "chat" and body_format == "anthropic-chat":
+        extra_headers.update(anthropic_chat_default_headers())
+    extra_headers.update(client_profile_headers(profile, stream=stream))
+    return provider_headers(
+        provider,
+        kind=kind,
+        extra_headers=extra_headers,
+        extra_headers_override=client_profile_overrides_provider_headers(profile),
+    )
+
+
+def apply_probe_attempt_metadata(result: dict[str, Any], attempt: dict[str, Any]) -> dict[str, Any]:
+    result["request_format"] = attempt.get("request_format")
+    result["client_profile"] = normalize_client_profile(attempt.get("client_profile"))
+    result["probe_attempt"] = attempt.get("name")
+    result["probe_path"] = attempt.get("path")
+    result["probe_strategy_version"] = PROBE_STRATEGY_VERSION
+    if result.get("request_format") == "codex-responses" and result.get("healthy"):
+        result["responses_compat_mode"] = "codex"
+    return result
+
+
+def probe_attempt_record(attempt: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
+    record = {
+        "name": attempt.get("name"),
+        "request_format": attempt.get("request_format"),
+        "client_profile": normalize_client_profile(attempt.get("client_profile")),
+        "endpoint_url": result.get("endpoint_url"),
+        "healthy": bool(result.get("healthy")),
+        "reason": result.get("reason"),
+        "status_code": result.get("status_code"),
+        "latency_ms": result.get("latency_ms"),
+    }
+    sample = result.get("sample")
+    if sample:
+        record["sample"] = redact_text(sample, 300)
+    return record
+
+
+def response_probe_failure_result(
+    kind: str,
+    reason: str,
+    status_code: int | None,
+    latency_ms: int,
+    sample: str,
+    endpoint_url: str,
+) -> dict[str, Any]:
+    shape_status = ""
+    shape_invalid_required = None
+    if kind == "responses" and reason == "invalid_request":
+        reason = "responses_request_shape_unverified"
+        shape_status = "probe_unverified"
+        shape_invalid_required = RESPONSES_INVALID_REQUEST_CONFIRMATIONS
+    return {
+        "healthy": False,
+        "reason": reason,
+        "shape_status": shape_status,
+        "shape_invalid_required": shape_invalid_required,
+        "status_code": status_code,
+        "latency_ms": latency_ms,
+        "sample": sample[:300],
+        "endpoint_url": endpoint_url,
+    }
+
+
+async def probe_standard_http_attempt(
+    client: httpx.AsyncClient,
+    provider: dict[str, Any],
+    actual_model: str,
+    kind: str,
+    probe_cfg: dict[str, Any],
+    attempt: dict[str, Any],
+    url: str,
+) -> dict[str, Any]:
+    attempt_start = now()
+    try:
+        body = probe_body_for_attempt(kind, probe_cfg, provider, actual_model, attempt)
+    except Exception as exc:
+        return {
+            "healthy": False,
+            "reason": f"request_build:{type(exc).__name__}",
+            "latency_ms": int((now() - attempt_start) * 1000),
+            "sample": str(exc)[:300],
+            "endpoint_url": url,
+        }
+    partial_retry_used = False
+    while True:
+        response = await client.post(url, headers=probe_headers_for_attempt(provider, kind, attempt, bool(body.get("stream", False))), json=body)
+        text = response.text[:2000]
+        if not partial_retry_used and can_retry_with_partial(kind, response.status_code, text[:1000], body):
+            partial_retry_used = True
+            learn_responses_partial_default(provider)
+            body = apply_responses_provider_defaults(body, provider)
+            continue
+        break
+    latency_ms = int((now() - attempt_start) * 1000)
+    if response.status_code < 200 or response.status_code >= 300:
+        return response_probe_failure_result(kind, classify_error(response.status_code, text), response.status_code, latency_ms, text, url)
+    try:
+        data = response.json()
+    except Exception:
+        return {
+            "healthy": False,
+            "reason": "invalid_json_response",
+            "status_code": response.status_code,
+            "latency_ms": latency_ms,
+            "sample": text[:300],
+            "endpoint_url": url,
+        }
+    if response_has_error_json(data):
+        sample = json.dumps(data, ensure_ascii=False)[:1000]
+        return response_probe_failure_result(kind, classify_error(response.status_code, sample), response.status_code, latency_ms, sample, url)
+    quality = probe_content_quality_result(data, kind)
+    if not quality.get("healthy"):
+        return {
+            "healthy": False,
+            "reason": quality.get("reason"),
+            "status_code": response.status_code,
+            "latency_ms": latency_ms,
+            "sample": quality.get("sample", ""),
+            "endpoint_url": url,
+            "quality_checked": quality.get("quality_checked"),
+            "quality_score": quality.get("quality_score"),
+        }
+    return {
+        "healthy": True,
+        "reason": "ok",
+        "status_code": response.status_code,
+        "latency_ms": latency_ms,
+        "endpoint_url": url,
+        "sample": quality.get("sample", ""),
+        "quality_checked": quality.get("quality_checked"),
+        "quality_score": quality.get("quality_score"),
+    }
+
+
 async def probe_codex_responses_shape(
     client: httpx.AsyncClient,
     provider: dict[str, Any],
@@ -2933,7 +3541,12 @@ async def probe_codex_responses_shape(
     url: str,
     start: float,
 ) -> dict[str, Any]:
-    headers = provider_headers(provider, codex_shape_diagnostic_headers(), "responses")
+    headers = provider_headers(
+        provider,
+        kind="responses",
+        extra_headers=codex_shape_diagnostic_headers(),
+        extra_headers_override=True,
+    )
     headers["Accept"] = "text/event-stream"
     body = apply_responses_provider_defaults(codex_shape_diagnostic_body(actual_model), provider)
     response = None
@@ -2996,6 +3609,29 @@ async def probe_codex_responses_shape(
             "sample": sample[:300],
             "endpoint_url": url,
         }
+    is_event_stream = "event:" in text or "data:" in text
+    if not is_event_stream:
+        if data is None:
+            return {
+                "healthy": False,
+                "reason": "invalid_json_response",
+                "status_code": response.status_code,
+                "latency_ms": latency_ms,
+                "sample": text[:300],
+                "endpoint_url": url,
+            }
+        quality = probe_content_quality_result(data, "responses")
+        if not quality.get("healthy"):
+            return {
+                "healthy": False,
+                "reason": quality.get("reason"),
+                "status_code": response.status_code,
+                "latency_ms": latency_ms,
+                "sample": quality.get("sample", ""),
+                "endpoint_url": url,
+                "quality_checked": quality.get("quality_checked"),
+                "quality_score": quality.get("quality_score"),
+            }
     return {
         "healthy": True,
         "reason": "ok",
@@ -3014,95 +3650,62 @@ async def probe_one(provider: dict[str, Any], local_model: str, actual_model: st
     if kind == "responses" and not ENABLE_RESPONSES_PROBE:
         return {"healthy": False, "reason": "responses_probe_disabled"}
 
-    body = deepcopy(probe_cfg.get("body") or {})
-    body["model"] = actual_model
-    if kind == "responses":
-        apply_responses_provider_defaults(body, provider)
     start = now()
+    attempts = probe_attempts_for_kind(provider, kind, probe_cfg)
+    attempt_records: list[dict[str, Any]] = []
     last_result: dict[str, Any] | None = None
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(PROBE_TIMEOUT_SECONDS), follow_redirects=True) as client:
-            for url in upstream_urls(provider, probe_cfg.get("path") or f"/{kind}"):
-                response = await client.post(url, headers=provider_headers(provider, kind=kind), json=body)
-                if can_retry_with_partial(kind, response.status_code, response.text[:1000], body):
-                    learn_responses_partial_default(provider)
-                    body = apply_responses_provider_defaults(body, provider)
-                    response = await client.post(url, headers=provider_headers(provider, kind=kind), json=body)
-                latency_ms = int((now() - start) * 1000)
-                text = response.text[:2000]
-                if response.status_code < 200 or response.status_code >= 300:
-                    reason = classify_error(response.status_code, text)
-                    if kind == "responses" and reason == "invalid_request":
-                        reason = "responses_request_shape_unverified"
-                        diagnostic = await probe_codex_responses_shape(client, provider, actual_model, url, start)
-                        if diagnostic.get("healthy"):
-                            return diagnostic
-                        last_result = diagnostic
-                        continue
-                    last_result = {
-                        "healthy": False,
-                        "reason": reason,
-                        "shape_status": "probe_unverified" if kind == "responses" and reason == "responses_request_shape_unverified" else "",
-                        "shape_invalid_required": RESPONSES_INVALID_REQUEST_CONFIRMATIONS if kind == "responses" and reason == "responses_request_shape_unverified" else None,
-                        "status_code": response.status_code,
-                        "latency_ms": latency_ms,
-                        "sample": text[:300],
-                        "endpoint_url": url,
-                    }
+            for attempt in attempts:
+                urls = upstream_urls(provider, attempt.get("path") or probe_cfg.get("path") or f"/{kind}")
+                if not urls:
+                    result = apply_probe_attempt_metadata(
+                        {
+                            "healthy": False,
+                            "reason": "no_endpoint",
+                            "latency_ms": int((now() - start) * 1000),
+                        },
+                        attempt,
+                    )
+                    attempt_records.append(probe_attempt_record(attempt, result))
+                    last_result = result
                     continue
-                data = response.json()
-                if response_has_error_json(data):
-                    sample = json.dumps(data, ensure_ascii=False)[:1000]
-                    reason = classify_error(response.status_code, sample)
-                    if kind == "responses" and reason == "invalid_request":
-                        reason = "responses_request_shape_unverified"
-                        diagnostic = await probe_codex_responses_shape(client, provider, actual_model, url, start)
-                        if diagnostic.get("healthy"):
-                            return diagnostic
-                        last_result = diagnostic
-                        continue
-                    last_result = {
-                        "healthy": False,
-                        "reason": reason,
-                        "shape_status": "probe_unverified" if kind == "responses" and reason == "responses_request_shape_unverified" else "",
-                        "shape_invalid_required": RESPONSES_INVALID_REQUEST_CONFIRMATIONS if kind == "responses" and reason == "responses_request_shape_unverified" else None,
-                        "status_code": response.status_code,
-                        "latency_ms": latency_ms,
-                        "sample": sample[:300],
-                        "endpoint_url": url,
-                    }
-                    continue
-                quality = probe_content_quality_result(data, kind)
-                if not quality.get("healthy"):
-                    return {
-                        "healthy": False,
-                        "reason": quality.get("reason"),
-                        "status_code": response.status_code,
-                        "latency_ms": latency_ms,
-                        "sample": quality.get("sample", ""),
-                        "endpoint_url": url,
-                        "quality_checked": quality.get("quality_checked"),
-                        "quality_score": quality.get("quality_score"),
-                    }
-                return {
-                    "healthy": True,
-                    "reason": "ok",
-                    "status_code": response.status_code,
-                    "latency_ms": latency_ms,
-                    "endpoint_url": url,
-                    "sample": quality.get("sample", ""),
-                    "quality_checked": quality.get("quality_checked"),
-                    "quality_score": quality.get("quality_score"),
-                }
+                for url in urls:
+                    attempt_start = now()
+                    if kind == "responses" and attempt.get("body_format") == "codex-responses":
+                        result = await probe_codex_responses_shape(client, provider, actual_model, url, attempt_start)
+                    else:
+                        result = await probe_standard_http_attempt(client, provider, actual_model, kind, probe_cfg, attempt, url)
+                    result = apply_probe_attempt_metadata(result, attempt)
+                    attempt_records.append(probe_attempt_record(attempt, result))
+                    if result.get("healthy"):
+                        result["latency_ms"] = int((now() - start) * 1000)
+                        result["probe_attempts"] = attempt_records
+                        result["probe_attempt_count"] = len(attempt_records)
+                        return result
+                    last_result = result
             if last_result:
+                last_result["latency_ms"] = int((now() - start) * 1000)
+                last_result["probe_attempts"] = attempt_records
+                last_result["probe_attempt_count"] = len(attempt_records)
                 return last_result
-            return {"healthy": False, "reason": "no_endpoint", "latency_ms": int((now() - start) * 1000)}
+            return {
+                "healthy": False,
+                "reason": "no_probe_attempts",
+                "latency_ms": int((now() - start) * 1000),
+                "probe_attempts": attempt_records,
+                "probe_attempt_count": len(attempt_records),
+                "probe_strategy_version": PROBE_STRATEGY_VERSION,
+            }
     except Exception as exc:
         return {
             "healthy": False,
             "reason": f"exception:{type(exc).__name__}",
             "latency_ms": int((now() - start) * 1000),
             "sample": str(exc)[:300],
+            "probe_attempts": attempt_records,
+            "probe_attempt_count": len(attempt_records),
+            "probe_strategy_version": PROBE_STRATEGY_VERSION,
         }
 
 
@@ -3128,13 +3731,77 @@ def probe_candidate_sort_key(candidate: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
+async def resolve_probe_candidate(candidate: dict[str, Any], run_probe: bool, semaphore: asyncio.Semaphore) -> tuple[str, str, str, dict[str, Any]]:
+    provider = candidate["provider"]
+    item = candidate["item"]
+    kind = candidate["kind"]
+    local_model = candidate["local_model"]
+    actual_model = candidate["actual_model"]
+    matrix_key = candidate["matrix_key"]
+    previous = candidate["previous"]
+    due = candidate["due"]
+    if run_probe:
+        async with semaphore:
+            result = await probe_one(provider, local_model, actual_model, kind)
+        item.update(
+            {
+                "healthy": bool(result.get("healthy")),
+                "reason": result.get("reason"),
+                "status_code": result.get("status_code"),
+                "latency_ms": result.get("latency_ms"),
+                "checked_at": int(now()),
+                "next_probe_at": int(now()) + probe_cooldown_seconds(result.get("reason"), bool(result.get("healthy"))),
+                "sample": result.get("sample", ""),
+                "quality_checked": result.get("quality_checked"),
+                "quality_score": result.get("quality_score"),
+                "request_format": result.get("request_format") or item.get("request_format"),
+                "client_profile": result.get("client_profile") or item.get("client_profile") or "default",
+                "probe_attempt": result.get("probe_attempt") or "",
+                "probe_attempts": result.get("probe_attempts") or [],
+                "probe_attempt_count": result.get("probe_attempt_count") or 0,
+                "probe_strategy_version": result.get("probe_strategy_version") or PROBE_STRATEGY_VERSION,
+                "probe_path": result.get("probe_path") or item.get("probe_path"),
+                "shape_status": result.get("shape_status") or "",
+                "shape_invalid_required": result.get("shape_invalid_required"),
+                "shape_verification_source": result.get("shape_verification_source") or "",
+                "responses_compat_mode": result.get("responses_compat_mode") or "",
+                "skipped": False,
+                "skip_reason": "",
+            }
+        )
+        if result.get("healthy") and runtime_failure_cooling_down(previous):
+            item = preserve_probe_state(item, previous)
+    else:
+        if previous is None:
+            item.update(
+                {
+                    "healthy": False,
+                    "reason": "probe_budget_exhausted" if due else "pending_probe",
+                    "status_code": None,
+                    "latency_ms": None,
+                    "checked_at": None,
+                    "next_probe_at": int(now()) + PROBE_INTERVAL_SECONDS,
+                    "sample": "",
+                    "skipped": True,
+                    "skip_reason": "probe_budget",
+                }
+            )
+        else:
+            item = preserve_probe_state(item, previous)
+    return kind, local_model, matrix_key, item
+
+
 async def probe_all(force: bool = False) -> None:
+    async with PROBE_RUN_LOCK:
+        await probe_all_once(force)
+
+
+async def probe_all_once(force: bool = False) -> None:
     global LAST_PROBE_AT
     await reload_config()
     old_health = deepcopy(HEALTH)
     new_health: dict[str, dict[str, dict[str, Any]]] = {"chat": {}, "responses": {}}
-    probes_run = 0
-    probe_limit = max(1, PROBE_MAX_PER_CYCLE)
+    probe_limit = 0 if force else max(1, PROBE_MAX_PER_CYCLE)
     candidates: list[dict[str, Any]] = []
     for provider in PROVIDERS:
         fetched = [] if provider.get("models_from_declared_only") else await get_models_for_provider(provider, force=force)
@@ -3156,7 +3823,7 @@ async def probe_all(force: bool = False) -> None:
                     "actual_model": actual_model,
                     "source": target.get("source"),
                     "kind": kind,
-                    "request_format": "openai-compatible",
+                    "request_format": request_format_label(provider, kind),
                     "probe_path": probe_cfg.get("path") or f"/{kind}",
                     "priority": provider["priority"],
                     "weight": provider["weight"],
@@ -3187,56 +3854,17 @@ async def probe_all(force: bool = False) -> None:
                 )
 
     candidates.sort(key=probe_candidate_sort_key)
-
+    semaphore = asyncio.Semaphore(PROBE_CONCURRENCY)
+    probes_scheduled = 0
+    tasks = []
     for candidate in candidates:
-        provider = candidate["provider"]
-        item = candidate["item"]
-        kind = candidate["kind"]
-        local_model = candidate["local_model"]
-        actual_model = candidate["actual_model"]
-        matrix_key = candidate["matrix_key"]
-        previous = candidate["previous"]
-        due = candidate["due"]
-        if due and probes_run < probe_limit:
-            result = await probe_one(provider, local_model, actual_model, kind)
-            probes_run += 1
-            item.update(
-                {
-                    "healthy": bool(result.get("healthy")),
-                    "reason": result.get("reason"),
-                    "status_code": result.get("status_code"),
-                    "latency_ms": result.get("latency_ms"),
-                    "checked_at": int(now()),
-                    "next_probe_at": int(now()) + probe_cooldown_seconds(result.get("reason"), bool(result.get("healthy"))),
-                    "sample": result.get("sample", ""),
-                    "quality_checked": result.get("quality_checked"),
-                    "quality_score": result.get("quality_score"),
-                    "shape_status": result.get("shape_status") or "",
-                    "shape_invalid_required": result.get("shape_invalid_required"),
-                    "shape_verification_source": result.get("shape_verification_source") or "",
-                    "skipped": False,
-                    "skip_reason": "",
-                }
-            )
-            if result.get("healthy") and runtime_failure_cooling_down(previous):
-                item = preserve_probe_state(item, previous)
-        else:
-            if previous is None:
-                item.update(
-                    {
-                        "healthy": False,
-                        "reason": "probe_budget_exhausted" if due else "pending_probe",
-                        "status_code": None,
-                        "latency_ms": None,
-                        "checked_at": None,
-                        "next_probe_at": int(now()) + PROBE_INTERVAL_SECONDS,
-                        "sample": "",
-                        "skipped": True,
-                        "skip_reason": "probe_budget",
-                    }
-                )
-            else:
-                item = preserve_probe_state(item, previous)
+        run_probe = False
+        if candidate["due"] and (force or probes_scheduled < probe_limit):
+            run_probe = True
+            probes_scheduled += 1
+        tasks.append(resolve_probe_candidate(candidate, run_probe, semaphore))
+
+    for kind, local_model, matrix_key, item in await asyncio.gather(*tasks):
         by_model = new_health.setdefault(kind, {}).setdefault(local_model, {})
         current = by_model.get(matrix_key)
         if current is None:
@@ -4043,6 +4671,8 @@ def log_route_fields(chosen: dict[str, Any], route_bucket: str | None = None) ->
         "fallback_only": bool(chosen.get("fallback_only", False)),
         "shadow": bool(chosen.get("_shadow", False)),
         "upstream_kind": chosen.get("_upstream_kind") or chosen.get("kind") or "",
+        "request_format": chosen.get("request_format") or "",
+        "client_profile": normalize_client_profile(chosen.get("client_profile")),
         "format_adapter": chosen.get("_format_adapter") or "native",
         "adapter_latency_penalty_ms": int(chosen.get("_adapter_latency_penalty_ms") or 0),
     }

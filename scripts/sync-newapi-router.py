@@ -80,7 +80,9 @@ VOLCES_CODING_DECLARED_MODELS = [
     "glm-5.1",
 ]
 MUYUAN_CLIENT_HEADERS = {
-    "User-Agent": "Claude-Code/1.0.0",
+    "User-Agent": "claude-cli/2.1.133",
+    "anthropic-version": "2023-06-01",
+    "anthropic-beta": "claude-code-20250219,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14",
 }
 
 
@@ -212,6 +214,13 @@ def provider_client_headers(name: str, base_url: str) -> dict[str, str]:
     return {}
 
 
+def provider_chat_request_format(name: str, base_url: str) -> str:
+    text = f"{name} {base_url}".lower()
+    if "muyuan.do" in text:
+        return "anthropic"
+    return ""
+
+
 def provider_from_channel(row: sqlite3.Row) -> dict[str, Any]:
     name = row["name"] or f"newapi_channel_{row['id']}"
     base_url, exact = normalize_base_url(row["base_url"] or "")
@@ -233,6 +242,9 @@ def provider_from_channel(row: sqlite3.Row) -> dict[str, Any]:
         "source": "new-api-channel",
         "new_api_channel_id": row["id"],
     }
+    chat_format = provider_chat_request_format(name, base_url)
+    if chat_format:
+        provider["chat_request_format"] = chat_format
     if exact:
         provider["base_url_exact"] = True
     base_urls = compatible_base_urls(name, base_url)

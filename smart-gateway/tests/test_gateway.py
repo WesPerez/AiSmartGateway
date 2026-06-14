@@ -203,6 +203,7 @@ def test_classify_error_prefers_semantic_reason(gateway):
         gateway.classify_error(400, '{"code":"MissingParameter","message":"missing tools.function parameter"}')
         == "client_invalid_input"
     )
+    assert gateway.classify_error(403, '{"error":"channel:client_restricted"}') == "client_restricted"
 
 
 def test_with_channel_fields_treats_only_status_one_as_enabled(gateway):
@@ -237,6 +238,117 @@ def test_provider_headers_adds_responses_beta(gateway):
 
     assert headers["Authorization"] == "Bearer sk-upstream"
     assert headers["OpenAI-Beta"] == "responses=v1"
+
+
+def test_anthropic_chat_body_from_openai_chat_body(gateway):
+    body = {
+        "model": "good-model",
+        "messages": [
+            {"role": "system", "content": "Be brief"},
+            {"role": "user", "content": "ping"},
+        ],
+        "tools": [{"type": "function", "function": {"name": "noop", "description": "No-op", "parameters": {"type": "object"}}}],
+        "tool_choice": {"type": "function", "function": {"name": "noop"}},
+        "max_tokens": 8,
+        "stream": False,
+    }
+
+    converted = gateway.anthropic_chat_body_from_openai_chat_body(body, {"actual_model": "actual-claude"})
+
+    assert converted["model"] == "actual-claude"
+    assert converted["system"] == [{"type": "text", "text": "Be brief"}]
+    assert converted["messages"] == [{"role": "user", "content": [{"type": "text", "text": "ping"}]}]
+    assert converted["tools"] == [{"name": "noop", "description": "No-op", "input_schema": {"type": "object"}}]
+    assert converted["tool_choice"] == {"type": "tool", "name": "noop"}
+    assert converted["max_tokens"] == 8
+
+
+@pytest.mark.asyncio()
+@respx.mock
+async def test_anthropic_chat_probe_uses_anthropic_body_and_headers(gateway):
+    await gateway.reload_config()
+    provider = {
+        "id": "p1",
+        "base_url": "https://p1.example/v1",
+        "api_key": "sk-p1",
+        "headers": {"User-Agent": "claude-cli/2.1.133"},
+        "chat_request_format": "anthropic",
+    }
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["headers"] = request.headers
+        seen["body"] = json.loads(request.content.decode())
+        return httpx.Response(200, json=chat_probe_response())
+
+    respx.post("https://p1.example/v1/chat/completions").mock(side_effect=handler)
+
+    result = await gateway.probe_one(provider, "good-model", "good-model", "chat")
+
+    assert result["healthy"] is True
+    assert seen["headers"]["user-agent"] == "claude-cli/2.1.133"
+    assert seen["headers"]["anthropic-version"] == "2023-06-01"
+    assert "claude-code-20250219" in seen["headers"]["anthropic-beta"]
+    assert seen["body"]["model"] == "good-model"
+    assert seen["body"]["messages"][0]["content"][0] == {
+        "type": "text",
+        "text": "Reply in one short sentence: gateway probe is working.",
+    }
+    assert result["request_format"] == "anthropic-chat"
+    assert result["client_profile"] == "default"
+
+
+@pytest.mark.asyncio()
+@respx.mock
+async def test_chat_probe_tries_claude_cli_profile_after_client_restriction(gateway):
+    await gateway.reload_config()
+    provider = {
+        "id": "p1",
+        "base_url": "https://p1.example/v1",
+        "api_key": "sk-p1",
+        "headers": {"User-Agent": "Claude-Code/1.0.0"},
+    }
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode())
+        seen.append({"headers": request.headers, "body": body})
+        user_agent = request.headers.get("user-agent", "")
+        content = ((body.get("messages") or [{}])[0].get("content"))
+        anthropic_body = isinstance(content, list) and content and content[0].get("type") == "text"
+        if anthropic_body and user_agent == "claude-cli/2.1.133":
+            return httpx.Response(200, json=chat_probe_response())
+        return httpx.Response(403, json={"error": "channel:client_restricted"})
+
+    route = respx.post("https://p1.example/v1/chat/completions").mock(side_effect=handler)
+
+    result = await gateway.probe_one(provider, "good-model", "good-model", "chat")
+
+    assert result["healthy"] is True
+    assert result["request_format"] == "anthropic-chat"
+    assert result["client_profile"] == "claude-cli"
+    assert route.call_count == 4
+    assert [item["reason"] for item in result["probe_attempts"][:3]] == [
+        "client_restricted",
+        "client_restricted",
+        "client_restricted",
+    ]
+    assert seen[-1]["headers"]["user-agent"] == "claude-cli/2.1.133"
+    assert seen[-1]["body"]["messages"][0]["content"][0]["text"] == "Reply in one short sentence: gateway probe is working."
+
+
+def test_upstream_request_headers_uses_discovered_client_profile_over_provider_header(gateway):
+    provider = {
+        "api_key": "sk-upstream",
+        "headers": {"User-Agent": "Claude-Code/1.0.0"},
+    }
+    chosen = {"request_format": "anthropic-chat", "client_profile": "claude-cli"}
+
+    headers = gateway.upstream_request_headers(provider, {}, "chat", chosen, "gw_req", False)
+
+    assert headers["Authorization"] == "Bearer sk-upstream"
+    assert headers["User-Agent"] == "claude-cli/2.1.133"
+    assert headers["anthropic-version"] == "2023-06-01"
 
 
 def test_probe_cooldown_retries_responses_shape_quickly(gateway):
@@ -1786,12 +1898,16 @@ async def test_responses_probe_verifies_codex_shape_after_simple_probe_rejection
     assert item["reason"] == "ok"
     assert item["shape_status"] == "codex_shape_verified"
     assert item["shape_verification_source"] == "diagnostic_codex_shape"
-    assert responses_route.call_count == 2
+    assert item["request_format"] == "codex-responses"
+    assert item["client_profile"] == "codex"
+    assert responses_route.call_count == 3
     assert seen_requests[0]["body"]["input"] == "Reply in one short sentence: gateway probe is working."
     assert seen_requests[0]["headers"]["openai-beta"] == "responses=v1"
-    assert seen_requests[1]["body"]["stream"] is True
-    assert "prompt_cache_key" in seen_requests[1]["body"]
+    assert seen_requests[1]["body"]["input"] == "Reply in one short sentence: gateway probe is working."
     assert "x-codex-turn-metadata" in seen_requests[1]["headers"]
+    assert seen_requests[2]["body"]["stream"] is True
+    assert "prompt_cache_key" in seen_requests[2]["body"]
+    assert "x-codex-turn-metadata" in seen_requests[2]["headers"]
 
 
 @pytest.mark.asyncio()

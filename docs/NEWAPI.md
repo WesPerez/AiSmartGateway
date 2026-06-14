@@ -131,8 +131,20 @@ models in New API model management; sync should respect those manual disables.
 
 The current public model list is additionally constrained by Smart Gateway
 `model_include` and `model_exclude`. These filters apply before health exposure
-and before the New API router channel ability sync. Current operational
-excludes include:
+and before the New API router channel ability sync. Current includes are:
+
+```yaml
+model_include:
+  - deepseek-*
+  - gpt-*
+  - claude-*
+  - doubao-*
+  - glm-*
+  - grok-*
+  - mimo-*
+```
+
+Current operational excludes include:
 
 ```yaml
 model_exclude:
@@ -146,6 +158,12 @@ requesting cached `gpt-5.4` models while the intended operational model was
 `claude-haiku-4-5-20251001` while keeping shorter aliases such as
 `claude-opus-4-8` visible. To re-enable those models, remove the matching
 exclude, reload Smart Gateway, and sync the New API router channel again.
+`grok-*` was added to the include list on 2026-06-14; Grok models still require
+normal health probe success before they are exposed.
+The full probe and router sync on 2026-06-14 exposed
+`grok-4.20-fast` and `grok-4.20-0309-non-reasoning`. Other discovered Grok
+variants stayed hidden because the currently reachable upstreams returned
+non-healthy probe results such as rate limiting.
 
 ## Health Detection Strategy
 
@@ -252,9 +270,17 @@ For upstreams that restrict accepted clients, provider-level headers may be
 used to force a compatible client identity. One Claude aggregation provider was
 observed returning a client-restricted error when probes looked like
 `python-httpx`; the sync script now preserves a provider-specific
-`User-Agent: Claude-Code/1.0.0` override for that source. This only fixes
-client identity for supported paths. If the same provider returns
-`not implemented` for `/responses`, it remains non-healthy for Responses.
+Claude Code identity override for that source.
+
+Current Muyuan behavior is stricter than the earlier UA-only workaround. Plain
+OpenAI Chat bodies are rejected even with a Claude Code-like UA. The working
+shape is Chat path `/chat/completions` with Anthropic/Claude Code-style body
+(`system`, Anthropic `messages`, `tools`/`tool_choice` when present) plus
+`User-Agent: claude-cli/2.1.133`, `anthropic-version`, and the Claude Code beta
+header. Smart Gateway represents this as `chat_request_format: anthropic` on
+the provider. This only fixes supported Chat-compatible paths. If the same
+provider returns `not implemented` or client restriction for `/responses`, it
+remains non-healthy for native Responses.
 
 ## Real Codex Shape Verification
 

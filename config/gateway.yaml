@@ -42,6 +42,7 @@ model_include:
   - claude-*
   - doubao-*
   - glm-*
+  - grok-*
   - mimo-*
 
 model_exclude:

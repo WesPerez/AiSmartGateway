@@ -726,6 +726,14 @@ Responses 的 `invalid_request` 特殊处理：
 - Chat：健康模型数恢复，旧的 `client_restricted/python-httpx` 从健康状态消失。
 - Responses：继续显示 `server_unavailable` / `not implemented`，这是正确的不可用状态，不应伪装成健康。
 
+2026-06-14 复查 Muyuan 时，上游策略已比上面旧结论更严格：
+
+- 仅改 `User-Agent` 不再足够；`Claude-Code/1.0.0`、`codex_exec/0.139.0`、浏览器 UA 和 curl UA 都会被 `channel:client_restricted` 拒绝。
+- 可用组合是 `/chat/completions` + Anthropic/Claude Code 风格 body + `User-Agent: claude-cli/2.1.133` + `anthropic-version` + Claude Code beta header。
+- 普通 OpenAI Chat body 即使换成 `claude-cli/2.1.133` 仍被拒绝。
+- Smart Gateway 增加 provider 级 `chat_request_format: anthropic`：Chat 探测和运行时 Chat 上游请求都会转换成 Anthropic body；Responses 客户端请求仍可安全降级到这个 Chat 上游后再转回 Responses。
+- 同步脚本识别 `muyuan.do` 时自动生成上述 header 和 `chat_request_format: anthropic`，避免下次从 New API 同步覆盖手工修复。
+
 ### `gpt-5.5` 请求为什么出现 `gpt-5.4`
 
 近期日志里出现一批 `gpt-5.4`，最初怀疑是 Gateway 把用户请求的 `gpt-5.5` 降级或串路由到了 `gpt-5.4`。
@@ -807,6 +815,7 @@ model_exclude:
 
 - `gpt-5.4*` 和 `*-20??????` 是临时运营屏蔽，不是模型永久不可用声明。
 - 这些规则会影响未来使用对应模型；恢复时需要删规则、reload、sync。
+- 2026-06-14 已将 `grok-*` 加入 `model_include`。这只让 Grok 进入候选集合；是否公开仍由健康探测和 New API Router channel 同步结果决定。本次全量探测后实际公开 `grok-4.20-fast` 和 `grok-4.20-0309-non-reasoning`，其他 Grok 变体因当前上游限流等非健康结果继续隐藏。
 - 对 Claude 聚合上游注入 `Claude-Code` UA 是针对该 provider 的兼容策略；它解决 Chat 客户端识别问题，但不改变 Responses `not implemented` 的事实。
 - Health UI 中“探测矩阵”不是公开模型列表；公开模型仍以 `/v1/models` 和 New API Router channel 同步结果为准。
 - 客户端如果缓存了旧模型列表，服务端已不再公开旧模型，但客户端可能仍短期继续发旧模型请求；这类请求应以 request log 的 `requested_model` 为准排查。
@@ -929,7 +938,7 @@ upstream_kind: 网关实际选择的上游接口格式
 
 - Volcengine `deepseek-v4-pro`：Responses stream 原生成功；Chat 请求实际选择 Responses 上游并 `responses_to_chat` 成功。
 - Fufu `mimo-v2-flash`：Chat 原生成功，Responses 原生成功。
-- Muyuan `claude-opus-4-8`：Responses 客户端请求非流式和流式均成功降级到 Chat 上游，再转回 Responses；provider 级 `User-Agent: Claude-Code/1.0.0` 继续解决该源的客户端限制。
+- Muyuan `claude-opus-4-8`：Responses 客户端请求非流式和流式均成功降级到 Chat 上游，再转回 Responses；该源现在需要 provider 级 `chat_request_format: anthropic`、`User-Agent: claude-cli/2.1.133` 和 Claude Code Anthropic headers，旧的 `User-Agent: Claude-Code/1.0.0` 已不够。
 - Anyrouter `gpt-5.5`：普通 Responses 小 JSON 仍返回 `invalid codex request`；Codex-compatible Chat -> Responses 转换已通过。自动路由不是按 Anyrouter 或模型强制，而是根据该 Responses health item 的 `responses_compat_mode=codex` / Codex shape 验证证据选择 `chat -> responses / codex_responses_to_chat`，成功后 health 保留 `responses_compat_mode=codex`。2026-06-14 真实回归中，带 tools 的 Chat stream 返回文本成功；强制 `tool_choice` 调用 `noop` 时，Anyrouter `/responses` 返回的 function_call 流事件已转成 Chat `tool_calls` delta。
 - 管理 API 暴露健康新鲜度字段。
 
