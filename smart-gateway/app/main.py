@@ -4496,19 +4496,26 @@ def adaptive_candidate_buckets(
     body: dict[str, Any],
     controls: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    combined: dict[str, list[dict[str, Any]]] = {name: [] for name in ROUTE_BUCKET_ORDER}
+    combined: dict[str, dict[str, list[dict[str, Any]]]] = {
+        name: {"native": [], "adapter": []} for name in ROUTE_BUCKET_ORDER
+    }
     upstream_kinds = [client_kind, "responses" if client_kind == "chat" else "chat"]
     for upstream_kind in upstream_kinds:
         for bucket in healthy_candidate_buckets(model, upstream_kind, controls):
-            target = combined.setdefault(bucket["name"], [])
+            bucket_items = combined.setdefault(bucket["name"], {"native": [], "adapter": []})
+            target = bucket_items["native" if upstream_kind == client_kind else "adapter"]
             for item in bucket["items"]:
                 if route_item_format_adapter_allowed(item, client_kind, upstream_kind, body):
                     target.append(annotate_route_item(item, client_kind, upstream_kind))
     buckets = []
     for name in ROUTE_BUCKET_ORDER:
-        items = combined.get(name) or []
-        if items:
-            buckets.append({"name": name, "items": sorted_route_bucket(items)})
+        bucket_items = combined.get(name) or {"native": [], "adapter": []}
+        native_items = bucket_items.get("native") or []
+        adapter_items = bucket_items.get("adapter") or []
+        if native_items:
+            buckets.append({"name": name, "items": sorted_route_bucket(native_items)})
+        if adapter_items:
+            buckets.append({"name": name, "items": sorted_route_bucket(adapter_items)})
     return buckets
 
 

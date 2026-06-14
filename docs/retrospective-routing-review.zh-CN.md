@@ -881,7 +881,7 @@ upstream_kind: 网关实际选择的上游接口格式
 ### 已执行优化
 
 1. 新增自适应格式路由，默认开启。
-2. 原生格式通过 `ADAPTER_LATENCY_PENALTY_MS` 获得偏好，默认 250ms；如果转换后的调整延迟仍更低，路由可以选择跨格式上游。
+2. 原生格式先通过 `ADAPTER_LATENCY_PENALTY_MS` 获得偏好，默认 250ms；2026-06-14 后进一步收紧为同一路由桶内 native 候选先于 adapter 候选，避免 Chat stream 已有健康 Chat 上游时仅因 Responses 探测延迟更低而先走 `responses_to_chat`。
 3. `/v1/responses` 可以在安全文本形态下选择健康 Chat 上游，再把 Chat 响应转回 Responses。
 4. `/v1/chat/completions` 可以在安全文本形态下选择健康 Responses 上游，再把 Responses 响应转回 Chat Completions。
 5. 普通小 JSON 跨格式转换仍拒绝工具调用、function calling、`reasoning`、`include`、`prompt_cache_key`、`previous_response_id`、Codex encrypted reasoning 等复杂字段；但已被证明为 Codex-compatible Responses 的 health item 可以走专用 `codex_responses_to_chat`，支持可映射的 OpenAI function tools/tool calls。
@@ -903,6 +903,7 @@ upstream_kind: 网关实际选择的上游接口格式
 21. 2026-06-14 排查 Claude Desktop 请求 `mimo-v2.5-pro` 的“一堆 422/报错”时，Gateway 请求日志中该模型最近大量请求是 `200`，且集中为客户端 `/v1/responses` 经 `chat_to_responses` 转到上游 `/chat/completions`。第一轮先修了 usage：Chat -> Responses 非流式和流式都把 `prompt_tokens` / `completion_tokens` 规范成 `input_tokens` / `output_tokens` / `total_tokens`，同时保留原字段；流式会把 usage 放进 `response.completed.response.usage`。如果上游没有给 usage，默认 `ADAPTER_SYNTHESIZE_USAGE=true` 会按转换后的上游请求体和实际输出文本/tool 参数生成带 `estimated:true` 的估算 usage，避免 New API 把成功请求落成 0 token 计费错误。
 22. 同一问题继续复查后确认，用户看到的 `422 format conversion error: NO OUTPUT IN RESPONSE` 还有更直接的格式原因：Chat -> Responses 流式适配旧逻辑只发 `response.output_text.delta`，最终补的 `response.completed.response` 只有状态和 usage，没有完整 `output`。New API 在把 OpenAI Responses 结果再转 Claude/Anthropic 时会检查 final response output，缺失就报 `NO OUTPUT IN RESPONSE`。修复改为：Chat -> Responses 流式结束时用累计文本生成 final message output 和 `output_text`；工具调用流用累计 function call 参数生成 final `function_call` output；空输出也保留一个空 message output，避免 final response 没有 output。
 23. 2026-06-14 排查 `https://elysiver.h-e.top`：该上游已同步为 `newapi_ch9_elysiver.h-e.top`，但本地 New API 渠道 `models` 字段为空，Gateway 之前只靠远端 `/models` 自动发现过 `gpt-5.5`。复查时远端 `/v1/models` 返回 `data: []`，直接请求 `gpt-5.5` 以及 34 个常见候选模型均返回 `503 model_not_found / No available channel for model ... under group codex-unstable (distributor)`。结论是：当前这把远端 distributor key 所属组没有可用模型，Gateway 不能把它判健康。优化为：`No available channel` 明确归类为 `model_unsupported`；运行时多 endpoint 都是模型不可用时保留 `model_unsupported`，不再折叠成 `all_endpoints_failed`；如果失败模型来自上游 `/models` 自动发现，则让该 provider 的模型缓存立即过期，下一轮强制重新拉取，避免旧 `gpt-5.5` 缓存继续误导。
+24. 2026-06-14 根据 `grok-4.20-fast` 真实请求日志继续收紧候选排序：同一个 Chat stream 请求中，Responses 健康项可能先以 `responses_to_chat` 被选中并遇到 522/Cloudflare，随后 native Chat fallback 成功。修复后同一路由桶内先试 native，再试 adapter；adapter 仍保留为跨格式兜底，不再压过健康 native。
 
 ### 当前健康含义
 

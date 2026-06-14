@@ -391,9 +391,10 @@ client kind: what the caller sent and expects back
 upstream kind: the provider endpoint Smart Gateway chooses
 ```
 
-Native routes get a lower score penalty, but the router may still choose a
-converted route when the adjusted latency is better. When the request body is a
-safe shape, Smart Gateway may adapt:
+Within the same route bucket, native routes are tried before converted routes.
+Converted routes remain available as fallback, but a lower adjusted latency no
+longer lets an adapter outrank a healthy native candidate for the same client
+format. When the request body is a safe shape, Smart Gateway may adapt:
 
 - `/v1/responses` client request -> healthy `/chat/completions` upstream ->
   converted back to a Responses response.
@@ -404,9 +405,9 @@ The plain small-JSON adapter intentionally refuses complex or lossy shapes such
 as tools, function calling, `reasoning`, `include`, `prompt_cache_key`,
 `previous_response_id`, and Codex-specific encrypted reasoning payloads. Those
 requests require either native compatibility or a dedicated compatibility mode.
-Adapted routes carry an `adapter_latency_penalty_ms` score penalty and logs
-include `upstream_kind` and `format_adapter` so operators can see when
-conversion was used.
+Adapted routes carry an `adapter_latency_penalty_ms` score penalty for ordering
+among adapter candidates, and logs include `upstream_kind` and `format_adapter`
+so operators can see when conversion was used.
 
 There is one important safety boundary: a Responses health item verified only by
 the Codex diagnostic shape (`shape_status=codex_shape_verified` or

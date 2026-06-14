@@ -966,6 +966,47 @@ def test_response_style_function_tool_shape_can_use_chat_and_responses(gateway):
     assert [item["_format_adapter"] for item in items] == ["native", "responses_to_chat"]
 
 
+def test_adaptive_candidates_prefer_native_before_faster_adapter_in_same_bucket(gateway):
+    gateway.HEALTH = {
+        "chat": {
+            "good-model": {
+                "chat-provider": {
+                    "provider_id": "chat-provider",
+                    "actual_model": "good-model",
+                    "healthy": True,
+                    "priority": 100,
+                    "weight": 1,
+                    "latency_ms": 20000,
+                },
+            }
+        },
+        "responses": {
+            "good-model": {
+                "responses-provider": {
+                    "provider_id": "responses-provider",
+                    "actual_model": "good-model",
+                    "healthy": True,
+                    "priority": 100,
+                    "weight": 1,
+                    "latency_ms": 1,
+                },
+            }
+        },
+    }
+
+    buckets = gateway.adaptive_candidate_buckets(
+        "good-model",
+        "chat",
+        {"model": "good-model", "messages": [{"role": "user", "content": "ping"}]},
+    )
+    chosen, bucket_name = gateway.select_route_candidate(buckets)
+
+    assert [bucket["name"] for bucket in buckets] == ["primary", "primary"]
+    assert [bucket["items"][0]["_format_adapter"] for bucket in buckets] == ["native", "responses_to_chat"]
+    assert bucket_name == "primary"
+    assert chosen["provider_id"] == "chat-provider"
+
+
 def test_anthropic_tool_history_converts_to_responses_items(gateway):
     messages = [
         {"role": "user", "content": "Use the tool"},
