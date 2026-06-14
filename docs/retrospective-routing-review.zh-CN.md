@@ -913,6 +913,8 @@ upstream_kind: 网关实际选择的上游接口格式
 31. 2026-06-14 处理 `https://new.sharedchat.cc/codex` 出口问题：当前机器直连返回 Cloudflare/HTML 403，符合非中国大陆出口被挡的表现。Gateway 增加 provider 级 `proxy_url`，同步脚本对 sharedchat 从 `GATEWAY_SHAREDCHAT_PROXY_URL` / `SHAREDCHAT_PROXY_URL` / `GATEWAY_CN_PROXY_URL` / `CN_PROXY_URL` 注入代理，只让 sharedchat 走大陆出口，不影响其它上游。
 32. 2026-06-14 复核 anyrouter/x666 Claude Code 配置时发现一个排查陷阱：本机 `/root/.claude/settings.json` 配了 CC Switch 本地代理 `127.0.0.1:15721`，未隔离 HOME/settings 的 `claude -p` 成功并不能证明目标上游直连可用。隔离 HOME、只保留本次指定的 `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_BASE_URL` 后，anyrouter direct Claude Code 返回 `400 1m 上下文已经全量可用，请启用 1m 上下文后重试`，带 1m beta 仍未得到可用响应；x666 新 key 已通过鉴权，但 Claude 系列统一返回 `503 No available channel ... under group default`。
 33. 同一轮复核发现手写最小 `/v1/responses` 会污染 Codex-compatible provider 健康：对 anyrouter `gpt-5.5` 发送弱 Responses body 会返回 `invalid codex request`，但这不能代表真实 Codex shape 不可用。修复为：已健康 provider 的同一 request-shape fingerprint 前两次形态失败只记录 `shape_invalid_count` 和 `last_runtime_error`，不撤销 `healthy=true`；第三次才标记 `runtime_failure:real_shape_invalid` 并冷却。
+34. 2026-06-14 复核 `grok-4.20-fast` 发现一个真实影响点：非流式 Responses 请求降级到 Chat 上游时，部分上游即使请求 `stream=false` 也会返回 Chat SSE。旧逻辑按 JSON 解析失败后把 2xx SSE 误判为 `empty_response`，并把原本可用的 Chat 健康项打下线。修复为：非流式 Chat/Responses 收到 SSE 时先聚合为标准 JSON 再判断输出；同时 `runtime_failure:empty_response` 改为连续确认型瞬态失败，第一次只记录计数，不直接移除健康候选。
+35. 同日按指定模型名直连 x666 复测：`claude-opus-4-6-cc`、`claude-opus-4-8-cc` 和 `grok-4.3-high` 均返回 `503 No available channel ... under group default`。结论是新 key 有效，但该 key 所属 default 组当前没有这些模型渠道；这不是 Gateway 模型映射或鉴权问题。
 
 ### 当前健康含义
 
@@ -961,9 +963,9 @@ upstream_kind: 网关实际选择的上游接口格式
 - sharedchat `/codex`：当前直连受出口限制；设置大陆代理后再做健康探测。
 - 管理 API 暴露健康新鲜度字段。
 
-部署后强制全量 probe 结果：Chat 健康 10，Responses 健康 5，公开模型 10 个，分别是 `claude-opus-4-6`、`claude-opus-4-7`、`claude-opus-4-8`、`claude-sonnet-4-6`、`deepseek-v4-flash`、`deepseek-v4-pro`、`glm-5.1`、`gpt-5.5`、`grok-4.20-fast`、`grok-4.20-0309-non-reasoning`。Router channel 已按这 10 个模型同步到 `default,vip` 两组，共 20 条能力。
+2026-06-14 Grok follow-up 后强制全量 probe 结果：Chat 健康 12，Responses 健康 11，公开模型 16 个。当前公开列表以 `/v1/models` 为准，本轮包含 `claude-opus-4-6`、`claude-opus-4-7`、`claude-opus-4-8`、`claude-sonnet-4-6`、`deepseek-v4-flash`、`deepseek-v4-pro`、`glm-5.1`、`gpt-5.5`、`gpt-5.5-openai-compact`、`grok-4.20-fast`、`grok-4.20-0309-non-reasoning` 和 Mimo 系列。
 
-完整验证结果更新：`111 passed`，sync 脚本测试 `9 passed`。
+完整验证结果更新：`122 passed`。
 
 ## 2026-06-14 AI Key Vault 借鉴判断
 

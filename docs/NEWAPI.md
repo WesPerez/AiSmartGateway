@@ -172,11 +172,11 @@ The full probe and router sync on 2026-06-14 exposed
 variants stayed hidden because the currently reachable upstreams returned
 non-healthy probe results such as rate limiting.
 
-After the runtime empty-output gate was deployed and a forced full probe was
-run on 2026-06-14, the effective public list contained 10 models:
-`claude-opus-4-6`, `claude-opus-4-7`, `claude-opus-4-8`,
-`claude-sonnet-4-6`, `deepseek-v4-flash`, `deepseek-v4-pro`, `glm-5.1`,
-`gpt-5.5`, `grok-4.20-fast`, and `grok-4.20-0309-non-reasoning`.
+The effective public list is runtime-dependent and should be read from
+`/v1/models` after a probe or router sync. After the 2026-06-14 Grok follow-up
+probe, the list contained 16 models, including `grok-4.20-fast`,
+`grok-4.20-0309-non-reasoning`, `gpt-5.5`, `gpt-5.5-openai-compact`, Claude
+short aliases, DeepSeek/GLM, and Mimo variants.
 
 ## Health Detection Strategy
 
@@ -245,14 +245,21 @@ the upstream sends only an empty completion, the runtime result is
 cooled down. This prevents clients such as Claude Desktop from seeing a silent
 successful completion with no assistant content.
 
-Runtime `server_unavailable`, `empty_stream`, `all_endpoints_failed`, and
-`exception:*` are treated as transient by default. A healthy item is not removed
-from routing after the first such runtime failure; Smart Gateway records a
-pending `runtime_failure_count` and only marks it unhealthy after
+Runtime `server_unavailable`, `empty_stream`, `empty_response`,
+`all_endpoints_failed`, and `exception:*` are treated as transient by default.
+A healthy item is not removed from routing after the first such runtime failure;
+Smart Gateway records a pending `runtime_failure_count` and only marks it unhealthy after
 `RUNTIME_TRANSIENT_FAILURE_CONFIRMATIONS` consecutive transient failures
 (default `2`). Any runtime success clears the pending counter. Non-transient
 failures such as unsupported model, auth, quota, rate limit, and confirmed real
 shape invalid still enter cooldown immediately.
+
+Some upstreams return SSE even when the client request is non-streaming. Smart
+Gateway now aggregates non-streamed Chat/Responses SSE bodies back into the
+expected JSON response before deciding whether output was observed. This avoids
+misclassifying a valid Chat SSE response as `empty_response` during
+`chat_to_responses` fallback, and prevents a Responses adapter failure from
+unnecessarily poisoning the native Chat health item.
 
 Tool-bearing Responses requests have an additional runtime signal. HTTP 200
 with plain text is not enough to prove agentic tool support. If a native

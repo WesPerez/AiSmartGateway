@@ -564,6 +564,59 @@ async def test_responses_request_can_use_chat_upstream_with_safe_adapter(gateway
     assert logs[0]["format_adapter"] == "chat_to_responses"
 
 
+@pytest.mark.asyncio()
+async def test_non_stream_responses_chat_adapter_accepts_sse_chat_response(gateway, monkeypatch):
+    gateway.PROVIDERS = [
+        {"id": "p1", "base_url": "https://p1.example/v1", "api_key": "sk-p1", "timeout_seconds": 3, "headers": {}},
+    ]
+    gateway.HEALTH = {
+        "chat": {
+            "good-model": {
+                "p1": {
+                    "provider_id": "p1",
+                    "actual_model": "actual-chat",
+                    "healthy": True,
+                    "reason": "ok",
+                    "priority": 100,
+                    "weight": 1,
+                    "latency_ms": 20,
+                },
+            }
+        },
+        "responses": {},
+    }
+    monkeypatch.setattr(gateway, "pick_weighted", lambda candidates: candidates[0])
+    stream_body = (
+        'data: {"id":"chatcmpl_test","object":"chat.completion.chunk","created":123,'
+        '"model":"actual-chat","choices":[{"index":0,"delta":{"role":"assistant","content":"pong"}}]}\n\n'
+        'data: {"id":"chatcmpl_test","object":"chat.completion.chunk","created":123,'
+        '"model":"actual-chat","choices":[{"index":0,"delta":{"content":""},"finish_reason":"stop"}]}\n\n'
+        "data: [DONE]\n\n"
+    )
+
+    with respx.mock:
+        route = respx.post("https://p1.example/v1/chat/completions").mock(
+            return_value=httpx.Response(200, text=stream_body, headers={"content-type": "text/event-stream"})
+        )
+        response = await gateway.relay_non_stream(
+            "/responses",
+            {"model": "good-model", "input": "ping", "stream": False},
+            "responses",
+        )
+
+    assert response.status_code == 200
+    payload = json.loads(response.body.decode())
+    assert payload["object"] == "response"
+    assert payload["output_text"] == "pong"
+    assert route.call_count == 1
+    assert gateway.HEALTH["chat"]["good-model"]["p1"]["healthy"] is True
+    assert "runtime_failure_count" not in gateway.HEALTH["chat"]["good-model"]["p1"]
+    logs = gateway.read_recent_request_logs()
+    assert logs[0]["success"] is True
+    assert logs[0]["upstream_kind"] == "chat"
+    assert logs[0]["format_adapter"] == "chat_to_responses"
+
+
 def test_responses_body_to_chat_body_converts_images_tools_and_tool_history(gateway):
     body = {
         "model": "good-model",
@@ -2909,6 +2962,40 @@ async def test_transient_runtime_failure_requires_confirmation(gateway, monkeypa
     assert item["reason"] == "runtime_failure:server_unavailable"
     assert item["runtime_failure_count"] == 2
     assert item["next_probe_at"] > gateway.now()
+
+
+@pytest.mark.asyncio()
+async def test_empty_response_runtime_failure_requires_confirmation(gateway, monkeypatch):
+    monkeypatch.setattr(gateway, "RUNTIME_TRANSIENT_FAILURE_CONFIRMATIONS", 2)
+    gateway.HEALTH = {
+        "chat": {
+            "good-model": {
+                "p1": {
+                    "provider_id": "p1",
+                    "actual_model": "good-model",
+                    "healthy": True,
+                    "reason": "ok",
+                    "priority": 100,
+                    "weight": 1,
+                },
+            }
+        },
+        "responses": {},
+    }
+
+    await gateway.mark_runtime_failure("chat", "good-model", "p1", "empty_response")
+
+    item = gateway.HEALTH["chat"]["good-model"]["p1"]
+    assert item["healthy"] is True
+    assert item["reason"] == "ok"
+    assert item["runtime_failure_count"] == 1
+    assert item["runtime_failure_reason"] == "empty_response"
+
+    await gateway.mark_runtime_failure("chat", "good-model", "p1", "empty_response")
+
+    assert item["healthy"] is False
+    assert item["reason"] == "runtime_failure:empty_response"
+    assert item["runtime_failure_count"] == 2
 
 
 @pytest.mark.asyncio()

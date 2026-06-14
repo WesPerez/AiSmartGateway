@@ -2895,6 +2895,152 @@ def iter_sse_data_payloads(text: str) -> list[str]:
     return payloads
 
 
+def chat_stream_text_to_chat_response(text: str, request_id: str, model: str | None) -> dict[str, Any] | None:
+    if "data:" not in (text or ""):
+        return None
+    content_parts: list[str] = []
+    tool_calls: dict[int, dict[str, Any]] = {}
+    usage: dict[str, Any] | None = None
+    finish_reason = "stop"
+    response_id = request_id
+    created = int(now())
+    response_model = model or ""
+    for payload in iter_sse_data_payloads(text):
+        if payload == "[DONE]":
+            continue
+        try:
+            data = json.loads(payload)
+        except Exception:
+            continue
+        if response_has_error_json(data):
+            continue
+        if data.get("id"):
+            response_id = str(data["id"])
+        if token_int(data.get("created")) is not None:
+            created = int(data["created"])
+        if data.get("model"):
+            response_model = str(data["model"])
+        if isinstance(data.get("usage"), dict):
+            usage = data["usage"]
+        for choice in data.get("choices") or []:
+            if not isinstance(choice, dict):
+                continue
+            if choice.get("finish_reason"):
+                finish_reason = str(choice["finish_reason"])
+            delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+            message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+            content = delta.get("content") if "content" in delta else message.get("content")
+            if content:
+                content_parts.append(str(content))
+            for call in (delta.get("tool_calls") or message.get("tool_calls") or []):
+                if not isinstance(call, dict):
+                    continue
+                index = token_int(call.get("index"))
+                if index is None:
+                    index = len(tool_calls)
+                record = tool_calls.setdefault(
+                    index,
+                    {
+                        "id": str(call.get("id") or f"call_{uuid.uuid4().hex[:16]}"),
+                        "type": "function",
+                        "function": {"name": "", "arguments": ""},
+                    },
+                )
+                if call.get("id"):
+                    record["id"] = str(call["id"])
+                function = call.get("function") if isinstance(call.get("function"), dict) else {}
+                if function.get("name"):
+                    record["function"]["name"] = str(function["name"])
+                if function.get("arguments"):
+                    record["function"]["arguments"] += str(function["arguments"])
+    text_out = "".join(content_parts)
+    observed_tool_calls = [
+        call
+        for _, call in sorted(tool_calls.items())
+        if str((call.get("function") or {}).get("name") or "").strip()
+    ]
+    if not text_out.strip() and not observed_tool_calls:
+        return None
+    message: dict[str, Any] = {"role": "assistant", "content": text_out}
+    if observed_tool_calls:
+        message["tool_calls"] = observed_tool_calls
+        if not text_out:
+            message["content"] = None
+            finish_reason = "tool_calls"
+    response: dict[str, Any] = {
+        "id": response_id,
+        "object": "chat.completion",
+        "created": created,
+        "model": response_model,
+        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+    }
+    if usage:
+        response["usage"] = usage
+    return response
+
+
+def responses_stream_text_to_response(text: str, request_id: str, model: str | None) -> dict[str, Any] | None:
+    if "data:" not in (text or ""):
+        return None
+    output_parts: list[str] = []
+    final_response: dict[str, Any] | None = None
+    usage: dict[str, Any] | None = None
+    for payload in iter_sse_data_payloads(text):
+        if payload == "[DONE]":
+            continue
+        try:
+            data = json.loads(payload)
+        except Exception:
+            continue
+        if response_has_error_json(data):
+            continue
+        if isinstance(data.get("usage"), dict):
+            usage = normalize_usage_for_responses(data.get("usage"))
+        response_obj = data.get("response") if isinstance(data.get("response"), dict) else None
+        if response_obj and str(data.get("type") or "") == "response.completed":
+            final_response = response_obj
+        event_type = str(data.get("type") or "")
+        if event_type == "response.output_text.delta" and data.get("delta"):
+            output_parts.append(str(data["delta"]))
+        item = data.get("item") if isinstance(data.get("item"), dict) else {}
+        if event_type == "response.output_item.done":
+            content = item.get("content")
+            for fragment in iter_text_fragments(content):
+                output_parts.append(fragment)
+    if final_response is not None:
+        if usage and not isinstance(final_response.get("usage"), dict):
+            final_response["usage"] = usage
+        return final_response
+    output_text = "".join(output_parts)
+    if not output_text.strip():
+        return None
+    response: dict[str, Any] = {
+        "id": request_id,
+        "object": "response",
+        "created_at": int(now()),
+        "status": "completed",
+        "model": model or "",
+        "output": [responses_message_output_item(output_text)],
+        "output_text": output_text,
+    }
+    if usage:
+        response["usage"] = usage
+    return response
+
+
+def event_stream_text_to_response_data(
+    text: str,
+    upstream_kind: str,
+    request_id: str,
+    model: str | None,
+) -> dict[str, Any] | None:
+    if upstream_kind == "chat":
+        return chat_stream_text_to_chat_response(text, request_id, model)
+    if upstream_kind == "responses":
+        return responses_stream_text_to_response(text, request_id, model)
+    return None
+
+
 def pop_complete_sse_events(buffer: bytes) -> tuple[bytes, bytes]:
     events = bytearray()
     remaining = buffer
@@ -4662,7 +4808,7 @@ def runtime_failure_reason_for_endpoint_failures(kind: str, endpoint_reasons: li
 
 
 def transient_runtime_failure_reason(reason: str) -> bool:
-    return reason in {"server_unavailable", "empty_stream", "all_endpoints_failed"} or reason.startswith("exception:")
+    return reason in {"server_unavailable", "empty_stream", "empty_response", "all_endpoints_failed"} or reason.startswith("exception:")
 
 
 def exploration_enabled(controls: dict[str, Any]) -> bool:
@@ -5199,6 +5345,8 @@ async def relay_non_stream(
                 data = response.json()
             except Exception:
                 data = None
+            if data is None and 200 <= response.status_code < 300:
+                data = event_stream_text_to_response_data(text, upstream_kind, request_id, chosen["actual_model"])
             if 200 <= response.status_code < 300 and not response_has_error_json(data) and response_data_has_output(data, upstream_kind):
                 tool_call_observed = request_has_tools(body) and response_data_has_tool_call(data, upstream_kind)
                 await mark_runtime_success(
