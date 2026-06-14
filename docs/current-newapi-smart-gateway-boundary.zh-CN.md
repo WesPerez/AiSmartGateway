@@ -132,7 +132,7 @@ Smart Gateway 后台是路由运维视图，不是第二套用户/令牌/订阅�
 
 - 成功：21600 秒。
 - 模型不支持或不存在：86400 秒。
-- 鉴权/权限、额度：3600 秒。
+- 鉴权/权限、上游配置错误、额度：3600 秒。
 - 限流：1800 秒。
 - 服务异常、网络异常：900 秒。
 - 探测内容为空或低信号：900 秒。
@@ -144,6 +144,8 @@ Smart Gateway 后台是路由运维视图，不是第二套用户/令牌/订阅�
 如果某上游只支持 Claude Code / Anthropic Messages / Chat 形态，但 `/responses` 返回 `not implemented`，不能因为加了客户端 header 就把 Responses 标健康。该上游应按实际可用接口展示。
 
 Muyuan 这类 Claude 聚合上游当前不能再只靠 `User-Agent` 伪装。它要求 `/chat/completions` 使用 Anthropic/Claude Code 风格 body，并带当前 Claude Code 客户端身份 header；Smart Gateway 用 provider 级 `chat_request_format: anthropic` 表达这类兼容策略。
+
+远端 New API 如果返回 `price not configured` / `价格未配置`，这不是客户端请求格式问题，而是上游 provider 的运营配置缺失。Smart Gateway 将其归类为 `provider_config_error` 并冷却对应 provider/model/kind；本地 Router channel 的 `ModelRatio` 仍由同步脚本维护。
 
 ## 自适应格式路由
 

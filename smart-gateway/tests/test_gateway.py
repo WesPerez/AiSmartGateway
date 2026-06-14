@@ -204,6 +204,13 @@ def test_classify_error_prefers_semantic_reason(gateway):
         == "client_invalid_input"
     )
     assert gateway.classify_error(403, '{"error":"channel:client_restricted"}') == "client_restricted"
+    assert (
+        gateway.classify_error(
+            400,
+            '{"error":{"message":"模型 grok-4.20-fast 的价格未配置。Model grok-4.20-fast price not configured."}}',
+        )
+        == "provider_config_error"
+    )
 
 
 def test_with_channel_fields_treats_only_status_one_as_enabled(gateway):

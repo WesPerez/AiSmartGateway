@@ -446,7 +446,7 @@ def probe_cooldown_seconds(reason: str | None, healthy: bool) -> int:
         return RESPONSES_INVALID_REQUEST_COOLDOWN_SECONDS
     if reason in {"not_found", "model_unsupported"}:
         return PROBE_UNSUPPORTED_TTL_SECONDS
-    if reason in {"auth_or_forbidden", "client_restricted"}:
+    if reason in {"auth_or_forbidden", "client_restricted", "provider_config_error"}:
         return PROBE_AUTH_TTL_SECONDS
     if reason == "quota":
         return PROBE_QUOTA_TTL_SECONDS
@@ -808,6 +808,7 @@ def health_policy_summary() -> dict[str, Any]:
             "success": PROBE_SUCCESS_TTL_SECONDS,
             "model_unsupported": PROBE_UNSUPPORTED_TTL_SECONDS,
             "auth_or_forbidden": PROBE_AUTH_TTL_SECONDS,
+            "provider_config_error": PROBE_AUTH_TTL_SECONDS,
             "quota": PROBE_QUOTA_TTL_SECONDS,
             "rate_limited": PROBE_RATE_LIMIT_TTL_SECONDS,
             "server_unavailable": PROBE_SERVER_ERROR_TTL_SECONDS,
@@ -1291,6 +1292,14 @@ def classify_error(status_code: int, text: str) -> str:
     )
     if any(word in sample for word in unsupported):
         return "model_unsupported"
+    provider_config_error = (
+        "price not configured",
+        "model price not configured",
+        "价格未配置",
+        "模型价格未配置",
+    )
+    if any(word in sample for word in provider_config_error):
+        return "provider_config_error"
     if status_code == 400 and "invalid_value" in sample and "input" in sample:
         return "client_invalid_input"
     if status_code == 400 and "missing" in sample and ("tools.function" in sample or "tool.function" in sample):
@@ -4459,6 +4468,8 @@ def runtime_failure_reason_for_endpoint_failures(kind: str, endpoint_reasons: li
         return "quota"
     if unique <= {"auth_or_forbidden"}:
         return "auth_or_forbidden"
+    if unique <= {"provider_config_error"}:
+        return "provider_config_error"
     if unique <= {"rate_limited"}:
         return "rate_limited"
     if unique <= {"server_unavailable", "empty_stream", "exception"}:

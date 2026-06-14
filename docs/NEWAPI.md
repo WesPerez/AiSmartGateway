@@ -181,6 +181,8 @@ The system distinguishes:
 - `rate_limited`: temporary limit.
 - `server_unavailable`: 5xx or upstream gateway failure.
 - `auth_or_forbidden`: credential or permission problem.
+- `provider_config_error`: upstream New API/provider-side operational config
+  is missing, for example `price not configured` / `价格未配置` for a model.
 - `empty_response` / `low_signal_response`: HTTP 2xx with no useful model
   text. This prevents a provider that only returns `ok`, `pong`, an empty
   completion, or another low-signal response from being treated as healthy.
@@ -203,7 +205,7 @@ Default health-loop and cooldown values:
 - `ADAPTER_SYNTHESIZE_USAGE=true`
 - success cache: 21600 seconds
 - unsupported/not found: 86400 seconds
-- auth/forbidden and quota: 3600 seconds
+- auth/forbidden, provider config error, and quota: 3600 seconds
 - rate limited: 1800 seconds
 - server unavailable and exceptions: 900 seconds
 - empty or low-signal probe output: 900 seconds

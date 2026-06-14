@@ -906,6 +906,7 @@ upstream_kind: 网关实际选择的上游接口格式
 24. 2026-06-14 根据 `grok-4.20-fast` 真实请求日志继续收紧候选排序：同一个 Chat stream 请求中，Responses 健康项可能先以 `responses_to_chat` 被选中并遇到 522/Cloudflare，随后 native Chat fallback 成功。修复后同一路由桶内先试 native，再试 adapter；adapter 仍保留为跨格式兜底，不再压过健康 native。
 25. 2026-06-14 根据 `mimo-v2.5-pro` Responses 日志继续修运行时健康反写：Fufu 连续三次 native Responses 成功后，一次 `503 Gateway Error: 没有可用的内网节点` 被立即写成 `runtime_failure:server_unavailable`，导致后续请求全部 `no_healthy_upstream`。修复为通用瞬时失败确认：`server_unavailable`、`empty_stream`、`all_endpoints_failed`、`exception:*` 默认连续 2 次才把刚健康候选打入冷却；单次失败只记录 pending 计数，任意成功清零。
 26. 2026-06-14 继续排查 `mimo-v2.5-pro` “循环卡住”：请求已是 HTTP 200 / native Responses，但带 51 个 tools 时上游连续输出“correct tool invocations / XML invocation format”等普通文本，没有真实 `function_call`，客户端不断把这些文本带回去导致循环。修复为工具能力子状态：带 tools 的 native Responses stream 会观察是否出现 function_call；出现工具调用循环文本且没有 function_call 时记录 `tool_call_support=unsupported`。后续带相同循环历史的请求跳过未验证/不支持的 native Responses，并允许低信号 Chat 探测项作为 `chat_to_responses` shadow fallback。
+27. 2026-06-14 排查 CC Switch 报错 `https://cooai.cc.cd grok-4.20-fast`：远端返回 `模型 ... 的价格未配置 / price not configured`。本地 New API `ModelRatio` 已包含 `grok-4.20-fast`，因此这是远端上游 New API 的运营配置错误。Gateway 新增 `provider_config_error` 分类，遇到此类 400 会冷却对应 provider/model/kind，而不是误判为客户端 `invalid_request`。
 
 ### 当前健康含义
 
