@@ -126,6 +126,7 @@ Smart Gateway 后台是路由运维视图，不是第二套用户/令牌/订阅�
 4. 任意一次真实形态成功，立即恢复健康并清空失败计数。
 5. 多 Base URL 的同一逻辑上游，应逐个 base URL 验证，但仍归并为一个 provider。
 6. 运行时 `server_unavailable`、`empty_stream`、`all_endpoints_failed`、`exception:*` 属于瞬时失败；默认连续 2 次才把刚健康的候选打入冷却，单次失败只记录 `runtime_failure_count`。任意一次运行时成功会清空该计数。模型不支持、鉴权、额度、限流和真实形态确认不兼容仍会立即冷却。
+7. 带 `tools` 的 Responses 请求还有工具能力子状态：HTTP 200 但只输出“正确工具调用格式/让我重试工具调用”这类循环文本、不产生 `function_call` 时，记录 `tool_call_support=unsupported`；后续带相同循环历史的请求会跳过未验证或已判不支持的 native Responses 候选，改试可安全映射的 Chat adapter 候选。真实产出 `function_call` 时记录 `tool_call_support=verified`。
 
 当前默认冷却策略：
 

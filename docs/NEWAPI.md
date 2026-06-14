@@ -231,6 +231,16 @@ pending `runtime_failure_count` and only marks it unhealthy after
 failures such as unsupported model, auth, quota, rate limit, and confirmed real
 shape invalid still enter cooldown immediately.
 
+Tool-bearing Responses requests have an additional runtime signal. HTTP 200
+with plain text is not enough to prove agentic tool support. If a native
+Responses stream with `tools` emits no `function_call` and instead returns
+tool-loop text such as repeated "correct tool invocation" guidance, Smart
+Gateway records `tool_call_support=unsupported` for that provider/model/kind.
+Later requests with the same loop history skip unverified or unsupported native
+Responses candidates and may try a safely mappable Chat adapter candidate
+instead. A real streamed or non-streamed function call records
+`tool_call_support=verified`.
+
 `HEALTH_FRESH_TTL_SECONDS` is an operations-facing freshness window. A healthy
 item checked inside this window is shown as fresh; a healthy item older than
 this window but still inside the success cache is shown as cached/stale health.

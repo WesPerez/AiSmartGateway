@@ -1377,6 +1377,57 @@ def score_response_text(text: str) -> int:
     return score
 
 
+TOOL_LOOP_TEXT_PATTERNS = (
+    "tool invocation",
+    "tool invocations",
+    "tool invocation errors",
+    "properly formatted tool",
+    "correct tool format",
+    "correct tool names",
+    "wrong format",
+    "xml invocation format",
+    "available tools directly",
+    "repeated errors",
+)
+
+
+def tool_loop_text_detected(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", text or "").strip().lower()
+    if not normalized:
+        return False
+    return any(pattern in normalized for pattern in TOOL_LOOP_TEXT_PATTERNS)
+
+
+def iter_text_fragments(value: Any) -> list[str]:
+    fragments: list[str] = []
+    stack = [value]
+    while stack and len(" ".join(fragments)) < 20000:
+        current = stack.pop()
+        if isinstance(current, str):
+            fragments.append(current)
+        elif isinstance(current, list):
+            stack.extend(reversed(current))
+        elif isinstance(current, dict):
+            for key in ("text", "content", "input_text", "output_text"):
+                if key in current:
+                    stack.append(current[key])
+            if "summary" in current:
+                stack.append(current["summary"])
+    return fragments
+
+
+def request_has_tools(body: dict[str, Any]) -> bool:
+    tools = body.get("tools")
+    return isinstance(tools, list) and bool(tools)
+
+
+def request_has_tool_loop_history(body: dict[str, Any]) -> bool:
+    if not request_has_tools(body):
+        return False
+    text = " ".join(iter_text_fragments(body.get("input") if "input" in body else body.get("messages")))
+    return tool_loop_text_detected(text)
+
+
 def probe_response_text(data: Any, kind: str) -> str:
     if kind == "chat":
         return extract_chat_response_text(data)
@@ -2711,6 +2762,26 @@ def extract_responses_function_calls(data: Any) -> list[dict[str, Any]]:
     return calls
 
 
+def chat_response_has_tool_call(data: Any) -> bool:
+    if not isinstance(data, dict):
+        return False
+    for choice in data.get("choices") or []:
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+        if isinstance(message.get("tool_calls"), list) and message["tool_calls"]:
+            return True
+    return False
+
+
+def response_data_has_tool_call(data: Any, kind: str) -> bool:
+    if kind == "responses":
+        return bool(extract_responses_function_calls(data))
+    if kind == "chat":
+        return chat_response_has_tool_call(data)
+    return False
+
+
 def convert_responses_response_to_chat(data: Any, request_id: str, model: str | None) -> dict[str, Any]:
     text = extract_responses_output_text(data)
     tool_calls = extract_responses_function_calls(data)
@@ -3100,11 +3171,13 @@ class StreamFormatAdapter:
         self.request_id = request_id
         self.model = model
         self.buffer = b""
+        self.observe_buffer = b""
         self.state: dict[str, Any] = {"request_body": request_body}
 
     def feed(self, chunk: bytes) -> bytes:
         upstream_kind = self.chosen.get("_upstream_kind") or self.client_kind
         if upstream_kind == self.client_kind:
+            self.observe_native_chunk(chunk)
             return chunk
         self.buffer += chunk
         complete, self.buffer = pop_complete_sse_events(self.buffer)
@@ -3114,7 +3187,15 @@ class StreamFormatAdapter:
 
     def flush(self) -> bytes:
         upstream_kind = self.chosen.get("_upstream_kind") or self.client_kind
-        if upstream_kind == self.client_kind or not self.buffer.strip():
+        if upstream_kind == self.client_kind:
+            if self.observe_buffer.strip():
+                pending = self.observe_buffer
+                self.observe_buffer = b""
+                if not pending.endswith((b"\n\n", b"\r\n\r\n")):
+                    pending += b"\n\n"
+                self.observe_native_events(pending)
+            return b""
+        if not self.buffer.strip():
             self.buffer = b""
             return b""
         pending = self.buffer
@@ -3128,6 +3209,46 @@ class StreamFormatAdapter:
         if self.client_kind == "responses" and upstream_kind == "chat":
             return chat_to_responses_completed_event(self.request_id, self.model, self.state)
         return response_completed_event(self.request_id, self.model)
+
+    def observe_native_chunk(self, chunk: bytes) -> None:
+        if self.client_kind != "responses":
+            return
+        self.observe_buffer += chunk
+        complete, self.observe_buffer = pop_complete_sse_events(self.observe_buffer)
+        if complete:
+            self.observe_native_events(complete)
+
+    def observe_native_events(self, chunk: bytes) -> None:
+        for payload in iter_sse_data_payloads(chunk.decode("utf-8", "ignore")):
+            if payload == "[DONE]":
+                continue
+            try:
+                data = json.loads(payload)
+            except Exception:
+                continue
+            event_type = str(data.get("type") or "")
+            item = data.get("item") if isinstance(data.get("item"), dict) else {}
+            if event_type.startswith("response.function_call") or str(item.get("type") or "") == "function_call":
+                self.state["native_tool_calls_seen"] = True
+            delta = None
+            if event_type in {"response.output_text.delta", "response.output_text.annotation.added"}:
+                delta = data.get("delta") or data.get("text") or data.get("content")
+            elif event_type == "response.output_item.done":
+                content = item.get("content") if isinstance(item, dict) else None
+                for fragment in iter_text_fragments(content):
+                    self.state.setdefault("native_response_text_parts", []).append(fragment)
+            if delta:
+                self.state.setdefault("native_response_text_parts", []).append(str(delta))
+
+    def tool_call_observed(self) -> bool:
+        if self.state.get("native_tool_calls_seen"):
+            return True
+        tool_calls = self.state.get("response_tool_calls")
+        return isinstance(tool_calls, dict) and bool(tool_calls)
+
+    def tool_loop_detected(self) -> bool:
+        text = " ".join(self.state.get("native_response_text_parts") or [])
+        return tool_loop_text_detected(text)
 
 
 def convert_stream_chunk_for_client(
@@ -4482,6 +4603,11 @@ def route_item_format_adapter_allowed(
     body: dict[str, Any],
 ) -> bool:
     if client_kind == upstream_kind:
+        if client_kind == "responses" and request_has_tools(body):
+            if item.get("tool_call_support") == "unsupported":
+                return False
+            if request_has_tool_loop_history(body) and item.get("tool_call_support") != "verified":
+                return False
         if client_kind == "chat":
             return chat_body_can_use_native_chat_upstream(body)
         return True
@@ -4494,6 +4620,28 @@ def route_item_format_adapter_allowed(
             return chat_body_can_use_codex_compat_responses_adapter(body)
         return chat_body_can_use_responses_adapter(body)
     return False
+
+
+def tool_loop_chat_adapter_candidates(model: str, body: dict[str, Any], controls: dict[str, Any]) -> list[dict[str, Any]]:
+    if not (request_has_tools(body) and request_has_tool_loop_history(body)):
+        return []
+    candidates: list[dict[str, Any]] = []
+    for item in (HEALTH.get("chat", {}).get(model) or {}).values():
+        if item.get("healthy"):
+            continue
+        if item.get("tool_call_support") == "unsupported":
+            continue
+        if str(item.get("reason") or "") not in {"empty_response", "low_signal_response"}:
+            continue
+        if not provider_matches_controls(item, controls):
+            continue
+        candidate = deepcopy(item)
+        if not route_item_format_adapter_allowed(candidate, "responses", "chat", body):
+            continue
+        candidate["_shadow"] = True
+        candidate["_tool_loop_fallback"] = True
+        candidates.append(annotate_route_item(candidate, "responses", "chat"))
+    return sorted_route_bucket(candidates)
 
 
 def adaptive_candidate_buckets(
@@ -4513,6 +4661,11 @@ def adaptive_candidate_buckets(
             for item in bucket["items"]:
                 if route_item_format_adapter_allowed(item, client_kind, upstream_kind, body):
                     target.append(annotate_route_item(item, client_kind, upstream_kind))
+    controls = controls or {}
+    if client_kind == "responses":
+        for item in tool_loop_chat_adapter_candidates(model, body, controls):
+            name = route_bucket_name(item)
+            combined.setdefault(name, {"native": [], "adapter": []})["adapter"].append(item)
     buckets = []
     for name in ROUTE_BUCKET_ORDER:
         bucket_items = combined.get(name) or {"native": [], "adapter": []}
@@ -4659,12 +4812,38 @@ async def mark_responses_shape_invalid_attempt(
             await save_state()
 
 
+async def mark_tool_call_support(
+    kind: str,
+    model: str,
+    provider_id: str,
+    supported: bool,
+    reason: str = "",
+) -> None:
+    async with STATE_LOCK:
+        matched = [
+            item
+            for item in (HEALTH.get(kind, {}).get(model) or {}).values()
+            if item.get("provider_id") == provider_id
+        ]
+        now_int = int(now())
+        for item in matched:
+            item["tool_call_support"] = "verified" if supported else "unsupported"
+            item["tool_call_checked_at"] = now_int
+            if supported:
+                item.pop("tool_call_failure_reason", None)
+            else:
+                item["tool_call_failure_reason"] = reason or "tool_call_unavailable"
+        if matched:
+            await save_state()
+
+
 async def mark_runtime_success(
     kind: str,
     model: str,
     provider_id: str,
     latency_ms: int,
     codex_compat: bool = False,
+    tool_call_observed: bool = False,
 ) -> None:
     async with STATE_LOCK:
         matched = [
@@ -4687,6 +4866,10 @@ async def mark_runtime_success(
             item.pop("runtime_failure_reason", None)
             item.pop("runtime_failure_last_at", None)
             item.pop("last_runtime_error", None)
+            if tool_call_observed:
+                item["tool_call_support"] = "verified"
+                item["tool_call_checked_at"] = int(now())
+                item.pop("tool_call_failure_reason", None)
             if kind == "responses":
                 if codex_compat:
                     item["shape_status"] = "codex_shape_verified"
@@ -4817,7 +5000,17 @@ async def relay_non_stream(
             except Exception:
                 data = None
             if 200 <= response.status_code < 300 and not response_has_error_json(data):
-                await mark_runtime_success(upstream_kind, model, chosen["provider_id"], latency_ms, bool(chosen.get("_codex_compat_adapter")))
+                tool_call_observed = request_has_tools(body) and response_data_has_tool_call(data, upstream_kind)
+                await mark_runtime_success(
+                    upstream_kind,
+                    model,
+                    chosen["provider_id"],
+                    latency_ms,
+                    bool(chosen.get("_codex_compat_adapter")),
+                    tool_call_observed,
+                )
+                if request_has_tools(body) and not tool_call_observed and tool_loop_text_detected(probe_response_text(data, upstream_kind)):
+                    await mark_tool_call_support(upstream_kind, model, chosen["provider_id"], False, "tool_loop_text")
                 client_data = convert_upstream_response_for_client(data, chosen, kind, request_id, model, req_body)
                 await append_request_log(
                     {
@@ -5109,6 +5302,11 @@ async def relay_stream(
                                     yield completion
                             if not done_sent:
                                 yield b"data: [DONE]\n\n"
+                            if request_has_tools(body):
+                                if stream_adapter.tool_call_observed():
+                                    await mark_tool_call_support(upstream_kind, model, chosen["provider_id"], True)
+                                elif stream_adapter.tool_loop_detected():
+                                    await mark_tool_call_support(upstream_kind, model, chosen["provider_id"], False, "tool_loop_text")
                             return
                     if stream_started:
                         return

@@ -1007,6 +1007,56 @@ def test_adaptive_candidates_prefer_native_before_faster_adapter_in_same_bucket(
     assert chosen["provider_id"] == "chat-provider"
 
 
+def test_tool_loop_history_skips_unverified_native_responses_and_tries_chat_shadow(gateway):
+    gateway.HEALTH = {
+        "chat": {
+            "good-model": {
+                "chat-provider": {
+                    "provider_id": "chat-provider",
+                    "actual_model": "good-model",
+                    "healthy": False,
+                    "reason": "empty_response",
+                    "source": "upstream_models+declared",
+                    "checked_at": 123,
+                    "priority": 100,
+                    "weight": 1,
+                },
+            }
+        },
+        "responses": {
+            "good-model": {
+                "responses-provider": {
+                    "provider_id": "responses-provider",
+                    "actual_model": "good-model",
+                    "healthy": True,
+                    "priority": 100,
+                    "weight": 1,
+                    "latency_ms": 1,
+                },
+            }
+        },
+    }
+    body = {
+        "model": "good-model",
+        "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Use the tool"}]},
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Let me use the correct tool invocations."}],
+            },
+        ],
+        "tools": [{"type": "function", "name": "lookup", "description": "Lookup", "parameters": {"type": "object"}}],
+    }
+
+    buckets = gateway.adaptive_candidate_buckets("good-model", "responses", body)
+    items = [item for bucket in buckets for item in bucket["items"]]
+
+    assert [item["provider_id"] for item in items] == ["chat-provider"]
+    assert items[0]["_format_adapter"] == "chat_to_responses"
+    assert items[0]["_shadow"] is True
+
+
 def test_anthropic_tool_history_converts_to_responses_items(gateway):
     messages = [
         {"role": "user", "content": "Use the tool"},
@@ -3395,6 +3445,54 @@ async def test_responses_client_stream_from_chat_upstream_synthesizes_missing_us
     assert usage["input_tokens"] > 0
     assert usage["output_tokens"] > 0
     assert usage["total_tokens"] == usage["input_tokens"] + usage["output_tokens"]
+
+
+@pytest.mark.asyncio()
+async def test_native_responses_tool_loop_stream_marks_tool_support_unsupported(gateway, monkeypatch):
+    gateway.PROVIDERS = [
+        {"id": "p1", "base_url": "https://p1.example/v1", "api_key": "sk-p1", "timeout_seconds": 3, "headers": {}},
+    ]
+    gateway.HEALTH = {
+        "responses": {
+            "good-model": {
+                "p1": {"provider_id": "p1", "actual_model": "good-model", "healthy": True, "priority": 100, "weight": 1},
+            }
+        },
+        "chat": {},
+    }
+    monkeypatch.setattr(gateway, "pick_weighted", lambda candidates: candidates[0])
+
+    def sse(event_type: str, payload: dict) -> str:
+        return f"event: {event_type}\ndata: {json.dumps(payload, separators=(',', ':'))}\n\n"
+
+    text = "".join(
+        [
+            sse(
+                "response.output_text.delta",
+                {"type": "response.output_text.delta", "delta": "Let me use the correct tool invocations."},
+            ),
+            sse("response.completed", {"type": "response.completed", "response": {"output": []}}),
+            "data: [DONE]\n\n",
+        ]
+    )
+
+    body = {
+        "model": "good-model",
+        "input": "Use the tool",
+        "stream": True,
+        "tools": [{"type": "function", "name": "lookup", "description": "Lookup", "parameters": {"type": "object"}}],
+    }
+
+    with respx.mock:
+        route = respx.post("https://p1.example/v1/responses").mock(return_value=httpx.Response(200, text=text))
+        chunks = [chunk async for chunk in gateway.relay_stream("/responses", body, "responses")]
+
+    assert route.call_count == 1
+    assert b"Let me use the correct tool invocations." in b"".join(chunks)
+    item = gateway.HEALTH["responses"]["good-model"]["p1"]
+    assert item["healthy"] is True
+    assert item["tool_call_support"] == "unsupported"
+    assert item["tool_call_failure_reason"] == "tool_loop_text"
 
 
 @pytest.mark.asyncio()
