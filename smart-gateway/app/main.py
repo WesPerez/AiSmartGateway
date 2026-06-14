@@ -4989,8 +4989,14 @@ async def mark_responses_shape_invalid_attempt(
             previous_count = int(item.get("shape_invalid_count") or 0) if previous_fingerprint == fingerprint else 0
             count = previous_count + 1
             confirmed = count >= RESPONSES_INVALID_REQUEST_CONFIRMATIONS
-            item["healthy"] = False
-            item["reason"] = "runtime_failure:real_shape_invalid" if confirmed else "runtime_failure:responses_request_shape_unverified"
+            if confirmed:
+                item["healthy"] = False
+                item["reason"] = "runtime_failure:real_shape_invalid"
+            elif not item.get("healthy"):
+                item["healthy"] = False
+                item["reason"] = "runtime_failure:responses_request_shape_unverified"
+            else:
+                item["reason"] = item.get("reason") or "ok"
             item["checked_at"] = now_int
             item["shape_status"] = "real_shape_invalid" if confirmed else "confirming"
             item["shape_invalid_count"] = count
@@ -4998,11 +5004,13 @@ async def mark_responses_shape_invalid_attempt(
             item["shape_fingerprint"] = fingerprint
             item["shape_invalid_last_at"] = now_int
             item["shape_verification_source"] = "runtime_real_request"
+            item["last_runtime_error"] = "responses_request_shape_unverified"
             if latency_ms is not None:
                 item["latency_ms"] = latency_ms
-            item["next_probe_at"] = now_int + (
-                RESPONSES_INVALID_REQUEST_COOLDOWN_SECONDS if confirmed else RESPONSES_INVALID_REQUEST_RETRY_SECONDS
-            )
+            if confirmed:
+                item["next_probe_at"] = now_int + RESPONSES_INVALID_REQUEST_COOLDOWN_SECONDS
+            elif not item.get("healthy"):
+                item["next_probe_at"] = now_int + RESPONSES_INVALID_REQUEST_RETRY_SECONDS
         if matched:
             await save_state()
 

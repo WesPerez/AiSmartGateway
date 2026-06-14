@@ -359,6 +359,11 @@ Therefore:
 - Runtime client requests are the strongest evidence.
 - Synthetic verification must replay a captured/sanitized Codex-shape template,
   not a small generic Responses body.
+- A failed weak runtime shape must not immediately revoke an already healthy
+  Codex-compatible provider. Smart Gateway records the request-shape
+  fingerprint and confirmation count; only after
+  `RESPONSES_INVALID_REQUEST_CONFIRMATIONS` failures for the same fingerprint
+  is the provider/model/kind marked `real_shape_invalid`.
 - Authorization is always replaced with the provider key; captured user tokens
   must never be stored or replayed.
 - Captured verification templates must be stored redacted, bounded in size, and

@@ -911,6 +911,8 @@ upstream_kind: 网关实际选择的上游接口格式
 29. 2026-06-14 重新直连验证 anyrouter Claude 系列：`/models` 声明 Claude 模型，但 `/chat/completions` 对 Claude 返回模型不支持，`/responses` 当前可证明的是 `gpt-5.5` Codex-compatible；Anthropic `/v1/messages` 对 Claude 至少进入了更深的网关逻辑，但当前返回 1m context/beta 或 503，不能判健康。结论：anyrouter 现在不能仅因模型列表声明就暴露 Claude，Gateway 只能保留已验证的 `gpt-5.5` Codex Responses 能力。
 30. 2026-06-14 重新直连验证 x666：`/models`、`/chat/completions`、`/responses`、`/messages` 都返回 `401 Invalid token`。同步脚本已改为对 x666 这类已知上游优先采用 `.env` 的 `UPSTREAM_X666_KEY`，但当前可用性仍取决于实际 token 是否正确。
 31. 2026-06-14 处理 `https://new.sharedchat.cc/codex` 出口问题：当前机器直连返回 Cloudflare/HTML 403，符合非中国大陆出口被挡的表现。Gateway 增加 provider 级 `proxy_url`，同步脚本对 sharedchat 从 `GATEWAY_SHAREDCHAT_PROXY_URL` / `SHAREDCHAT_PROXY_URL` / `GATEWAY_CN_PROXY_URL` / `CN_PROXY_URL` 注入代理，只让 sharedchat 走大陆出口，不影响其它上游。
+32. 2026-06-14 复核 anyrouter/x666 Claude Code 配置时发现一个排查陷阱：本机 `/root/.claude/settings.json` 配了 CC Switch 本地代理 `127.0.0.1:15721`，未隔离 HOME/settings 的 `claude -p` 成功并不能证明目标上游直连可用。隔离 HOME、只保留本次指定的 `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_BASE_URL` 后，anyrouter direct Claude Code 返回 `400 1m 上下文已经全量可用，请启用 1m 上下文后重试`，带 1m beta 仍未得到可用响应；x666 新 key 已通过鉴权，但 Claude 系列统一返回 `503 No available channel ... under group default`。
+33. 同一轮复核发现手写最小 `/v1/responses` 会污染 Codex-compatible provider 健康：对 anyrouter `gpt-5.5` 发送弱 Responses body 会返回 `invalid codex request`，但这不能代表真实 Codex shape 不可用。修复为：已健康 provider 的同一 request-shape fingerprint 前两次形态失败只记录 `shape_invalid_count` 和 `last_runtime_error`，不撤销 `healthy=true`；第三次才标记 `runtime_failure:real_shape_invalid` 并冷却。
 
 ### 当前健康含义
 
@@ -945,6 +947,7 @@ upstream_kind: 网关实际选择的上游接口格式
 - provider 级 `proxy_url` 会进入 httpx client 参数和 provider signature；管理接口只显示是否设置并脱敏 URL 凭据。
 - sync 脚本对已知上游使用 `.env` key 覆盖 New API channel key，并为 sharedchat 注入 provider 级代理。
 - Responses stream 只有 completed 事件但带 `output_text` 时可转成 Chat delta；完全空输出会被识别为 `empty_response`。
+- 已健康的 Codex-compatible Responses provider 遇到弱 runtime shape 的 `invalid_request` 时，不会在 1 次失败后被移出健康候选；同一 fingerprint 连续达到确认阈值后才真正冷却。
 
 真实请求回归：
 
@@ -953,8 +956,8 @@ upstream_kind: 网关实际选择的上游接口格式
 - Muyuan `claude-opus-4-8`：Responses 客户端请求非流式和流式均成功降级到 Chat 上游，再转回 Responses；该源现在需要 provider 级 `chat_request_format: anthropic`、`User-Agent: claude-cli/2.1.133` 和 Claude Code Anthropic headers，旧的 `User-Agent: Claude-Code/1.0.0` 已不够。
 - Anyrouter `gpt-5.5`：普通 Responses 小 JSON 仍返回 `invalid codex request`；Codex-compatible Chat -> Responses 转换已通过。自动路由不是按 Anyrouter 或模型强制，而是根据该 Responses health item 的 `responses_compat_mode=codex` / Codex shape 验证证据选择 `chat -> responses / codex_responses_to_chat`，成功后 health 保留 `responses_compat_mode=codex`。2026-06-14 真实回归中，带 tools 的 Chat stream 返回文本成功；强制 `tool_choice` 调用 `noop` 时，Anyrouter `/responses` 返回的 function_call 流事件已转成 Chat `tool_calls` delta。
 - Grok `grok-4.20-fast`：Codex/Chat 原生路径可成功；Claude Desktop 的静默空输出路径已通过 `empty_response` 判定防止被误记成功。另一个远端 `price not configured` 是上游 New API 价格配置问题，不是本地 `ModelRatio` 问题。
-- Anyrouter Claude 系列：当前直连不能证明可用，不能作为 Claude Code 健康候选暴露。
-- x666 Claude 系列：当前失败原因为 token 无效；修复 token 后再进入 Claude Code/Anthropic 形态探测。
+- Anyrouter Claude 系列：隔离本机 Claude settings 后直连不能证明可用，不能作为 Claude Code 健康候选暴露；未隔离时的成功会被 CC Switch 本地代理污染。
+- x666 Claude 系列：新 key 已生效，不再 401；当前失败原因为该 key 所属 `default` 组没有 Claude channel。
 - sharedchat `/codex`：当前直连受出口限制；设置大陆代理后再做健康探测。
 - 管理 API 暴露健康新鲜度字段。
 

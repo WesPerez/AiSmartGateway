@@ -2304,8 +2304,9 @@ async def test_non_stream_uses_paid_fallback_after_responses_invalid_request(gat
     payload = json.loads(response.body.decode())
     assert payload["id"] == "paid-ok"
     item = gateway.HEALTH["responses"]["good-model"]["primary"]
-    assert item["healthy"] is False
-    assert item["reason"] == "runtime_failure:responses_request_shape_unverified"
+    assert item["healthy"] is True
+    assert item["reason"] == "ok"
+    assert item["last_runtime_error"] == "responses_request_shape_unverified"
     assert item["shape_invalid_count"] == 1
     assert item["shape_invalid_required"] == 3
     logs = gateway.read_recent_request_logs()
@@ -2980,9 +2981,10 @@ async def test_responses_shape_invalid_confirms_after_three_real_requests(gatewa
 
     await gateway.mark_responses_shape_invalid_attempt("responses", "good-model", "p1", body, {})
     item = gateway.HEALTH["responses"]["good-model"]["p1::good-model"]
-    assert item["reason"] == "runtime_failure:responses_request_shape_unverified"
+    assert item["reason"] == "ok"
     assert item["shape_invalid_count"] == 1
-    assert item["healthy"] is False
+    assert item["healthy"] is True
+    assert item["last_runtime_error"] == "responses_request_shape_unverified"
 
     await gateway.mark_responses_shape_invalid_attempt("responses", "good-model", "p1", body, {})
     await gateway.mark_responses_shape_invalid_attempt("responses", "good-model", "p1", body, {})
@@ -4104,8 +4106,9 @@ async def test_responses_stream_invalid_request_does_not_cool_down_provider_afte
     joined = b"".join(chunks)
     item = gateway.HEALTH["responses"]["good-model"]["p1::good-model"]
     assert b"all_upstreams_failed" in joined
-    assert item["healthy"] is False
-    assert item["reason"] == "runtime_failure:responses_request_shape_unverified"
+    assert item["healthy"] is True
+    assert item["reason"] == "ok"
+    assert item["last_runtime_error"] == "responses_request_shape_unverified"
     assert item["shape_invalid_count"] == 1
 
 
